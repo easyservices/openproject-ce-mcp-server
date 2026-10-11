@@ -1,19 +1,9 @@
-.git
-.github
-.venv
-__pycache__
-.pytest_cache
-.ruff_cache
-.mypy_cache
-.coverage
-.coverage.*
-coverage.xml
-htmlcov
-dist
-build
-*.egg-info
-.env
-.env.*
-!.env.example
-logs
-data
+# Build only from the package metadata and application source. This excludes
+# local credentials, environment files, Git metadata, caches, and unrelated files.
+**
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE.md
+!src/
+!src/**
