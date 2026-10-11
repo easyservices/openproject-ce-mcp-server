@@ -56,13 +56,9 @@ jobs:
       - name: Check dependency licenses
         run: uvx pip-licenses --python .venv/bin/python3 --fail-on="GPL;LGPL;AGPL"
 
-  # macos-latest/windows-latest cost roughly 10x/2x a Linux runner-minute — scoped to
-  # release-time confirmation only (the workflow_call from publish.yml's tag push, or a
-  # manual workflow_dispatch), never the per-push/per-PR gate. Split into two jobs rather
-  # than one matrix job with a job-level `if`, because GitHub Actions job-level `if` can't
-  # reference `matrix` at all, and a step-level `if` still provisions (and bills) the
-  # runner before skipping — so test-macos-windows below uses a job-level `if` on
-  # a job with a fixed (non-matrix) runs-on per OS instead.
+  # macOS and Windows are outside the supported deployment targets. Keep these
+  # compatibility checks available on manual runs, but never make Linux releases wait
+  # for them. A separate matrix job lets the manual run select both operating systems.
   test-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -90,7 +86,7 @@ jobs:
         run: ./dev test
 
   test-macos-windows:
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
