@@ -210,6 +210,12 @@ jobs:
       - name: Check package metadata
         run: uvx twine check dist/*
 
+      - name: Build Docker image
+        run: docker build --tag openproject-ce-mcp-server:test .
+
+      - name: Check Docker image entry point
+        run: docker run --rm openproject-ce-mcp-server:test --version
+
       - name: Generate SBOM
         run: |
           uv export --no-dev --format requirements-txt --no-hashes -o requirements.txt

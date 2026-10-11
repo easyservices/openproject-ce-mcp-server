@@ -1,8 +1,70 @@
 # Production deployment
 
-This guide runs the Streamable HTTP server from the project checkout with a
-dedicated Linux account and systemd. The MCP server may be hosted separately
-from OpenProject.
+This guide covers running the Streamable HTTP server with Docker Compose or
+from a project checkout with a dedicated Linux account and systemd. The MCP
+server may be hosted separately from OpenProject.
+
+## Docker Compose
+
+The published image is `ghcr.io/easyservices/openproject-ce-mcp-server`. Each
+GitHub release publishes a version tag (for example, `0.1.0`) and updates
+`latest`. The image includes the optional PostgreSQL driver for budget
+comparison; the feature remains disabled unless explicitly enabled. If the
+GHCR package is private, authenticate on the Docker host before pulling it:
+
+```bash
+docker login ghcr.io
+```
+
+Add the service from
+[`docker/production/compose.yml`](../docker/production/compose.yml) to your
+existing Compose project. It uses the `mcp_web` and `openproject_backend`
+networks from your Compose file, reaches the API at `http://openproject`, and
+publishes host port `8766` to container port `8000`. Merge the service into the
+existing file or use it as a Compose overlay:
+
+```bash
+docker compose \
+  -f /path/to/openproject/compose.yml \
+  -f /path/to/openproject-ce-mcp-server/docker/production/compose.yml \
+  up -d
+```
+
+Create the audit-log directory next to the base Compose file and give the
+container's unprivileged user access to it:
+
+```bash
+mkdir -p /path/to/openproject/data/mcp-audit
+sudo chown 10001:10001 /path/to/openproject/data/mcp-audit
+```
+
+Compose reads variable substitutions from the `.env` file beside the base
+Compose file. For direct HTTP access on a trusted network, use the defaults or
+set `MCP_PUBLIC_URL` to the address clients use, such as
+`http://mcp.example.lan:8766`, and set `MCP_ALLOWED_HOSTS` to the matching
+host and port. This direct HTTP setup uses development mode. For production,
+put the service behind a TLS reverse proxy, set `MCP_ENVIRONMENT=production`,
+set `MCP_PUBLIC_URL` to its HTTPS URL, and set `MCP_ALLOWED_HOSTS` to that
+URL's host. The MCP container can remain reachable by the proxy on port 8766.
+
+Each remote MCP user supplies their own OpenProject API token to their MCP
+client; do not put a shared user token in Compose. To enable budget comparison,
+set `OPENPROJECT_BUDGET_COMPARISON_ENABLED=true` and configure
+`OPENPROJECT_DB_NAME`, `OPENPROJECT_DB_USER`, and `OPENPROJECT_DB_PASSWORD`
+for a dedicated read-only PostgreSQL account. The default DB host is
+`openproject`, port `5432`, and SSL mode `prefer`; adjust these if your
+database is hosted elsewhere. See [Configuration](configuration.md#database-grants-and-schema-access)
+for the required grants.
+
+To build the image locally from the repository root instead of pulling a
+release image, run `docker build -t ghcr.io/easyservices/openproject-ce-mcp-server:local .`
+and set `MCP_IMAGE_TAG=local` in the Compose `.env` file. To update to a
+release, set `MCP_IMAGE_TAG` to its version (or `latest`) and run
+`docker compose pull openproject-mcp` followed by
+`docker compose up -d openproject-mcp`.
+
+The runtime image is built for `linux/amd64` by the release workflow. Local
+builds use the host's default architecture.
 
 ## Prepare the application
 

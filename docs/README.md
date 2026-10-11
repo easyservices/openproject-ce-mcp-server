@@ -8,8 +8,9 @@ the supported transports and a quick start.
 
 - [Installation](installation.md) — development and production `.venv` setup,
   local stdio mode, remote HTTP mode, and GitHub Release artifacts.
-- [Production deployment](deployment.md) — separately hosted HTTP service,
-  API-token authentication, systemd, permissions, and audit log forwarding.
+- [Production deployment](deployment.md) — Docker Compose and GHCR image,
+  separately hosted HTTP service, API-token authentication, systemd,
+  permissions, and audit log forwarding.
 - [Configuration](configuration.md) — `.env` reference, tool scopes,
   audit event schema, error classification, and log rotation.
 - [Troubleshooting](troubleshooting.md) — diagnostics and common errors.

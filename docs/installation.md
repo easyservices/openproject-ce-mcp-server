@@ -80,10 +80,12 @@ for the systemd example, permissions, log rotation, and network setup.
 
 ## GitHub releases
 
-The project is hosted on GitHub and does not publish to PyPI. GitHub Releases
-may include source distributions and wheels for downloading, but the supported
-installation path is from a project checkout using the `.venv` instructions
-above.
+The project is hosted on GitHub and does not publish Python packages to PyPI.
+Install the Python package from a project checkout using the `.venv`
+instructions above. GitHub Releases may include source distributions and
+wheels, and publish a Docker image to
+`ghcr.io/easyservices/openproject-ce-mcp-server`; see [Production deployment](deployment.md#docker-compose)
+for the Compose overlay and local build instructions.
 
 ## See also
 

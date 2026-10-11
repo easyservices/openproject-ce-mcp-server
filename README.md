@@ -74,6 +74,7 @@ of the service. HTTP is allowed only in development mode. Each remote MCP user
 must provide their own OpenProject API token through the MCP client's
 `OPENPROJECT_API_TOKEN` environment variable. For Codex, see the
 [Codex connection guide](docs/codex.md) and [deployment guide](docs/deployment.md).
+The deployment guide includes a Docker Compose overlay and GHCR image details.
 
 ## Configuration
 

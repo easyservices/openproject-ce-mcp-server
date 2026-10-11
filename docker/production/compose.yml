@@ -1,0 +1,33 @@
+services:
+  openproject-mcp:
+    image: ghcr.io/easyservices/openproject-ce-mcp-server:${MCP_IMAGE_TAG:-latest}
+    container_name: openproject-mcp
+    depends_on:
+      - openproject
+    ports:
+      - "8766:8000"
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_ENVIRONMENT: "${MCP_ENVIRONMENT:-development}"
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+      MCP_PUBLIC_URL: "${MCP_PUBLIC_URL:-http://localhost:8766}"
+      MCP_SERVER_NAME: openproject
+      MCP_PATH: /mcp
+      MCP_ALLOWED_HOSTS: "${MCP_ALLOWED_HOSTS:-localhost:8766,127.0.0.1:8766}"
+      OPENPROJECT_BASE_URL: http://openproject
+      MCP_AUDIT_LOG_FILE: /app/logs/audit.jsonl
+      OPENPROJECT_BUDGET_COMPARISON_ENABLED: "${OPENPROJECT_BUDGET_COMPARISON_ENABLED:-false}"
+      OPENPROJECT_DB_TYPE: "${OPENPROJECT_DB_TYPE:-postgresql}"
+      OPENPROJECT_DB_HOST: "${OPENPROJECT_DB_HOST:-openproject}"
+      OPENPROJECT_DB_PORT: "${OPENPROJECT_DB_PORT:-5432}"
+      OPENPROJECT_DB_NAME: "${OPENPROJECT_DB_NAME:-}"
+      OPENPROJECT_DB_USER: "${OPENPROJECT_DB_USER:-}"
+      OPENPROJECT_DB_PASSWORD: "${OPENPROJECT_DB_PASSWORD:-}"
+      OPENPROJECT_DB_SSLMODE: "${OPENPROJECT_DB_SSLMODE:-prefer}"
+    volumes:
+      - ./data/mcp-audit:/app/logs
+    networks:
+      - mcp_web
+      - openproject_backend
+    restart: unless-stopped
