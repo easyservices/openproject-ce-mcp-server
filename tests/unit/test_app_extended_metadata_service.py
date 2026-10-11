@@ -19,7 +19,13 @@ from openproject_ce_mcp_server.app.ports.extended_metadata_api import (
     WorkingDayRecord,
 )
 from openproject_ce_mcp_server.app.services.extended_metadata_service import ExtendedMetadataService
-from openproject_ce_mcp_server.models import CustomOptionSummary, HelpTextSummary, NonWorkingDay, RenderedText, WorkingDay
+from openproject_ce_mcp_server.models import (
+    CustomOptionSummary,
+    HelpTextSummary,
+    NonWorkingDay,
+    RenderedText,
+    WorkingDay,
+)
 
 
 def _rendered_text_record() -> RenderedTextRecord:

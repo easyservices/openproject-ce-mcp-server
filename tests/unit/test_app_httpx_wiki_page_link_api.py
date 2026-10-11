@@ -5,7 +5,10 @@ import json
 import httpx
 import pytest
 
-from openproject_ce_mcp_server.app.adapters.httpx_wiki_page_link_api import HttpxWikiPageLinkApi, normalize_wiki_page_link
+from openproject_ce_mcp_server.app.adapters.httpx_wiki_page_link_api import (
+    HttpxWikiPageLinkApi,
+    normalize_wiki_page_link,
+)
 from openproject_ce_mcp_server.app.errors import OpenProjectServerError
 from openproject_ce_mcp_server.app.transport.httpx_transport import HttpxTransport
 

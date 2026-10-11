@@ -14,7 +14,10 @@ from openproject_ce_mcp_server.app.adapters.httpx_work_package_api import (
     normalize_work_package_summary,
 )
 from openproject_ce_mcp_server.app.errors import InvalidInputError
-from openproject_ce_mcp_server.app.ports.project_resolution import ProjectResolutionContext, WorkPackageResolutionContext
+from openproject_ce_mcp_server.app.ports.project_resolution import (
+    ProjectResolutionContext,
+    WorkPackageResolutionContext,
+)
 from openproject_ce_mcp_server.app.transport.httpx_transport import HttpxTransport
 from openproject_ce_mcp_server.models import SortCriterion
 

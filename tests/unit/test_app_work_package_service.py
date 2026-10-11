@@ -19,7 +19,11 @@ from openproject_ce_mcp_server.app.errors import (
 )
 from openproject_ce_mcp_server.app.ports.activity_api import ActivityRecord
 from openproject_ce_mcp_server.app.ports.status_priority_type_api import StatusRecord
-from openproject_ce_mcp_server.app.ports.work_package_api import WorkPackageFormResult, WorkPackagePage, WorkPackageRecord
+from openproject_ce_mcp_server.app.ports.work_package_api import (
+    WorkPackageFormResult,
+    WorkPackagePage,
+    WorkPackageRecord,
+)
 from openproject_ce_mcp_server.app.ports.work_package_resolution import WorkPackageAllowedContext
 from openproject_ce_mcp_server.app.resolvers.work_package_resolver import WorkPackageResolver
 from openproject_ce_mcp_server.app.services.work_package_service import WorkPackageService

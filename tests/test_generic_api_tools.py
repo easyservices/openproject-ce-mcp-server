@@ -28,9 +28,7 @@ def test_operations_read_standard_openapi_v3_paths_and_resolve_schemas() -> None
 
 def test_normalized_operations_and_operation_id_index_are_cached_per_client(monkeypatch) -> None:
     client = OpenProjectClient(
-        Settings.from_env(
-            {"OPENPROJECT_BASE_URL": "https://op.example.test", "OPENPROJECT_API_TOKEN": "test-token"}
-        )
+        Settings.from_env({"OPENPROJECT_BASE_URL": "https://op.example.test", "OPENPROJECT_API_TOKEN": "test-token"})
     )
     client._api_specification = {
         "paths": {"/api/v3/projects": {"get": {"operationId": "view_projects"}}},

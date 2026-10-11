@@ -132,7 +132,9 @@ def _app_import_violations(source: str) -> list[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name == "openproject_ce_mcp_server.app" or alias.name.startswith("openproject_ce_mcp_server.app."):
+                if alias.name == "openproject_ce_mcp_server.app" or alias.name.startswith(
+                    "openproject_ce_mcp_server.app."
+                ):
                     violations.append(ast.dump(node))
         elif isinstance(node, ast.ImportFrom):
             if node.level == 0 and node.module and node.module.startswith("openproject_ce_mcp_server.app"):
@@ -1293,7 +1295,10 @@ def test_work_package_resolver_methods_structurally_satisfy_the_seam_protocols()
     each bound method's runtime signature (param names, kinds, and defaults)
     against the corresponding Protocol's `__call__` signature.
     """
-    from openproject_ce_mcp_server.app.ports.work_package_ref import WorkPackageIdResolver, WorkPackageProjectAllowedCheck
+    from openproject_ce_mcp_server.app.ports.work_package_ref import (
+        WorkPackageIdResolver,
+        WorkPackageProjectAllowedCheck,
+    )
     from openproject_ce_mcp_server.app.resolvers.work_package_resolver import WorkPackageResolver
 
     def _bound_params(func: object) -> list[inspect.Parameter]:

@@ -3,7 +3,11 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from openproject_ce_mcp_server.app.adapters.httpx_group_api import HttpxGroupApi, normalize_group, normalize_group_detail
+from openproject_ce_mcp_server.app.adapters.httpx_group_api import (
+    HttpxGroupApi,
+    normalize_group,
+    normalize_group_detail,
+)
 from openproject_ce_mcp_server.app.transport.httpx_transport import HttpxTransport
 
 BASE_URL = "https://op.example.com"
