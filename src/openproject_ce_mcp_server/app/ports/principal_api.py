@@ -1,0 +1,47 @@
+"""Principals Domain API port.
+
+Read-only list only -- OpenProject exposes no single-item GET for a
+principal (users/groups have their own domain single-item GETs; `principals`
+is a read-only, combined-search collection over both).
+
+Distinct from `principal_ref.py`, which defines the separate
+`PrincipalRefResolver` seam Protocol -- a bare-callable seam several
+Services depend on (satisfied structurally by the bound method
+`self._resolve_principal_id`), unrelated to this Domain API port.
+
+`lookup_name`: the raw payload's `name`
+field, independent of `summary.name`. `normalize_principal` falls back to a
+synthetic display name (`f"Principal {id}"`) when the raw name is
+blank/missing -- correct DISPLAY behavior for list/get MCP tool output, but
+wrong for exact-name RESOLUTION (`PrincipalResolver` must not let a
+caller's literal search for "Principal 7" accidentally match a principal
+whose real name was blank). `lookup_name` is never synthesized, so
+`PrincipalResolver` compares against it instead of `summary.name`.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Protocol
+
+from ...models import PrincipalSummary
+
+
+@dataclass(frozen=True)
+class PrincipalRecord:
+    summary: PrincipalSummary
+    lookup_name: str
+
+
+class PrincipalApi(Protocol):
+    """Narrow, Principals-only Domain API port. PrincipalService and
+    PrincipalResolver both depend on this Protocol, never on
+    HttpxPrincipalApi concretely (enforced by the architecture-boundary
+    test). Deliberately ungated -- I/O and normalization only, no read-scope
+    check -- so PrincipalResolver can search principals without requiring
+    OPENPROJECT_ENABLE_ADMIN_READ (see PrincipalResolver's own docstring).
+    """
+
+    async def list_principals(
+        self, *, search: str | None, offset: int, page_size: int
+    ) -> tuple[list[PrincipalRecord], int]: ...

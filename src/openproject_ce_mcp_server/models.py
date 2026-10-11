@@ -1,0 +1,2120 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Literal, NamedTuple
+
+
+class SortCriterion(NamedTuple):
+    """A validated sort criterion with field name and direction.
+
+    Used to ensure type safety between tool validation and client execution.
+    """
+
+    field: str
+    direction: str  # "asc" or "desc"
+
+
+@dataclass
+class PageResult:
+    """Shared pagination envelope. Deliberately NOT Generic[T] with
+    `results` on the base -- a dataclass field typed `list[~T]` on a generic
+    base stays that way at runtime even when a subclass parametrizes it, which
+    would degrade the MCP output schema for `results.items` to an untyped `{}`
+    instead of a concrete $ref. Each subclass instead redeclares its own
+    concretely-typed `results` field, keeping field order (envelope fields
+    first, then results) identical to every pre-existing declaration.
+    """
+
+    offset: int
+    limit: int
+    total: int
+    count: int
+    next_offset: int | None
+    truncated: bool
+
+
+@dataclass
+class CollectionResult:
+    """Shared bare-collection envelope. See PageResult for why this
+    is not Generic[T] with `results` on the base.
+    """
+
+    count: int
+
+
+WriteResultState = Literal["rejected", "invalid", "preview", "confirmed"]
+"""Confirm-gated write/delete outcome (replaces the former
+confirmed/requires_confirmation boolean pair):
+- "rejected": confirm=False, payload invalid. No mutation was committed.
+  Fix the payload, then retry with confirm=true.
+- "invalid": confirm=True, payload invalid. No mutation was committed.
+  Retrying confirm alone will not help -- the payload itself must change.
+- "preview": confirm=False, payload valid. No mutation was committed.
+  Ask the user, then commit with confirm=true.
+- "confirmed": confirm=True, payload valid, committed.
+"""
+
+
+@dataclass
+class ConfirmationHeader:
+    """Shared confirm-gated write/delete header. Deliberately just
+    these 4 fields -- the ones genuinely common to all matching write
+    results. payload/validation_errors/result are NOT here: identity fields
+    vary in name/count/type and always sit between the header and payload,
+    and result's type differs per subclass, so a wider shared base would
+    either reorder every subclass's fields for no functional reason or
+    reintroduce the Generic[T] schema-degradation problem already
+    rejected for `results` (see PageResult). BulkWorkPackageWriteResult is
+    deliberately excluded from this hierarchy -- it lacks `ready` and is
+    batch-shaped, not a single confirm-gated action, and keeps its own
+    confirmed/requires_confirmation pair unchanged.
+
+    `state` replaces the former confirmed/requires_confirmation pair --
+    see WriteResultState. `ready` is fully derivable from `state`
+    (`state in ("preview", "confirmed")`) but is kept as its own field: it is
+    read directly by callers (e.g. work_package_service.py's
+    `_bulk_item_result`) and lets a consumer check "did this succeed
+    structurally" with a single boolean instead of a string comparison. This
+    is a deliberate, acknowledged redundancy for ergonomics, not independent
+    information.
+    """
+
+    action: str
+    state: WriteResultState
+    ready: bool
+    message: str
+
+
+@dataclass
+class ProjectSummary:
+    id: int
+    name: str
+    identifier: str | None
+    active: bool | None
+    description: str | None
+    public: bool | None = None
+    status: str | None = None
+    status_explanation: str | None = None
+    parent_id: int | None = None
+    parent_name: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    can_update: bool = False
+    can_delete: bool = False
+    favorited: bool | None = None
+    description_truncated: bool = False
+    description_length: int | None = None
+    status_explanation_truncated: bool = False
+    status_explanation_length: int | None = None
+
+
+@dataclass
+class ProjectDetail(ProjectSummary):
+    """Single-project read (get_project) only -- list_projects/ProjectListResult
+    stays on the leaner ProjectSummary so list responses don't carry every
+    row's ancestor chain (mirrors WorkPackageDetail.ancestors).
+    """
+
+    ancestors: list[dict[str, str | None]] | None = None
+    ancestors_truncated: bool = False
+
+
+@dataclass
+class ProjectListResult(PageResult):
+    results: list[ProjectSummary]
+
+
+@dataclass
+class RoleSummary:
+    id: int
+    name: str
+
+
+@dataclass
+class RoleListResult(PageResult):
+    results: list[RoleSummary]
+
+
+@dataclass
+class MembershipSummary:
+    id: int
+    principal_id: int | None
+    principal_name: str | None
+    project_id: int | None
+    project_name: str | None
+    role_ids: list[int]
+    role_names: list[str]
+    can_update: bool
+    can_update_immediately: bool
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass
+class MembershipListResult(PageResult):
+    results: list[MembershipSummary]
+
+
+@dataclass
+class ProjectWriteResult(ConfirmationHeader):
+    project_id: int | None
+    project: str | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: ProjectSummary | None
+
+
+@dataclass
+class ProjectCopyResult(ConfirmationHeader):
+    source_project_id: int | None
+    source_project: str | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    job_status_id: str | None
+
+
+@dataclass
+class JobStatusDetail:
+    id: str | None
+    type: str | None
+    status: str | None
+    message: str | None
+    project_id: int | None
+    project: str | None
+    created_resource_type: str | None
+    created_resource_id: int | None
+    created_resource_name: str | None
+
+
+@dataclass
+class MembershipWriteResult(ConfirmationHeader):
+    membership_id: int | None
+    project: str | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: MembershipSummary | None
+
+
+@dataclass
+class ProjectAccessSummary:
+    project_id: int
+    project_name: str
+    project_identifier: str | None
+    current_user_id: int
+    current_user_name: str | None
+    membership: MembershipSummary | None
+    inferred_is_project_admin: bool
+    inferred_can_edit_project: bool
+    inferred_can_manage_memberships: bool
+    inference_basis: str
+
+
+@dataclass
+class PrincipalSummary:
+    id: int
+    type: str | None
+    name: str
+    email: str | None
+
+
+@dataclass
+class PrincipalListResult(PageResult):
+    results: list[PrincipalSummary]
+
+
+@dataclass
+class UserSummary:
+    id: int
+    name: str | None
+    login: str | None
+    email: str | None
+    status: str | None
+    admin: bool | None
+    locked: bool | None
+    avatar_url: str | None
+    created_at: str | None
+    updated_at: str | None
+    firstname: str | None = None
+    lastname: str | None = None
+
+
+@dataclass
+class UserDetail:
+    id: int
+    name: str | None
+    login: str | None
+    email: str | None
+    status: str | None
+    admin: bool | None
+    locked: bool | None
+    avatar_url: str | None
+    created_at: str | None
+    updated_at: str | None
+    language: str | None
+    identity_url: str | None
+    auth_source: str | None
+    firstname: str | None = None
+    lastname: str | None = None
+
+
+@dataclass
+class UserListResult(PageResult):
+    results: list[UserSummary]
+
+
+@dataclass
+class GroupSummary:
+    id: int
+    name: str | None
+    member_count: int
+    created_at: str | None
+    updated_at: str | None
+    can_update: bool
+    can_delete: bool
+
+
+@dataclass
+class GroupDetail:
+    id: int
+    name: str | None
+    member_count: int
+    members: list[str]
+    created_at: str | None
+    updated_at: str | None
+    can_update: bool
+    can_delete: bool
+
+
+@dataclass
+class GroupListResult(PageResult):
+    results: list[GroupSummary]
+
+
+@dataclass
+class ActionSummary:
+    """id/url only -- OpenProject's actions API never populates name/description/
+    modules on the wire (verified across all supported versions: the
+    representer's `self` link title is always `-> {}`, and no other properties
+    are declared). Those three fields were removed as 100% dead weight.
+    """
+
+    id: str
+    url: str | None
+
+
+@dataclass
+class ActionListResult(PageResult):
+    results: list[ActionSummary]
+
+
+@dataclass
+class CapabilitySummary:
+    """name/action_name dropped -- OpenProject's capabilities API never
+    populates them on the wire (verified against OpenProject's own API
+    implementation: the representer's `self`/`action` link titles are always
+    `-> {}`, unlike `context`'s title, which is a genuine populated SQL
+    expression). Removed as dead weight.
+    """
+
+    id: str
+    action_id: str | None
+    principal_id: int | None
+    principal_name: str | None
+    context: str | None
+    url: str | None
+
+
+@dataclass
+class CapabilityListResult(PageResult):
+    results: list[CapabilitySummary]
+
+
+@dataclass
+class OptionValue:
+    id: int | None
+    title: str
+    href: str | None
+
+
+@dataclass
+class ProjectFieldSchema:
+    key: str
+    name: str
+    type: str | None
+    required: bool
+    writable: bool
+    has_default: bool
+    location: str | None
+    allowed_values: list[OptionValue]
+
+
+@dataclass
+class ProjectRef:
+    # Lightweight project picklist entry. Keep implementation rationale out of
+    # the class docstring because Pydantic may publish it as schema description.
+    id: int
+    identifier: str | None
+    name: str
+
+
+@dataclass
+class ProjectAdminContext:
+    project: ProjectSummary | None
+    available_statuses: list[OptionValue]
+    available_parent_projects: list[ProjectRef]
+    fields: list[ProjectFieldSchema]
+
+
+@dataclass
+class ProjectConfiguration:
+    project_id: int
+    project_name: str
+    maximum_attachment_file_size_bytes: int | None
+    maximum_api_v3_page_size: int | None
+    per_page_options: list[int]
+    duration_format: str | None
+    hours_per_day: int | float | None
+    days_per_month: int | float | None
+    active_feature_flags: list[str]
+    available_features: list[str]
+    trialling_features: list[str]
+    enabled_internal_comments: bool | None
+
+
+@dataclass
+class WorkPackageFieldSchema:
+    key: str
+    name: str
+    type: str | None
+    required: bool
+    writable: bool
+    has_default: bool
+    placeholder: str | None
+    location: str | None
+    allowed_values: list[OptionValue]
+
+
+@dataclass
+class ProjectWorkPackageContext:
+    project_id: int
+    project_name: str
+    project_identifier: str | None
+    selected_type_id: int | None
+    selected_type_name: str | None
+    available_types: list[OptionValue]
+    available_statuses: list[OptionValue]
+    available_priorities: list[OptionValue]
+    available_categories: list[OptionValue]
+    available_project_phases: list[OptionValue]
+    available_versions: list[VersionSummary]
+    fields: list[WorkPackageFieldSchema]
+    custom_fields: list[WorkPackageFieldSchema]
+
+
+@dataclass
+class WorkPackageSummary:
+    id: int
+    display_id: str | None
+    subject: str
+    type: str | None
+    status: str | None
+    priority: str | None
+    project_phase: str | None
+    assignee: str | None
+    responsible: str | None
+    project: str | None
+    version: str | None
+    target_versions: list[str]
+    observed_in_versions: list[str]
+    sprint: str | None
+    start_date: str | None
+    due_date: str | None
+    description: str | None
+    has_description: bool
+    description_truncated: bool = False
+    description_length: int | None = None
+    estimated_time: str | None = None
+    derived_estimated_time: str | None = None
+    spent_time: str | None = None
+    remaining_time: str | None = None
+    derived_remaining_time: str | None = None
+    duration: str | None = None
+    parent_id: int | None = None
+    parent_display_id: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    author: str | None = None
+    category: str | None = None
+    schedule_manually: bool | None = None
+    ignore_non_working_days: bool | None = None
+    derived_start_date: str | None = None
+    derived_due_date: str | None = None
+    percentage_done: int | None = None
+    derived_percentage_done: int | None = None
+    readonly: bool | None = None
+    has_project_attributes: bool | None = None
+    custom_fields: dict[str, Any] | None = None
+    custom_fields_truncated: bool = False
+    custom_comments: dict[str, str] | None = None
+    custom_comments_truncated: bool = False
+
+
+@dataclass
+class WorkPackageDetail:
+    id: int
+    display_id: str | None
+    subject: str
+    type: str | None
+    status: str | None
+    priority: str | None
+    project_phase: str | None
+    assignee: str | None
+    responsible: str | None
+    project: str | None
+    version: str | None
+    target_versions: list[str]
+    observed_in_versions: list[str]
+    sprint: str | None
+    parent_id: int | None
+    parent_display_id: str | None
+    start_date: str | None
+    due_date: str | None
+    lock_version: int | None
+    description: str | None
+    description_truncated: bool = False
+    description_length: int | None = None
+    estimated_time: str | None = None
+    derived_estimated_time: str | None = None
+    spent_time: str | None = None
+    remaining_time: str | None = None
+    derived_remaining_time: str | None = None
+    duration: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    author: str | None = None
+    category: str | None = None
+    children: list[dict[str, str | None]] | None = None
+    children_truncated: bool = False
+    ancestors: list[dict[str, str | None]] | None = None
+    ancestors_truncated: bool = False
+    schedule_manually: bool | None = None
+    ignore_non_working_days: bool | None = None
+    derived_start_date: str | None = None
+    derived_due_date: str | None = None
+    percentage_done: int | None = None
+    derived_percentage_done: int | None = None
+    readonly: bool | None = None
+    has_project_attributes: bool | None = None
+    custom_fields: dict[str, Any] | None = None
+    custom_fields_truncated: bool = False
+    custom_comments: dict[str, str] | None = None
+    custom_comments_truncated: bool = False
+
+
+@dataclass
+class WorkPackageWriteResult(ConfirmationHeader):
+    # A resolved work-package reference, e.g. from _work_package_ref: a numeric
+    # id or a project-prefixed display id (e.g. "PROJ-123"), passed through
+    # verbatim rather than always resolved to a number.
+    work_package_id: int | str | None
+    project: str | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: WorkPackageDetail | None
+
+
+@dataclass
+class BulkWorkPackageItemResult:
+    index: int
+    success: bool
+    error: str | None
+    result: WorkPackageWriteResult | None
+
+
+@dataclass
+class BulkWorkPackageWriteResult:
+    action: str
+    confirmed: bool
+    requires_confirmation: bool
+    total: int
+    succeeded: int
+    failed: int
+    message: str
+    items: list[BulkWorkPackageItemResult]
+
+
+@dataclass
+class ActivityWriteResult(ConfirmationHeader):
+    work_package_id: int | str
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: ActivitySummary | None
+
+
+@dataclass
+class RelationWriteResult(ConfirmationHeader):
+    relation_id: int | None
+    work_package_id: int | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: RelationSummary | None
+
+
+@dataclass
+class WorkPackageGroupSums:
+    """One `groupBy` bucket's aggregate, as returned by OpenProject's
+    `showSums=true`. `sums` holds OpenProject's own fixed summable-field set
+    (estimatedTime, storyPoints, percentageDone, remainingTime,
+    overallCosts, laborCosts, materialCosts, plus any custom fields) as raw,
+    unparsed server values -- same passthrough convention as
+    WorkPackageSummary.estimated_time.
+    """
+
+    value: str | None
+    count: int
+    sums: dict[str, Any] | None
+
+
+@dataclass
+class WorkPackageListResult(PageResult):
+    results: list[WorkPackageSummary]
+    groups: list[WorkPackageGroupSums] | None = None
+    total_sums: dict[str, Any] | None = None
+    # Populated only by search() when its query resolves directly to a work
+    # package (numeric id or display id) that also satisfies every other
+    # active filter -- kept separate from `results` rather than merged in,
+    # since merging would break pagination/total/sort_by consistency for a
+    # result set that already has well-defined semantics of its own.
+    exact_match: WorkPackageSummary | None = None
+
+
+@dataclass
+class BatchWorkPackageReadItemResult:
+    """Single item result from batch read operation."""
+
+    id: int | str
+    success: bool
+    work_package: WorkPackageDetail | None
+    error: str | None
+
+
+@dataclass
+class BatchWorkPackageReadResult:
+    """Result of batch read operation, mirroring BulkWorkPackageWriteResult pattern."""
+
+    action: str  # Always "batch_read"
+    total: int
+    succeeded: int
+    failed: int
+    message: str  # User-facing summary
+    results: list[BatchWorkPackageReadItemResult]
+
+
+@dataclass
+class VersionSummary:
+    id: int
+    name: str
+    status: str | None
+    sharing: str | None
+    start_date: str | None
+    end_date: str | None
+    defining_project: str | None
+    description: str | None
+    created_at: str | None = None
+    updated_at: str | None = None
+    description_truncated: bool = False
+    description_length: int | None = None
+
+
+@dataclass
+class VersionDetail(VersionSummary):
+    """Identical field shape to VersionSummary today; kept as a distinct
+    subclass (not a bare alias) so __name__/import path/MCP output schema
+    title for get_version stay exactly as they are.
+    """
+
+
+@dataclass
+class VersionWriteResult(ConfirmationHeader):
+    version_id: int | None
+    project: str | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: VersionDetail | None
+
+
+@dataclass
+class VersionListResult(PageResult):
+    results: list[VersionSummary]
+
+
+@dataclass
+class SprintSummary:
+    id: int
+    name: str
+    status: str | None
+    start_date: str | None
+    finish_date: str | None
+    defining_workspace_id: int | None
+    defining_workspace: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class SprintDetail(SprintSummary):
+    """Identical field shape to SprintSummary today; kept as a distinct
+    subclass (not a bare alias) so __name__/import path/MCP output schema
+    title for get_sprint stay exactly as they are (mirrors
+    VersionDetail/NewsDetail).
+    """
+
+
+@dataclass
+class SprintListResult(PageResult):
+    results: list[SprintSummary]
+
+
+@dataclass
+class BacklogBucketSummary:
+    id: int
+    name: str
+    defining_workspace_id: int | None
+    defining_workspace: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class BacklogBucketDetail(BacklogBucketSummary):
+    """Identical field shape to BacklogBucketSummary today; kept as a
+    distinct subclass (not a bare alias) so __name__/import path/MCP output
+    schema title for get_backlog_bucket stay exactly as they are (mirrors
+    SprintDetail/VersionDetail/NewsDetail).
+    """
+
+
+@dataclass
+class BacklogBucketListResult(PageResult):
+    results: list[BacklogBucketSummary]
+
+
+@dataclass
+class BoardFilter:
+    key: str | None
+    name: str | None
+    operator: str | None
+    values: list[str]
+
+
+@dataclass
+class BoardSummary:
+    id: int
+    name: str
+    project_id: int | None
+    project: str | None
+    public: bool
+    hidden: bool
+    starred: bool
+    include_subprojects: bool
+    show_hierarchies: bool
+    timeline_visible: bool
+    filter_count: int
+    can_update: bool
+    can_delete: bool
+
+
+@dataclass
+class BoardDetail:
+    id: int
+    name: str
+    project_id: int | None
+    project: str | None
+    public: bool
+    hidden: bool
+    starred: bool
+    include_subprojects: bool
+    show_hierarchies: bool
+    timeline_visible: bool
+    timeline_zoom_level: str | None
+    highlighting_mode: str | None
+    group_by: str | None
+    columns: list[str]
+    sort_by: list[str]
+    highlighted_attributes: list[str]
+    timestamps: list[str]
+    filters: list[BoardFilter]
+    created_at: str | None
+    updated_at: str | None
+    can_update: bool
+    can_delete: bool
+
+
+@dataclass
+class BoardWriteResult(ConfirmationHeader):
+    board_id: int | None
+    project: str | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: BoardDetail | None
+
+
+@dataclass
+class BoardListResult(PageResult):
+    results: list[BoardSummary]
+
+
+@dataclass
+class ViewSummary:
+    id: int
+    type: str | None
+    name: str
+    project_id: int | None
+    project: str | None
+    query_id: int | None
+    query: str | None
+    public: bool
+    starred: bool
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class ViewDetail:
+    id: int
+    type: str | None
+    name: str
+    project_id: int | None
+    project: str | None
+    query_id: int | None
+    query: str | None
+    public: bool
+    starred: bool
+    created_at: str | None
+    updated_at: str | None
+    links: list[str]
+
+
+@dataclass
+class ViewListResult(PageResult):
+    results: list[ViewSummary]
+
+
+@dataclass
+class QueryFilterSummary:
+    id: str
+    name: str | None
+    url: str | None
+
+
+@dataclass
+class QueryColumnSummary:
+    id: str
+    name: str | None
+    type: str | None
+    relation_type: str | None
+    url: str | None
+
+
+@dataclass
+class QueryOperatorSummary:
+    id: str
+    name: str | None
+    url: str | None
+
+
+@dataclass
+class QuerySortBySummary:
+    id: str
+    name: str | None
+    column: str | None
+    direction: str | None
+    url: str | None
+
+
+@dataclass
+class QueryFilterInstanceSchemaSummary:
+    id: str
+    name: str | None
+    filter: str | None
+    operator_count: int
+    url: str | None
+
+
+@dataclass
+class QueryFilterInstanceSchemaListResult(CollectionResult):
+    results: list[QueryFilterInstanceSchemaSummary]
+
+
+@dataclass
+class CategorySummary:
+    id: int
+    name: str
+    project_id: int | None
+    project: str | None
+    default_assignee_id: int | None = None
+    default_assignee: str | None = None
+
+
+@dataclass
+class CategoryListResult(CollectionResult):
+    results: list[CategorySummary]
+
+
+@dataclass
+class DocumentSummary:
+    id: int
+    title: str
+    project_id: int | None
+    project: str | None
+    description: str | None
+    created_at: str | None
+    attachment_count: int
+    can_update: bool
+    description_truncated: bool = False
+    description_length: int | None = None
+
+
+@dataclass
+class DocumentDetail:
+    id: int
+    title: str
+    project_id: int | None
+    project: str | None
+    description: str | None
+    created_at: str | None
+    attachment_count: int
+    can_update: bool
+    description_truncated: bool = False
+    description_length: int | None = None
+
+
+@dataclass
+class DocumentWriteResult(ConfirmationHeader):
+    document_id: int | None
+    project: str | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: DocumentDetail | None
+
+
+@dataclass
+class DocumentListResult(PageResult):
+    results: list[DocumentSummary]
+
+
+@dataclass
+class AttachmentSummary:
+    id: int
+    title: str
+    file_name: str | None
+    file_size_bytes: int | None
+    description: str | None
+    content_type: str | None
+    status: str | None
+    author: str | None
+    container_type: str | None
+    container_id: int | None
+    created_at: str | None
+    download_url: str | None
+
+
+@dataclass
+class AttachmentContentResult:
+    """What happened when an attachment's content was fetched for inlining.
+
+    The metadata half of `get_attachment_content` (and of each entry in
+    `list_work_package_attachments`' `include_images`): the bytes themselves,
+    when there are any, travel as a native MCP content block alongside this,
+    never inside it. `outcome` says which:
+
+    - ``"image"``      an inlineable image; an ImageContent block follows
+    - ``"text"``       text-like content; a TextContent block follows,
+                       cut at the byte cap when ``truncated`` is true
+    - ``"too_large"``  over the byte cap and not truncatable (an image is
+                       never returned partially); no content block
+    - ``"not_inline_supported"``  a content type no MCP client can use as a
+                       block (an arbitrary binary blob); no content block,
+                       no bytes -- ``reason`` says why
+
+    ``content_type`` is the served response's own type for content that was
+    inlined (``image``/``text``/``too_large``), except for text-like content
+    the server labelled ``application/octet-stream``, where it is the stored
+    metadata's type. For ``not_inline_supported`` it is the stored metadata's
+    type throughout: the served header for a blob OpenProject will not inline
+    is a generic ``application/octet-stream`` that says nothing about the
+    file. Either way, only the reported value follows the stored type -- the
+    classification itself is made on the served header.
+    ``size_bytes`` is the size of the content block that follows (so, the cap
+    itself when ``truncated``) -- not the attachment's stored size, and None
+    when no content block was included or when ``file_size_bytes`` is hidden
+    by server configuration.
+    """
+
+    attachment_id: int
+    file_name: str | None
+    outcome: str
+    content_type: str | None
+    size_bytes: int | None
+    truncated: bool
+    reason: str | None
+
+
+@dataclass
+class AttachmentListResult(PageResult):
+    results: list[AttachmentSummary]
+    total_size_bytes: int | None = None
+    # Only populated by include_images=true: one entry per attachment that was
+    # considered for inlining, including the ones that were skipped (an
+    # entry with outcome != "image" is a skip and carries its reason). The
+    # ImageContent blocks for the successful ones follow this result's own
+    # JSON, in the same order as their entries here.
+    images: list[AttachmentContentResult] | None = None
+
+
+@dataclass(frozen=True)
+class AttachmentContentOutcome:
+    """One attachment's inlining result: the metadata the caller gets back
+    (`metadata`, serialized as the leading JSON block), plus the payload for
+    the native content block the tool layer builds from it.
+
+    Never serialized itself -- it crosses the Service -> tool boundary, and
+    lives here rather than in the Service module because that boundary is
+    also the `app/` -> tool-layer boundary: the tool layer may not import from
+    `app/`, and `app/` may not import the `mcp` SDK, so the shared shape has
+    to sit at the package root and the block construction on the tool side.
+    `image_bytes` is populated only when `metadata.outcome == "image"`, `text`
+    only when it is `"text"`, and neither for a skip.
+    """
+
+    metadata: AttachmentContentResult
+    image_bytes: bytes | None = None
+    text: str | None = None
+
+
+@dataclass(frozen=True)
+class AttachmentListWithImages:
+    """`list_work_package_attachments`' result when `include_images` is set.
+
+    `list_result.images` already describes every attachment that was
+    considered (including the skipped ones and why); `included` carries only
+    the ones that actually produced bytes, in the same order, so the tool
+    layer can append their blocks without re-filtering. Not a `*ListResult`
+    itself (deliberately: it wraps one) and never serialized directly.
+    """
+
+    list_result: AttachmentListResult
+    included: tuple[AttachmentContentOutcome, ...]
+
+
+@dataclass
+class AttachmentWriteResult(ConfirmationHeader):
+    attachment_id: int | None
+    work_package_id: int | str | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: AttachmentSummary | None
+
+
+@dataclass
+class InstanceConfiguration:
+    host_name: str | None
+    maximum_attachment_file_size_bytes: int | None
+    maximum_api_v3_page_size: int | None
+    per_page_options: list[int]
+    duration_format: str | None
+    hours_per_day: int | float | None
+    days_per_month: int | float | None
+    active_feature_flags: list[str]
+    available_features: list[str]
+    trialling_features: list[str]
+
+
+@dataclass
+class ProjectPhaseDefinition:
+    id: int
+    name: str
+    start_gate: str | None
+    finish_gate: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class ProjectPhaseDefinitionListResult(CollectionResult):
+    results: list[ProjectPhaseDefinition]
+
+
+@dataclass
+class ProjectPhase:
+    id: int
+    name: str
+    project_id: int | None
+    project: str | None
+    phase_definition_id: int | None
+    phase_definition: str | None
+    start_date: str | None
+    finish_date: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class TimeEntryActivitySummary:
+    id: int
+    name: str
+    position: int | None
+    is_default: bool
+    projects: list[str]
+
+
+@dataclass
+class TimeEntryActivityListResult(CollectionResult):
+    results: list[TimeEntryActivitySummary]
+
+
+@dataclass
+class TimeEntrySummary:
+    id: int
+    project: str | None
+    entity_type: str | None
+    entity_id: int | None
+    entity_name: str | None
+    user: str | None
+    activity: str | None
+    hours: str | None
+    spent_on: str | None
+    start_time: str | None
+    end_time: str | None
+    ongoing: bool
+    comment: str | None
+    created_at: str | None
+    updated_at: str | None
+    comment_truncated: bool = False
+    comment_length: int | None = None
+
+
+@dataclass
+class TimeEntryWriteResult(ConfirmationHeader):
+    time_entry_id: int | None
+    project: str | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: TimeEntrySummary | None
+
+
+@dataclass
+class CostEntrySummary:
+    id: int
+    project: str | None
+    cost_type: str | None
+    user: str | None
+    entity_id: int | None
+    entity_name: str | None
+    spent_units: str | None
+    spent_on: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class CostEntryListResult(CollectionResult):
+    results: list[CostEntrySummary]
+
+
+@dataclass
+class CostTypeSummary:
+    id: int
+    name: str | None
+    unit: str | None
+    unit_plural: str | None
+    is_default: bool
+
+
+@dataclass
+class WorkPackageCostsByTypeElement:
+    cost_type: str | None
+    cost_type_id: int | None
+    spent_units: str | None
+
+
+@dataclass
+class WorkPackageCostsByTypeResult:
+    work_package_id: int
+    count: int
+    results: list[WorkPackageCostsByTypeElement]
+
+
+@dataclass
+class TimeEntryListResult(PageResult):
+    results: list[TimeEntrySummary]
+    total_hours: str | None = None
+    total_hours_truncated: bool = False
+
+
+@dataclass
+class CurrentUser:
+    id: int
+    name: str | None
+    login: str | None
+
+
+@dataclass
+class QueriedRelationPerspective:
+    """Caller-relative reading of a relation's stored type/from_id/to_id,
+    from the point of view of one specific work package (the one a caller
+    queried relations FOR). Purely derived, additive: never changes type/
+    from_id/to_id, which stay OpenProject's raw, perspective-stable values.
+    Only present when a query anchor exists (list_for_work_package/
+    get_work_package_relations); absent (None on the summary) for a global,
+    unanchored list_all() result, where no single work package is "the one
+    being queried" to read the relation relative to.
+
+    effective_type mirrors OpenProject's own label_for(work_package) logic
+    (relation.rb): the stored type read from queried_work_package_id's side
+    -- e.g. a stored "blocks" (from_id blocks to_id) reads as "blocked"
+    when queried from to_id's side. direction says which raw id
+    (queried_work_package_id) equals: "from" or "to".
+
+    predecessor_id/successor_id are populated ONLY for the "precedes"/
+    "follows" type pair, mirroring OpenProject's own Relation#predecessor_id/
+    successor_id (relation.rb) -- these are the only two relation types with
+    a defined temporal-scheduling direction upstream (lag, soonest-start
+    computation); every other type has no equivalent first/second concept,
+    so both stay None there rather than guessing one.
+
+    Never populated at all when either raw from_id/to_id is hidden via
+    OPENPROJECT_HIDE_RELATION_FIELDS -- direction and predecessor_id/
+    successor_id both embed one of those two raw ids, and the top-level
+    hidden-fields mechanism (apply_hidden_fields) only drops a field by
+    name, it cannot see into this nested dataclass to redact just the id
+    inside it. See RelationService._stamp.
+    """
+
+    queried_work_package_id: int
+    direction: str
+    effective_type: str | None
+    predecessor_id: int | None
+    successor_id: int | None
+
+
+@dataclass
+class RelationSummary:
+    id: int
+    type: str | None
+    description: str | None
+    from_id: int | None
+    from_subject: str | None
+    to_id: int | None
+    to_subject: str | None
+    description_truncated: bool = False
+    description_length: int | None = None
+    queried_perspective: QueriedRelationPerspective | None = None
+
+
+@dataclass
+class RelationListResult(PageResult):
+    results: list[RelationSummary]
+
+
+@dataclass
+class ActivitySummary:
+    id: int
+    type: str | None
+    version: int | None
+    user: str | None
+    comment: str | None
+    created_at: str | None
+    comment_truncated: bool = False
+    comment_length: int | None = None
+    details: list[dict[str, Any]] | None = None
+    details_truncated: bool = False
+
+
+@dataclass
+class ActivityListResult(CollectionResult):
+    results: list[ActivitySummary]
+
+
+@dataclass
+class NewsSummary:
+    id: int
+    title: str
+    summary: str | None
+    description: str | None
+    project_id: int | None
+    project: str | None
+    author: str | None
+    created_at: str | None
+    can_update: bool
+    can_delete: bool
+    description_truncated: bool = False
+    description_length: int | None = None
+
+
+@dataclass
+class NewsDetail(NewsSummary):
+    """Identical field shape to NewsSummary today; kept as a distinct subclass
+    (not a bare alias) so __name__/import path/MCP output schema title for
+    get_news stay exactly as they are.
+    """
+
+
+@dataclass
+class NewsWriteResult(ConfirmationHeader):
+    news_id: int | None
+    project: str | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: NewsDetail | None
+
+
+@dataclass
+class NewsListResult(PageResult):
+    results: list[NewsSummary]
+
+
+@dataclass
+class WikiPageDetail:
+    id: int
+    title: str
+    project_id: int | None
+    project: str | None
+
+
+@dataclass
+class WikiPageListResult:
+    count: int
+    total: int
+    results: list[WikiPageDetail]
+
+
+@dataclass
+class PostDetail:
+    id: int
+    subject: str
+    project_id: int | None
+    project: str | None
+
+
+@dataclass
+class StatusSummary:
+    id: int
+    name: str
+    is_default: bool
+    is_closed: bool
+    color: str | None
+    position: int | None
+    is_readonly: bool | None = None
+    default_done_ratio: int | None = None
+    excluded_from_totals: bool | None = None
+
+
+@dataclass
+class StatusListResult(CollectionResult):
+    results: list[StatusSummary]
+
+
+@dataclass
+class PrioritySummary:
+    id: int
+    name: str
+    is_default: bool
+    is_active: bool
+    color: str | None
+    position: int | None
+
+
+@dataclass
+class PriorityListResult(CollectionResult):
+    results: list[PrioritySummary]
+
+
+@dataclass
+class TypeSummary:
+    id: int
+    name: str
+    color: str | None
+    position: int | None
+    is_default: bool
+    is_milestone: bool
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass
+class TypeListResult(CollectionResult):
+    results: list[TypeSummary]
+
+
+@dataclass
+class WatcherSummary:
+    id: int
+    name: str
+    login: str | None
+
+
+@dataclass
+class WatcherListResult(CollectionResult):
+    results: list[WatcherSummary]
+
+
+@dataclass
+class WatcherWriteResult(ConfirmationHeader):
+    work_package_id: int | str
+    watcher_user_id: int | None
+    validation_errors: dict
+    result: WatcherSummary | None
+
+
+@dataclass
+class NotificationSummary:
+    id: int
+    subject: str
+    reason: str | None
+    read: bool
+    project_id: int | None
+    project_name: str | None
+    work_package_id: int | None
+    work_package_subject: str | None
+    created_at: str
+
+
+@dataclass
+class NotificationListResult:
+    count: int
+    total: int
+    truncated: bool
+    next_offset: int | None
+    results: list[NotificationSummary]
+
+
+@dataclass
+class UserWriteResult(ConfirmationHeader):
+    user_id: int | None
+    payload: dict
+    validation_errors: dict
+    result: UserDetail | None
+
+
+@dataclass
+class GroupWriteResult(ConfirmationHeader):
+    group_id: int | None
+    payload: dict
+    validation_errors: dict
+    result: GroupSummary | None
+
+
+# --- Storages (provider-polymorphic; discriminator = provider_type) --------
+#
+# provider_type is a plain string discriminator ("Nextcloud" | "OneDrive" |
+# "Sharepoint", matching the API's own `type` link title -- the last segment
+# of the URN, e.g. "urn:openproject-org:api:v3:storages:Nextcloud") rather
+# than a nested tagged-union type, matching this codebase's flat-dataclass
+# convention: every other domain uses flat optional fields, never a
+# Union/sum-type model. Fields that only apply to one provider default to
+# None for every other provider, mirroring GroupDetail's flat-optional-field
+# style.
+#
+# No can_update/can_delete fields: StorageRepresenter (OpenProject's Ruby
+# representer for this resource) declares no `link :update`/`link :delete`
+# at all -- verified directly against source -- so there is no HAL signal to
+# derive them from. Adding always-False fields would be actively misleading
+# rather than merely unused.
+
+
+@dataclass
+class StorageSummary:
+    id: int
+    name: str
+    provider_type: str
+    host: str | None
+    configured: bool
+    created_at: str | None
+    updated_at: str | None
+    # Nextcloud-only (None for every other provider)
+    has_application_password: bool | None = None
+    forbidden_file_name_characters: str | None = None
+    # OneDrive-only (None for every other provider)
+    tenant_id: str | None = None
+    drive_id: str | None = None
+
+
+@dataclass
+class StorageDetail:
+    id: int
+    name: str
+    provider_type: str
+    host: str | None
+    configured: bool
+    # "connected" | "not_connected" | "failed_authorization" | "error" --
+    # normalized from the authorizationState link's URN (PascalCase suffix,
+    # e.g. "FailedAuthorization") to snake_case for consistency with every
+    # other enum-shaped field in this codebase.
+    authorization_state: str | None
+    # Nextcloud only: "two_way_oauth2" | "oauth2_sso"; None for every other
+    # provider (the authenticationMethod link is only rendered for Nextcloud).
+    authentication_method: str | None
+    created_at: str | None
+    updated_at: str | None
+    has_application_password: bool | None = None
+    forbidden_file_name_characters: str | None = None
+    tenant_id: str | None = None
+    drive_id: str | None = None
+
+
+@dataclass
+class StorageListResult(PageResult):
+    results: list[StorageSummary]
+
+
+@dataclass
+class StorageWriteResult(ConfirmationHeader):
+    storage_id: int | None
+    payload: dict
+    validation_errors: dict
+    result: StorageDetail | None
+
+
+# --- Project Storages (read-only, project-scoped) ---------------------------
+#
+# No write model: OpenProject's v3 API mounts only GET (Index/Show) for
+# project_storages -- no create/update/delete endpoint exists at all
+# (confirmed against modules/storages/lib/api/v3/project_storages/
+# project_storages_api.rb: only `get` verbs are grape-mounted).
+
+
+@dataclass
+class ProjectStorageSummary:
+    id: int
+    project_id: int | None
+    project: str | None
+    storage_id: int | None
+    storage_name: str | None
+    project_folder_mode: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class ProjectStorageDetail:
+    id: int
+    project_id: int | None
+    project: str | None
+    storage_id: int | None
+    storage_name: str | None
+    project_folder_mode: str | None
+    creator_id: int | None
+    creator: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class ProjectStorageListResult(PageResult):
+    results: list[ProjectStorageSummary]
+
+
+@dataclass
+class FileLinkSummary:
+    id: int
+    title: str
+    storage_id: int | None
+    storage_name: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class FileLinkListResult(PageResult):
+    results: list[FileLinkSummary]
+
+
+@dataclass
+class FileLinkWriteResult(ConfirmationHeader):
+    file_link_id: int | None
+    work_package_id: int | None
+    validation_errors: dict
+    result: FileLinkSummary | None
+
+
+@dataclass
+class GridSummary:
+    id: int
+    row_count: int | None
+    column_count: int | None
+    scope: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class GridListResult(PageResult):
+    results: list[GridSummary]
+
+
+@dataclass
+class GridWriteResult(ConfirmationHeader):
+    grid_id: int | None
+    scope: str | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: GridSummary | None
+
+
+@dataclass
+class UserPreferences:
+    time_zone: str | None
+    comment_sort_descending: bool | None
+    warn_on_leaving_unsaved: bool | None
+    auto_hide_popups: bool | None
+
+
+@dataclass
+class UserPreferencesWriteResult(ConfirmationHeader):
+    payload: dict[str, Any]
+    result: UserPreferences | None
+
+
+@dataclass
+class RenderedText:
+    format: str
+    raw: str
+    html: str
+
+
+@dataclass
+class HelpTextSummary:
+    id: int
+    attribute_name: str | None
+    attribute_caption: str | None
+    help_text: str | None
+
+
+@dataclass
+class HelpTextListResult(CollectionResult):
+    results: list[HelpTextSummary]
+
+
+@dataclass
+class WorkingDay:
+    name: str
+    day_of_week: int
+    working: bool
+
+
+@dataclass
+class WorkingDayListResult(CollectionResult):
+    results: list[WorkingDay]
+
+
+@dataclass
+class NonWorkingDay:
+    date: str
+    name: str | None
+
+
+@dataclass
+class NonWorkingDayListResult(CollectionResult):
+    results: list[NonWorkingDay]
+
+
+@dataclass
+class CustomOptionSummary:
+    id: int
+    value: str | None
+
+
+@dataclass
+class RelationUpdateResult(ConfirmationHeader):
+    relation_id: int | None
+    payload: dict[str, Any]
+    result: RelationSummary | None
+
+
+@dataclass
+class EmojiReactionSummary:
+    reaction: str
+    emoji: str | None
+    count: int
+    users: list[str]
+
+
+@dataclass
+class EmojiReactionListResult(CollectionResult):
+    results: list[EmojiReactionSummary]
+
+
+@dataclass
+class EmojiReactionWriteResult(ConfirmationHeader):
+    """Confirm-gated toggle result. Deliberately its own type rather than
+    EmojiReactionListResult (which stays a pure read shape used by
+    list_work_package_reactions) — the exact add/remove outcome is not known
+    ahead of the actual PATCH, so the preview state only describes the
+    toggle's nature, not its resulting reaction list."""
+
+    activity_id: int
+    reaction: str
+    result: EmojiReactionListResult | None
+
+
+@dataclass
+class NotificationMarkResult(ConfirmationHeader):
+    """Confirm-gated mark-as-read result. No OpenProject dry-run
+    endpoint exists for this action, so ``ready=True`` in the preview state
+    means only "the request is valid and will be sent once confirmed" — not
+    that OpenProject has validated it server-side."""
+
+    notification_id: int | None  # None means "all unread notifications"
+
+
+@dataclass
+class ReminderSummary:
+    id: int
+    remind_at: str | None
+    note: str | None
+    work_package_id: int | None
+    creator: str | None
+
+
+@dataclass
+class ReminderListResult(PageResult):
+    results: list[ReminderSummary]
+
+
+@dataclass
+class ReminderWriteResult(ConfirmationHeader):
+    reminder_id: int | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: ReminderSummary | None
+
+
+@dataclass
+class FavoriteWriteResult(ConfirmationHeader):
+    project_id: int | None
+    project: str | None
+
+
+@dataclass
+class WikiPageLinkSummary:
+    id: int
+    identifier: str | None
+    link_type: str | None  # "inline" or "relation"
+    provider: str | None
+    work_package_id: int | None
+    author: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class WikiPageLinkListResult(PageResult):
+    results: list[WikiPageLinkSummary]
+
+
+@dataclass
+class WikiPageLinkWriteResult(ConfirmationHeader):
+    link_id: int | None
+    work_package_id: int | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: WikiPageLinkSummary | None
+
+
+@dataclass
+class UserNonWorkingTimeSummary:
+    id: int
+    user_id: int | None
+    user_name: str | None
+    start_date: str | None
+    end_date: str | None
+
+
+@dataclass
+class UserNonWorkingTimeListResult(PageResult):
+    results: list[UserNonWorkingTimeSummary]
+
+
+@dataclass
+class UserNonWorkingTimeWriteResult(ConfirmationHeader):
+    non_working_time_id: int | None
+    user_id: int | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: UserNonWorkingTimeSummary | None
+
+
+@dataclass
+class UserWorkingHoursSummary:
+    id: int
+    user_id: int | None
+    user_name: str | None
+    valid_from: str | None
+    monday_hours: float | None
+    tuesday_hours: float | None
+    wednesday_hours: float | None
+    thursday_hours: float | None
+    friday_hours: float | None
+    saturday_hours: float | None
+    sunday_hours: float | None
+    availability_factor: float | None
+
+
+@dataclass
+class UserWorkingHoursListResult(PageResult):
+    results: list[UserWorkingHoursSummary]
+
+
+@dataclass
+class UserWorkingHoursWriteResult(ConfirmationHeader):
+    working_hours_id: int | None
+    user_id: int | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: UserWorkingHoursSummary | None
+
+
+# --- Meetings ---
+
+
+@dataclass
+class MeetingParticipantSummary:
+    id: int
+    name: str | None
+
+
+@dataclass
+class MeetingSummary:
+    id: int
+    title: str | None
+    location: str | None
+    lock_version: int
+    start_time: str | None
+    end_time: str | None
+    duration: str | None
+    state: str | None
+    sharing: str | None
+    template: bool
+    notify: bool
+    author: str | None
+    participants: list[MeetingParticipantSummary]
+    project_id: int | None
+    project: str | None
+    recurring_meeting_id: int | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class MeetingListResult(PageResult):
+    results: list[MeetingSummary]
+
+
+@dataclass
+class MeetingWriteResult(ConfirmationHeader):
+    meeting_id: int | None
+    project: str | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: MeetingSummary | None
+
+
+# --- Meeting Agenda Items ---
+
+
+@dataclass
+class MeetingAgendaItemSummary:
+    id: int
+    title: str | None
+    notes: str | None
+    notes_truncated: bool
+    notes_length: int | None
+    position: int | None
+    duration_in_minutes: int | None
+    item_type: str | None
+    lock_version: int
+    meeting_id: int | None
+    author: str | None
+    presenter: str | None
+    work_package_id: int | None
+    meeting_section_id: int | None
+    outcome_ids: list[int]
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class MeetingAgendaItemListResult(PageResult):
+    results: list[MeetingAgendaItemSummary]
+
+
+@dataclass
+class MeetingAgendaItemWriteResult(ConfirmationHeader):
+    agenda_item_id: int | None
+    meeting_id: int | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: MeetingAgendaItemSummary | None
+
+
+# --- Meeting Outcomes (OpenProject 17.6+) ---
+
+
+@dataclass
+class MeetingOutcomeSummary:
+    id: int
+    kind: str | None
+    notes: str | None
+    notes_truncated: bool
+    notes_length: int | None
+    author: str | None
+    meeting_agenda_item_id: int | None
+    work_package_id: int | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class MeetingOutcomeListResult(PageResult):
+    results: list[MeetingOutcomeSummary]
+
+
+@dataclass
+class MeetingOutcomeWriteResult(ConfirmationHeader):
+    outcome_id: int | None
+    meeting_agenda_item_id: int | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: MeetingOutcomeSummary | None
+
+
+# --- Meeting Sections ---
+
+
+@dataclass
+class MeetingSectionSummary:
+    id: int
+    title: str | None
+    position: int | None
+    backlog: bool
+    meeting_id: int | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class MeetingSectionListResult(PageResult):
+    results: list[MeetingSectionSummary]
+
+
+@dataclass
+class MeetingSectionWriteResult(ConfirmationHeader):
+    section_id: int | None
+    meeting_id: int | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: MeetingSectionSummary | None
+
+
+# --- Recurring Meetings ---
+
+
+@dataclass
+class RecurringMeetingSummary:
+    id: int
+    title: str | None
+    frequency: str | None
+    monthly_day: int | None
+    monthly_ordinal: str | None
+    monthly_weekday: str | None
+    interval: int | None
+    end_after: str | None
+    end_date: str | None
+    iterations: int | None
+    time_zone: str | None
+    start_time: str | None
+    location: str | None
+    duration: float | None
+    notify: bool | None
+    author: str | None
+    project_id: int | None
+    project: str | None
+    template_meeting_id: int | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class RecurringMeetingListResult(PageResult):
+    results: list[RecurringMeetingSummary]
+
+
+@dataclass
+class RecurringMeetingWriteResult(ConfirmationHeader):
+    recurring_meeting_id: int | None
+    project: str | None
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: RecurringMeetingSummary | None
+
+
+# --- Recurring Meeting Occurrences (virtual -- init/cancel only) ---
+
+
+@dataclass
+class RecurringMeetingOccurrenceSummary:
+    start_time: str
+    state: str
+    meeting_id: int | None
+
+
+@dataclass
+class RecurringMeetingOccurrenceListResult:
+    """Deliberately NOT a PageResult subclass: none of the four upstream
+    occurrence-list filters (upcoming/past/cancelled/open) carry an
+    offset/pageSize pagination envelope -- upcoming takes only a bare
+    `limit` (server-side capped, no offset param at all); past/cancelled/open
+    take no params whatsoever and return everything. Forcing PageResult's
+    shape here would fabricate offset/next_offset/truncated fields that
+    correspond to nothing real server-side.
+    """
+
+    recurring_meeting_id: int
+    filter: str
+    count: int
+    results: list[RecurringMeetingOccurrenceSummary]
+
+
+@dataclass
+class RecurringMeetingOccurrenceWriteResult(ConfirmationHeader):
+    recurring_meeting_id: int
+    start_time: str
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: MeetingSummary | None
+
+
+# --- GitHub / GitLab work-package linkage (entirely read-only) ---
+
+
+@dataclass
+class GithubPullRequestSummary:
+    id: int
+    number: int | None
+    html_url: str | None
+    state: str | None
+    repository: str | None
+    repository_html_url: str | None
+    github_updated_at: str | None
+    title: str | None
+    body: str | None
+    body_truncated: bool
+    body_length: int | None
+    draft: bool
+    merged: bool
+    merged_at: str | None
+    comments_count: int | None
+    review_comments_count: int | None
+    additions_count: int | None
+    deletions_count: int | None
+    changed_files_count: int | None
+    labels: list[str]
+    author: str | None
+    merged_by: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class GithubPullRequestListResult(CollectionResult):
+    results: list[GithubPullRequestSummary]
+
+
+@dataclass
+class GitlabIssueSummary:
+    id: int
+    number: int | None
+    html_url: str | None
+    state: str | None
+    repository: str | None
+    gitlab_updated_at: str | None
+    title: str | None
+    body: str | None
+    body_truncated: bool
+    body_length: int | None
+    labels: list[str]
+    author: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class GitlabIssueListResult(CollectionResult):
+    results: list[GitlabIssueSummary]
+
+
+@dataclass
+class GitlabMergeRequestSummary:
+    id: int
+    number: int | None
+    html_url: str | None
+    state: str | None
+    repository: str | None
+    gitlab_updated_at: str | None
+    title: str | None
+    body: str | None
+    body_truncated: bool
+    body_length: int | None
+    draft: bool
+    merged: bool
+    labels: list[str]
+    author: str | None
+    merged_by: str | None
+    created_at: str | None
+    updated_at: str | None
+
+
+@dataclass
+class GitlabMergeRequestListResult(CollectionResult):
+    results: list[GitlabMergeRequestSummary]
+
+
+@dataclass
+class ContainerAttachmentWriteResult(ConfirmationHeader):
+    """Upload result for an attachment on a container other than a work
+    package (wiki page, forum post, meeting, comment)."""
+
+    attachment_id: int | None
+    container_type: str
+    container_id: int
+    payload: dict[str, Any]
+    validation_errors: dict[str, str]
+    result: AttachmentSummary | None
+
+
+@dataclass
+class PrincipalCollectionResult(CollectionResult):
+    """Principals OpenProject offers for one slot (assignee, watcher, ...) --
+    an unpaginated collection, unlike list_principals' search."""
+
+    results: list[PrincipalSummary]
+
+
+@dataclass
+class RelationCandidateSummary:
+    """A work package OpenProject would accept as the other end of a new
+    relation. Deliberately narrow (no description or custom fields): enough to
+    pick one, then get_work_package for the rest."""
+
+    id: int
+    display_id: str | None
+    subject: str
+    type: str | None
+    status: str | None
+    project: str | None
+
+
+@dataclass
+class RelationCandidateListResult(CollectionResult):
+    results: list[RelationCandidateSummary]

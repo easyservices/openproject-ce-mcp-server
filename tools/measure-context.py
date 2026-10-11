@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+"""Measure the context/token cost this MCP actually produces, right now.
+
+Backs the numbers in docs/context-efficiency.md (and the short summary table
+in README.md's "How it works" section). Three parts:
+
+1. **Tool catalog size** (`tools/list`) — pure code, no live instance needed.
+   Builds the app for several representative exposure profiles, from a fresh
+   install through every write scope, and measures the serialized `tools/list`
+   payload both with and without the opt-in metadata tools.
+
+2. **Response-size table** (raw API vs. list/get/search/update/bulk, each with
+   and without MCP trimming, the list and bulk rows also with `select`) — needs a live OpenProject instance with a few
+   realistic work packages, since payload size depends on real content
+   (description length, populated fields, custom fields) that a synthetic
+   fixture can't responsibly claim to represent. Point it at the local
+   Docker test harness (``docker/test/up.sh 178``, never production):
+
+    OPENPROJECT_BASE_URL=http://localhost:8178 \\
+    OPENPROJECT_API_TOKEN=... \\
+    OPENPROJECT_TEST_PROJECT=TST \\
+    python tools/measure-context.py
+
+   If those env vars are unset, parts 2 and 3 are skipped with a message —
+   part 1 still runs, since it needs no live data.
+
+   Part 2 creates three representative work packages in the target project
+   (realistic subjects/descriptions, not empty seed data) for the list/read/
+   search/update measurements, plus 5 more for the bulk-create/bulk-update
+   measurements. It does not delete any of them afterward — the Docker test
+   project is disposable by convention; don't point this at a real instance.
+
+3. **Cost of null-vs-absent distinguishability** — reuses
+   the live rows from part 2 (real, uneven None-field population, not an
+   invented distribution) to measure the token cost of keeping `None` fields
+   explicit instead of eliding them: `elide_none`, derived per-tool from
+   whether it accepts `select`, plus `next_offset` always being present, make
+   some responses slightly *larger* than pure elision would, in exchange for
+   callers being able to tell "unset" apart from "not returned". This is a
+   deliberate, measured trade-off, not a regression — see part 2's savings
+   numbers for what it sits alongside.
+
+Token counts use tiktoken's `o200k_base` encoding as a stable, reproducible
+BPE proxy, not an exact billed count for every model, provider, or MCP client.
+Requires the `measure` extra (`uv sync --extra measure`, or
+`pip install openproject-ce-mcp-server[measure]`).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import httpx
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+
+from openproject_ce_mcp_server.client import OpenProjectClient  # noqa: E402
+from openproject_ce_mcp_server.config import Settings  # noqa: E402
+from openproject_ce_mcp_server.models import SortCriterion  # noqa: E402
+from openproject_ce_mcp_server.presentation import _to_payload  # noqa: E402
+from openproject_ce_mcp_server.server import CE_INSTRUCTIONS, create_app  # noqa: E402
+
+_encoding: Any = None
+
+
+def _tokens(raw: str) -> int:
+    # Loaded on first use: tiktoken is an optional extra and fetches its
+    # encoding over the network, which the offline unit suite must not need.
+    global _encoding
+    if _encoding is None:
+        import tiktoken
+
+        _encoding = tiktoken.get_encoding("o200k_base")
+    return len(_encoding.encode(raw))
+
+
+# A substring of CE_INSTRUCTIONS distinctive enough that a false-positive match
+# elsewhere is implausible -- used by measure_tools_list's duplication check below.
+_CE_INSTRUCTIONS_NEEDLE = "Community Edition (CE)"
+
+WRITE_ENV = {
+    "OPENPROJECT_READ_PROJECTS": "*",
+    "OPENPROJECT_WRITE_PROJECTS": "*",
+    "OPENPROJECT_ENABLE_PROJECT_WRITE": "true",
+    "OPENPROJECT_ENABLE_MEMBERSHIP_WRITE": "true",
+    "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE": "true",
+    "OPENPROJECT_ENABLE_VERSION_WRITE": "true",
+    "OPENPROJECT_ENABLE_BOARD_WRITE": "true",
+    "OPENPROJECT_ENABLE_PERSONAL_READ": "true",
+    "OPENPROJECT_ENABLE_PERSONAL_WRITE": "true",
+    "OPENPROJECT_ENABLE_ADMIN_READ": "true",
+    "OPENPROJECT_ENABLE_ADMIN_WRITE": "true",
+}
+BASE_ENV = {
+    "OPENPROJECT_BASE_URL": "https://op.example.com",
+    "OPENPROJECT_API_TOKEN": "token",
+}
+
+SAMPLE_WORK_PACKAGES = [
+    (
+        "Attachment upload fails with 500 when metadata part includes a filename",
+        "When uploading an attachment, the request occasionally returns a 500 error. "
+        "The multipart 'metadata' part was sent with a filename, so the server parses "
+        "it as an uploaded file instead of a JSON field.\n\nSteps to reproduce:\n"
+        "1. Call create_work_package_attachment with a small text file.\n"
+        "2. Observe the 500 response and the conversion error in the server log.\n\n"
+        "Expected: the attachment uploads and metadata parses as JSON.",
+    ),
+    (
+        "list_projects returns zero results when allowed projects fall outside the first page",
+        "On instances with more than one page of projects, list_projects can return an "
+        "empty result even though the caller's allowed project is genuinely visible, "
+        "because the allowlist filter was applied per-page instead of walking further "
+        "pages until enough matches are found or the server is exhausted.\n\n"
+        "Acceptance criteria: a project matching the allowlist is always returned "
+        "regardless of which server page it lives on.",
+    ),
+    (
+        "Add Backlogs sprint read tools and hide-field support",
+        "Instances with the Backlogs module enabled expose sprints via a separate "
+        "module engine not covered by the main work-package API surface. Adds read "
+        "tools for sprints, plus hide-field support so operators can control which "
+        "sprint fields are exposed, consistent with every other entity.",
+    ),
+]
+
+
+async def measure_tools_list() -> None:
+    print("=== Tool catalog (tools/list) ===\n")
+    scenarios = [
+        ("fresh install (compatible defaults, no project scope granted)", BASE_ENV),
+        (
+            "project reads enabled, no writes",
+            {**BASE_ENV, "OPENPROJECT_READ_PROJECTS": "*"},
+        ),
+        (
+            "work-package writes enabled",
+            {
+                **BASE_ENV,
+                "OPENPROJECT_READ_PROJECTS": "*",
+                "OPENPROJECT_WRITE_PROJECTS": "*",
+                "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE": "true",
+            },
+        ),
+        ("every write scope enabled, extended tools off (worst case)", {**BASE_ENV, **WRITE_ENV}),
+        (
+            "every write scope enabled, extended tools on",
+            {
+                **BASE_ENV,
+                **WRITE_ENV,
+                "OPENPROJECT_ENABLE_EXTENDED_READ": "true",
+            },
+        ),
+    ]
+    for label, env in scenarios:
+        settings = Settings.from_env(env)
+        app = create_app(settings)
+        tools = await app.list_tools()
+        payload = [t.model_dump(exclude_none=True, mode="json") for t in tools]
+        raw = json.dumps({"tools": payload})
+        print(f"{label}: {len(tools)} tools, {len(raw)} bytes, ~{_tokens(raw)} tokens")
+    print()
+
+    # Live Codex tool discovery reportedly saw the server-level CE
+    # instructions repeated in every tool's own metadata/description. Verify
+    # server.instructions is carried exactly once (the spec-standard `initialize`
+    # field) and never duplicated into any individual tool's `description` --
+    # confirming the duplication, if real, is not introduced by this server or
+    # by MCPServer's Tool.description construction (which is built from each
+    # function's own docstring, never referencing `instructions`).
+    print("=== server instructions vs. per-tool descriptions ===\n")
+    settings = Settings.from_env({**BASE_ENV, **WRITE_ENV, "OPENPROJECT_ENABLE_EXTENDED_READ": "true"})
+    app = create_app(settings)
+    tools = await app.list_tools()
+    payload = [t.model_dump(exclude_none=True, mode="json") for t in tools]
+    server_instructions = app.instructions
+    duplicated_into = [t["name"] for t in payload if _CE_INSTRUCTIONS_NEEDLE in (t.get("description") or "")]
+    raw = json.dumps({"tools": payload})
+    raw_tokens = _tokens(raw)
+    hypothetical_tokens = raw_tokens + len(tools) * _tokens(CE_INSTRUCTIONS)
+    print(f"server.instructions is CE_INSTRUCTIONS: {server_instructions == CE_INSTRUCTIONS}")
+    print(f"tools whose description duplicates it: {duplicated_into or 'none'}")
+    print(
+        f"tools/list as sent by this server: {len(raw)} bytes, ~{raw_tokens} tokens "
+        f"(if a client duplicated instructions into every one of {len(tools)} tool descriptions "
+        f"instead, that would be ~{hypothetical_tokens} tokens, {round(hypothetical_tokens / raw_tokens, 1)}x)"
+    )
+    print()
+
+
+def _report(label: str, raw_json: str, mcp_json: str) -> None:
+    raw_tokens, mcp_tokens = _tokens(raw_json), _tokens(mcp_json)
+    pct = round((1 - mcp_tokens / raw_tokens) * 100) if raw_tokens else 0
+    print(f"{label}:")
+    print(f"  Raw: {len(raw_json)} bytes, ~{raw_tokens} tokens")
+    print(f"  MCP: {len(mcp_json)} bytes, ~{mcp_tokens} tokens (-{pct}% vs. raw)\n")
+
+
+def _measurement_settings(base_url: str, token: str, project: str) -> Settings:
+    env = {
+        "OPENPROJECT_BASE_URL": base_url,
+        "OPENPROJECT_API_TOKEN": token,
+        "OPENPROJECT_READ_PROJECTS": project,
+        "OPENPROJECT_WRITE_PROJECTS": project,
+        "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE": "true",
+    }
+    if timeout := os.environ.get("OPENPROJECT_TIMEOUT"):
+        env["OPENPROJECT_TIMEOUT"] = timeout
+    return Settings.from_env(env)
+
+
+def _raw_api(settings: Settings) -> httpx.AsyncClient:
+    """Client for the raw REST baseline the MCP responses are compared with."""
+    # httpx's 5 s default is shorter than a busy instance's first write; both
+    # sides of the comparison wait as long as the MCP client does.
+    return httpx.AsyncClient(
+        base_url=settings.base_url,
+        auth=httpx.BasicAuth("apikey", settings.api_token),
+        verify=settings.verify_ssl,
+        timeout=settings.timeout,
+    )
+
+
+async def measure_response_sizes() -> list | None:
+    base_url = os.environ.get("OPENPROJECT_BASE_URL")
+    token = os.environ.get("OPENPROJECT_API_TOKEN")
+    project = os.environ.get("OPENPROJECT_TEST_PROJECT", "TST")
+
+    print("=== Response sizes (raw API vs. MCP) ===\n")
+    if not base_url or not token:
+        print(
+            "Skipped: set OPENPROJECT_BASE_URL / OPENPROJECT_API_TOKEN "
+            "(docker/test/up.sh 178, never production) to run this part.\n"
+        )
+        return None
+
+    settings = _measurement_settings(base_url, token, project)
+    client = OpenProjectClient(settings)
+    await client.initialize()
+
+    created_ids = []
+    project_id: str | None = None
+    run_marker = f"context-measure-{uuid4().hex[:12]}"
+    async with _raw_api(settings) as http:
+        for index, (subject, description) in enumerate(SAMPLE_WORK_PACKAGES):
+            if index == 0:
+                subject = f"{subject} [{run_marker}]"
+            resp = await http.post(
+                f"/api/v3/projects/{project}/work_packages",
+                json={
+                    "subject": subject,
+                    "description": {"format": "markdown", "raw": description},
+                    "_links": {"type": {"href": "/api/v3/types/7"}},
+                },
+            )
+            resp.raise_for_status()
+            created_payload = resp.json()
+            created_ids.append(created_payload["id"])
+            if project_id is None:
+                project_id = created_payload["_links"]["project"]["href"].rsplit("/", 1)[-1]
+
+        if project_id is None:
+            raise RuntimeError("Measurement setup did not return a project id.")
+        raw_filters = json.dumps([{"project_id": {"operator": "=", "values": [project_id]}}])
+        resp = await http.get(
+            "/api/v3/work_packages",
+            params={
+                "offset": "1",
+                "pageSize": str(len(created_ids)),
+                "filters": raw_filters,
+                "sortBy": json.dumps([["id", "desc"]]),
+            },
+        )
+        resp.raise_for_status()
+        raw_collection = resp.json()
+
+    raw_json = json.dumps(raw_collection)
+    raw_tokens = _tokens(raw_json)
+
+    # Sort by id desc so the work packages just created above are always
+    # within the first `limit` rows, regardless of how many other work
+    # packages already exist in this (disposable, never-cleaned) test
+    # project from earlier runs.
+    result = await client.work_package.list(
+        project=project,
+        limit=len(created_ids),
+        sort_by=[SortCriterion("id", "desc")],
+    )
+    rows = list(result.results)
+    measured_ids = [row.id for row in rows]
+    if set(measured_ids) != set(created_ids):
+        print(
+            f"Warning: expected ids {created_ids}, found {measured_ids} — numbers below may include concurrent writes.\n"
+        )
+
+    full_json = json.dumps(_to_payload(result))
+    full_tokens = _tokens(full_json)
+    # Use the real _select_fields() path (same as a caller passing `select`
+    # would exercise via the registered wrapper) rather than filtering an
+    # already-fully-serialized row after the fact -- filtering post-hoc would
+    # silently miss any None-valued field among select_fields, since it's
+    # already gone from _to_payload(r)'s default (elide_none=True) output
+    # before the filter ever runs.
+    select_fields = frozenset({"id", "display_id", "subject", "status", "assignee"})
+    select_json = json.dumps(_to_payload(result, select=select_fields))
+    select_tokens = _tokens(select_json)
+
+    print(f"Raw OpenProject REST API v3 (HAL), {len(rows)} rows: {len(raw_json)} bytes, ~{raw_tokens} tokens")
+    print(
+        f"list_work_packages (MCP), {len(rows)} rows: {len(full_json)} bytes, ~{full_tokens} tokens "
+        f"(-{round((1 - full_tokens / raw_tokens) * 100)}% vs. raw)"
+    )
+    print(
+        f"list_work_packages with select (5 fields): {len(select_json)} bytes, ~{select_tokens} tokens "
+        f"(-{round((1 - select_tokens / raw_tokens) * 100)}% vs. raw)"
+    )
+    print(
+        f"\nCreated work packages {created_ids} in project '{project}' for this measurement; "
+        "left in place (disposable test project)."
+    )
+    print()
+
+    async with _raw_api(settings) as http:
+        # --- Single read: get_work_package vs. GET /work_packages/{id} ---
+        single_id = created_ids[0]
+        resp = await http.get(f"/api/v3/work_packages/{single_id}")
+        resp.raise_for_status()
+        raw_single_json = json.dumps(resp.json())
+        lock_version = resp.json()["lockVersion"]
+
+        detail = await client.work_package.get(single_id)
+        _report(
+            "get_work_package (single read)",
+            raw_single_json,
+            json.dumps(_to_payload(detail, elide_none=False)),
+        )
+
+        # --- Search: search_work_packages vs. GET /work_packages?filters=subject_or_id ---
+        query = run_marker
+        raw_filters = json.dumps(
+            [
+                {"subject_or_id": {"operator": "**", "values": [query]}},
+                {"project_id": {"operator": "=", "values": [project_id]}},
+            ]
+        )
+        resp = await http.get(
+            "/api/v3/work_packages",
+            params={"offset": "1", "pageSize": "50", "filters": raw_filters},
+        )
+        resp.raise_for_status()
+        raw_search_json = json.dumps(resp.json())
+
+        search_result = await client.work_package.search(search=query, project=project, limit=50)
+        _report(
+            f"search_work_packages ({len(search_result.results)} rows)",
+            raw_search_json,
+            json.dumps(_to_payload(search_result)),
+        )
+
+        # --- Confirmed single update: update_work_package vs. PATCH /work_packages/{id} ---
+        resp = await http.patch(
+            f"/api/v3/work_packages/{single_id}",
+            json={"lockVersion": lock_version, "percentageDone": 40},
+        )
+        resp.raise_for_status()
+        raw_update_json = json.dumps(resp.json())
+
+        update_result = await client.work_package.update(work_package_id=single_id, percentage_done=60, confirm=True)
+        _report(
+            "update_work_package (confirmed write)",
+            raw_update_json,
+            # update_work_package has no `select` param, so its real registered
+            # wrapper uses elide_none=False -- match that here.
+            json.dumps(_to_payload(update_result, elide_none=False)),
+        )
+
+        # --- Bulk create ×5: bulk_create_work_packages vs. 5x POST /work_packages ---
+        # type "7" matches the numeric type id used for the raw POSTs above and below
+        # (same type as SAMPLE_WORK_PACKAGES) — avoids a name/id mismatch between the
+        # raw and MCP creation paths.
+        bulk_items = [{"project": project, "type": "7", "subject": f"Bulk-created sample {i}"} for i in range(1, 6)]
+        raw_bulk_create_parts = []
+        for item in bulk_items:
+            resp = await http.post(
+                f"/api/v3/projects/{project}/work_packages",
+                json={"subject": item["subject"], "_links": {"type": {"href": "/api/v3/types/7"}}},
+            )
+            resp.raise_for_status()
+            raw_bulk_create_parts.append(resp.json())
+
+        bulk_create_result = await client.work_package.bulk_create(items=bulk_items, confirm=True)
+        created_ids.extend(
+            item.result.result.id
+            for item in bulk_create_result.items
+            if item.success and item.result and item.result.result
+        )
+        _report(
+            f"bulk_create_work_packages (x{len(bulk_items)}, vs. {len(bulk_items)} individual raw POSTs)",
+            json.dumps(raw_bulk_create_parts),
+            json.dumps(_to_payload(bulk_create_result)),
+        )
+        _report(
+            "bulk_create_work_packages with select (work_package_id, result.subject)",
+            json.dumps(raw_bulk_create_parts),
+            json.dumps(_to_payload(bulk_create_result, select=frozenset({"work_package_id", "result.subject"}))),
+        )
+
+        # --- Bulk update ×5: bulk_update_work_packages vs. 5x PATCH /work_packages/{id} ---
+        bulk_target_ids = created_ids[-len(bulk_items) :]
+        raw_bulk_update_parts = []
+        for wp_id in bulk_target_ids:
+            resp = await http.get(f"/api/v3/work_packages/{wp_id}")
+            resp.raise_for_status()
+            wp_lock_version = resp.json()["lockVersion"]
+            resp = await http.patch(
+                f"/api/v3/work_packages/{wp_id}", json={"lockVersion": wp_lock_version, "percentageDone": 20}
+            )
+            resp.raise_for_status()
+            raw_bulk_update_parts.append(resp.json())
+
+        bulk_update_items = [{"work_package_id": wp_id, "percentage_done": 30} for wp_id in bulk_target_ids]
+        bulk_update_result = await client.work_package.bulk_update(items=bulk_update_items, confirm=True)
+        _report(
+            f"bulk_update_work_packages (x{len(bulk_target_ids)}, vs. {len(bulk_target_ids)} individual raw PATCHes)",
+            json.dumps(raw_bulk_update_parts),
+            json.dumps(_to_payload(bulk_update_result)),
+        )
+        _report(
+            "bulk_update_work_packages with select (work_package_id, result.percentage_done)",
+            json.dumps(raw_bulk_update_parts),
+            json.dumps(
+                _to_payload(bulk_update_result, select=frozenset({"work_package_id", "result.percentage_done"}))
+            ),
+        )
+
+    # A fixed 20-row page of the project's newest work packages for Part 3.
+    # This is a much richer, real None-field distribution than just the three
+    # representative rows above while keeping the sample size stable across
+    # repeated runs against the deliberately non-cleaned test project.
+    page_result = await client.work_package.list(
+        project=project,
+        limit=20,
+        sort_by=[SortCriterion("id", "desc")],
+    )
+
+    await client.aclose()
+    return list(page_result.results)
+
+
+# ── Part 3: cost of null-vs-absent distinguishability ───────────────────────
+#
+# elide_none (derived per-tool from whether it accepts `select`) and the
+# always-present next_offset are a deliberate trade-off, not a saving: some
+# responses get slightly larger so a caller can tell "field is unset" apart
+# from "field was never returned". This section measures that cost against
+# the first page of real seeded rows fetched by measure_response_sizes (its
+# `rows` return value -- NOT the same 3 rows shown in that function's own
+# printed table, which only covers the handful of work packages it created;
+# see that function's docstring comment for the exact fetch), rather than
+# synthetic fixtures with an invented None distribution -- a made-up 50/50
+# split would not tell you anything about the actual cost on real data, since
+# real field-population patterns are uneven (e.g. `responsible` is unset on
+# nearly every seeded work package here, `priority` on very few). Requires
+# the same live instance as measure_response_sizes.
+#
+# Two angles, BOTH counterfactual comparisons against a hypothetical
+# always-elide policy that never actually shipped as this diff's behavior
+# (not a real before/after of a released version -- see
+# docs/context-efficiency.md's framing of these numbers): (a) what
+# elide_none=True (maximal elision) would produce vs. elide_none=False (the
+# real registered policy for any tool with no `select` parameter, e.g.
+# list_statuses -- simulated here on work-package rows since they have a much
+# richer None distribution than this instance's 14 fully-populated statuses);
+# (b) a `select` that includes a field which is None on some real rows, with
+# that field dropped (maximal elision, again hypothetical) vs. kept as
+# explicit null (the real, registered `_select_fields` behavior).
+
+
+def measure_null_distinguishability_cost(rows: list) -> None:
+    print("=== Cost of null-vs-absent distinguishability ===\n")
+    print(f"Measured on {len(rows)} real seeded work packages (first page, see script docstring).\n")
+
+    # (a) elide_none=True (hypothetical maximal-elision policy) vs. False (the
+    # real registered policy for a select-less tool) on the SAME rows, full
+    # field set.
+    elided_json = json.dumps({"results": [_to_payload(r, elide_none=True) for r in rows]})
+    explicit_json = json.dumps({"results": [_to_payload(r, elide_none=False) for r in rows]})
+    elided_tokens, explicit_tokens = _tokens(elided_json), _tokens(explicit_json)
+    delta_pct = round((explicit_tokens / elided_tokens - 1) * 100) if elided_tokens else 0
+    print(f"Full rows, simulating a select-less tool (e.g. list_statuses's Rule 1, {len(rows)} rows):")
+    print(f"  Maximal elision (hypothetical, not this tool's real policy): ~{elided_tokens} tokens")
+    print(f"  Explicit null (real registered behavior, elide_none=False): ~{explicit_tokens} tokens (+{delta_pct}%)\n")
+
+    # (b) select-capable tool, `select` includes a field that's None on some
+    # real rows (responsible is unset on most seeded work packages here).
+    select_fields = frozenset({"id", "subject", "responsible"})
+    selected = [_select_row(r, select_fields) for r in rows]
+    dropped_json = json.dumps({"results": [{k: v for k, v in row.items() if v is not None} for row in selected]})
+    kept_json = json.dumps({"results": selected})
+    dropped_tokens, kept_tokens = _tokens(dropped_json), _tokens(kept_json)
+    delta_pct = round((kept_tokens / dropped_tokens - 1) * 100) if dropped_tokens else 0
+    none_count = sum(1 for row in selected if row.get("responsible") is None)
+    print(
+        f"list_work_packages with select=[id,subject,responsible] ({len(rows)} rows, {none_count} with responsible=None):"
+    )
+    print(f"  Selected None dropped (hypothetical maximal elision): ~{dropped_tokens} tokens")
+    print(f"  Selected None kept as explicit null (real registered behavior): ~{kept_tokens} tokens (+{delta_pct}%)\n")
+
+    print(
+        "Both deltas are the accepted cost of a caller being able to tell "
+        "'unset' apart from 'not returned' -- see docs/context-efficiency.md "
+        "for the accompanying savings this trade-off sits alongside.\n"
+    )
+
+
+def _select_row(row: Any, select_fields: frozenset[str]) -> dict:
+    from openproject_ce_mcp_server.presentation import _select_fields
+
+    # elide_none=True: matches list_work_packages's real registered policy
+    # (it has a `select` param, so elide_none is derived as True).
+    return _select_fields(row, select_fields, elide_none=True)
+
+
+async def main() -> None:
+    await measure_tools_list()
+    rows = await measure_response_sizes()
+    if rows is not None:
+        measure_null_distinguishability_cost(rows)
+    else:
+        print("=== Cost of null-vs-absent distinguishability ===\n")
+        print("Skipped: needs the same live instance as the response-size table above.\n")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

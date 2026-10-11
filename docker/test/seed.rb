@@ -1,0 +1,700 @@
+# Idempotent test seed for a local OpenProject container.
+#
+# Run via:  docker compose exec -T <service> bundle exec rails runner - < seed.rb
+# (up.sh does this for you.)
+#
+# Creates, if missing:
+#   - an API token for the admin user, printing its plaintext to stdout so the
+#     test harness can capture it (the plaintext is only available at creation;
+#     OpenProject stores a hash)
+#   - a restricted-permission role + user + API token (log_own_time granted,
+#     log_time/view_time_entries/manage_members withheld), for tests that need
+#     a REAL OpenProject permission boundary rather than this MCP server's own
+#     allowlist config
+#   - a project with identifier "TST" plus one work package
+#   - on 17.5+ only, when SEED_SEMANTIC=1: switches the instance to project-based
+#     (semantic) identifiers so displayId becomes "TST-<n>"
+#   - on 17.7+ only, when target_versions/targetVersions support exists
+#     (target_version_ids=, backed by the `has_many :target_versions,
+#     through: :work_package_versions` association): forces
+#     Setting::WorkPackageMultipleVersions to a known state (false unless
+#     SEED_MULTI_VERSIONS=1, true when it is -- 17.8+ images ship this with
+#     default: true, so this is a real force, not just a conditional
+#     enable), then re-verifies Setting::WorkPackageMultipleVersions.active?
+#     actually reached the requested state before seeding a second work
+#     package with exactly one target version assigned. On 17.7,
+#     .active? additionally requires an experimental
+#     OpenProject::FeatureDecisions flag this seed does not set, so
+#     SEED_MULTI_VERSIONS=1 there logs a WARNING and the multi-version
+#     fixture below is skipped rather than seeded against a state the
+#     server will reject; on 17.8+ (no such extra gate) SEED_MULTI_VERSIONS=1
+#     also seeds a THIRD work package with two target versions assigned.
+#     Both fixtures are seeded via a direct model write, which runs Rails
+#     model-level validations/callbacks but does NOT run
+#     WorkPackages::BaseContract (OpenProject's own service-layer contract,
+#     invoked only via the real API/service call chain) -- a genuine,
+#     deliberate contract bypass, not "the same validated path a real API
+#     write would take".
+#
+# Output lines are prefixed "SEED:" so up.sh can parse them.
+
+def log(msg)
+  puts("SEED: #{msg}")
+end
+
+admin = User.admin.active.first || User.where(admin: true).first
+raise "no admin user found" unless admin
+
+# --- API token (print plaintext once) -----------------------------------------
+# Token::API.create! returns an instance exposing the plaintext via #plain_value.
+token = Token::API.create!(user: admin)
+log("API_TOKEN=#{token.plain_value}")
+
+# --- Restricted-permission role + user -----------------------------------------
+# Grants log_own_time but withholds log_time/view_time_entries/manage_members,
+# reproducing the exact permission-gating asymmetry GitHub issue #10 covers
+# (see app/services/time_entry_service.py's own docstring): OpenProject's
+# CreateContract#allowed_to_log_own? only validates log_own_time against a
+# concrete WorkPackage/Meeting entity link, never a project-only link.
+# Integration tests need a REAL restricted OpenProject role to exercise this --
+# denied_client only tests this MCP server's OWN allowlist config, never an
+# actual OpenProject permission boundary.
+restricted_role = Role.find_by(name: "Integration Test Restricted") || ProjectRole.create!(
+  name: "Integration Test Restricted",
+  permissions: [:view_work_packages, :view_project, :log_own_time]
+  # explicitly NOT granted: :log_time, :view_time_entries, :manage_members
+)
+# Must satisfy the instance's password complexity policy (lower/upper/digit/
+# special) -- SecureRandom.hex alone is lowercase-hex-only and fails it.
+restricted_password = "Aa1!#{SecureRandom.hex(16)}"
+restricted_user = User.find_by(login: "integration-test-restricted") || User.create!(
+  login: "integration-test-restricted",
+  firstname: "Integration",
+  lastname: "Restricted",
+  mail: "integration-test-restricted@example.invalid",
+  password: restricted_password,
+  password_confirmation: restricted_password,
+  status: User.statuses[:active]
+)
+
+# --- Test project + one work package ------------------------------------------
+# Project identifiers are validated as lowercase regardless of the semantic/
+# classic work-package-identifier display setting -- always create as
+# lowercase. Semantic mode's required uppercase identifier is applied
+# afterward via update_column (below), which intentionally bypasses that
+# validation; a direct create! with an uppercase identifier fails it instead.
+project = Project.find_by(identifier: "tst") || Project.find_by(identifier: "TST")
+if project.nil?
+  attrs = {name: "TST Test", identifier: "tst", public: false}
+  attrs[:workspace_type] = "project" if Project.new.respond_to?(:workspace_type)
+  project = Project.create!(**attrs)
+  log("created project #{project.identifier} (id=#{project.id})")
+else
+  log("project #{project.identifier} already present (id=#{project.id})")
+end
+
+# A freshly created project has no modules enabled and no members, so the admin
+# cannot see its work packages via the API. Enable every available project module
+# (work packages, time/costs, news, wiki, boards, backlogs, …) and make the admin
+# a project member with a work-package-capable role.
+all_modules = OpenProject::AccessControl.available_project_modules.map(&:to_s)
+project.enabled_module_names = (project.enabled_module_names | all_modules)
+# A new project also has no work-package types enabled; assign them all so
+# create_work_package (Task, etc.) works. 17.9 dropped the `types` writer
+# (Project#types became read-only via Projects::EnabledTypes; types are
+# enabled through ProjectType rows with a variant); 16.x has no ProjectType
+# model at all, so pick the writer the running version actually offers.
+if project.respond_to?(:types=)
+  project.types = Type.all
+else
+  Type.all.each { |type| project.project_types.find_or_create_by!(type: type) }
+end
+project.save!
+
+# Reading side of the same split: 17.8+ expose the enabled root types as
+# `enabled_types`, older versions only as the `types` association.
+def enabled_types_of(project)
+  project.respond_to?(:enabled_types) ? project.enabled_types : project.types
+end
+
+# 17.9 moved "default type for new projects" from Type#is_default to
+# TypeVariant#enabled_in_new_projects, but its seeder sets that flag on no
+# variant, so a freshly installed 17.9 creates every new project without any
+# work-package type (upgraded instances keep the flag through the migration's
+# rename). Mirror 17.8's seeded defaults (Task, Milestone, Summary task) so
+# the disposable per-test projects behave like an upgraded instance.
+if defined?(TypeVariant) && TypeVariant.column_names.include?("enabled_in_new_projects") &&
+   TypeVariant.enabled_in_new_projects.none?
+  default_names = ["Task", "Milestone", "Summary task"]
+  enabled = Type.where(name: default_names).filter_map do |type|
+    variant = type.respond_to?(:default_variant) ? type.default_variant : nil
+    next unless variant
+    variant.update!(enabled_in_new_projects: true)
+    type.name
+  end
+  log("WARNING: no type variant was enabled for new projects (fresh 17.9 install, upstream seeder gap) -- enabled #{enabled.join(', ')}")
+end
+log("enabled modules: #{project.reload.enabled_module_names.sort.join(', ')}")
+wp_role = Role.givable.find { |r| r.permissions.include?(:view_work_packages) }
+if wp_role
+  member = Member.find_or_initialize_by(project: project, principal: admin)
+  member.roles = [wp_role] if member.roles.empty?
+  member.save!
+  log("admin is a member of tst with role #{wp_role.name}")
+end
+
+# Restricted user needs project membership too, with the restricted role
+# (not wp_role) -- must happen after the project exists.
+restricted_member = Member.find_or_initialize_by(project: project, principal: restricted_user)
+restricted_member.roles = [restricted_role] if restricted_member.roles.empty?
+restricted_member.save!
+log("integration-test-restricted is a member of tst with role #{restricted_role.name}")
+
+restricted_token = Token::API.create!(user: restricted_user)
+log("RESTRICTED_API_TOKEN=#{restricted_token.plain_value}")
+
+# Instance-wide setting: without this, OpenProject silently discards any
+# `startTime` written to a time entry (TimeEntry.can_track_start_and_end_time?
+# stays false) instead of storing it or rejecting it -- integration tests for
+# create_time_entry/update_time_entry/create_time_entry_until/
+# update_time_entry_until's start_time/end_time handling can't meaningfully
+# assert anything without this being on.
+unless Setting.allow_tracking_start_and_end_times?
+  Setting.allow_tracking_start_and_end_times = true
+  log("enabled allow_tracking_start_and_end_times")
+else
+  log("allow_tracking_start_and_end_times already enabled")
+end
+
+# Instance-wide setting: OFF by default in a fresh OpenProject install --
+# without it, Users::DeleteContract.deletion_allowed? always returns false
+# for an admin-initiated delete, and delete_user fails with a 403
+# "may not be accessed" that has nothing to do with this MCP server's own
+# write-allowlist logic. Needed for delete_user's integration test to
+# exercise the real DELETE /users/{id} endpoint at all.
+unless Setting.users_deletable_by_admins?
+  Setting.users_deletable_by_admins = true
+  log("enabled users_deletable_by_admins")
+else
+  log("users_deletable_by_admins already enabled")
+end
+
+# Instance-wide feature flag, present only on 16.6.10 of the pinned versions
+# below (removed again by 17.4.1 -- the documents_api.rb gate this flag
+# controlled is gone there, patch runs unconditionally). Where it exists and
+# is OFF (the fresh-install default), PATCH /documents/{id} unconditionally
+# raises Unauthorized *before* any permission/ownership check ever runs, so
+# even a full admin token gets a generic 403 "not authorized" that has
+# nothing to do with document permissions. Needed for update_document's
+# integration test to exercise the real PATCH endpoint at all on 16.6.
+if Setting.respond_to?(:feature_block_note_editor_active?)
+  unless Setting.feature_block_note_editor_active?
+    Setting.feature_block_note_editor_active = true
+    log("enabled feature_block_note_editor_active")
+  else
+    log("feature_block_note_editor_active already enabled")
+  end
+else
+  log("feature_block_note_editor_active not present on this version (expected on 17.4+)")
+end
+
+# Instance-wide feature flag, present on 17.3-17.6 of the pinned versions
+# below (the route becomes generally available with no gate on 17.7, and
+# does not exist at all before 17.3). Where it exists and is OFF (the
+# fresh-install default), every User Non-Working Times / User Working Hours
+# tool unconditionally raises NotFound -- not a permission error, a route
+# that simply won't route. Needed for the user_schedule integration tests to
+# exercise the real endpoints at all on 17.3-17.6 (see
+# tests/integration/test_user_schedule.py's module docstring for the full
+# per-version breakdown).
+if Setting.respond_to?(:feature_user_working_times_active?)
+  unless Setting.feature_user_working_times_active?
+    Setting.feature_user_working_times_active = true
+    log("enabled feature_user_working_times_active")
+  else
+    log("feature_user_working_times_active already enabled")
+  end
+else
+  log("feature_user_working_times_active not present on this version (expected on 17.3-17.6; generally available 17.7+)")
+end
+
+# Per-user notification setting: the admin's default global NotificationSetting
+# has watched=true but work_package_commented=false -- being a watcher alone
+# does NOT trigger an in-app notification for a new comment; the specific
+# work_package_commented flag must also be on. Needed for
+# test_mark_notification_read_confirmed_roundtrip (a genuinely triggered,
+# then confirmed-read notification) to have anything real to mark read.
+notification_setting = NotificationSetting.find_or_initialize_by(user_id: admin.id, project_id: nil)
+if notification_setting.work_package_commented
+  log("admin already has work_package_commented notifications enabled")
+else
+  notification_setting.work_package_commented = true
+  notification_setting.save!
+  log("enabled work_package_commented notifications for admin")
+end
+
+# Instance-wide setting: OpenProject batches/delays journal aggregation by
+# this many minutes (default: 5) before a Notifications::WorkflowJob for a
+# new comment actually fires -- verified live via GoodJob::Job records
+# (Journals::CompletedJob's scheduled_at is created_at + this setting's
+# value). Without setting this to 0, a test that waits a realistic handful
+# of seconds for a real notification (e.g.
+# test_mark_notification_read_confirmed_roundtrip) can never see it appear.
+if Setting.journal_aggregation_time_minutes.to_i.zero?
+  log("journal_aggregation_time_minutes already 0")
+else
+  Setting.journal_aggregation_time_minutes = 0
+  log("set journal_aggregation_time_minutes to 0")
+end
+
+if project.work_packages.empty?
+  type = enabled_types_of(project).first || Type.first
+  status = Status.respond_to?(:default) && Status.default ? Status.default : Status.first
+  priority = (IssuePriority.respond_to?(:default) && IssuePriority.default) || IssuePriority.active.first || IssuePriority.first
+  wp = WorkPackage.create!(
+    project: project,
+    type: type,
+    status: status,
+    priority: priority,
+    author: admin,
+    subject: "Seed work package"
+  )
+  display = wp.respond_to?(:display_id) ? wp.display_id : wp.id
+  log("created work package id=#{wp.id} display_id=#{display}")
+else
+  log("project TST already has work packages")
+end
+
+# list_categories/get_category have no create endpoint in this server's API
+# to seed one through -- a pre-existing category is needed here.
+if project.categories.empty?
+  category = Category.create!(project: project, name: "Seed Category")
+  log("created category id=#{category.id} name=#{category.name}")
+else
+  log("project TST already has categories")
+end
+
+# list_documents/get_document/update_document have no create endpoint in
+# this server's API to seed one through -- two pre-existing documents are
+# needed here (two, not one, so a pagination test can exercise a real
+# multi-page walk the same way test_list_versions_search_walks_every_server_page
+# does for versions).
+if project.documents.count < 2
+  # Document's classification association was renamed and made optional
+  # between 16.6 and 17.x -- verified directly against source (documents
+  # module's app/models/document.rb on each version):
+  #   16.6: `belongs_to :category, class_name: "DocumentCategory"`,
+  #         `validates_presence_of :category` (required; DocumentCategory
+  #         constant exists).
+  #   17.6/17.7: `belongs_to :type, class_name: "DocumentType", optional:
+  #              true` -- category/DocumentCategory do not exist at all
+  #              (Document.new(category: ...) raises NoMethodError there).
+  # Both branches pass their own version's real attribute key rather than
+  # omitting it and relying on Document's own after_initialize default --
+  # the seed should be explicit about which entity it creates.
+  document_attrs = {
+    project: project,
+    description: "Seeded for integration tests"
+  }
+  if Object.const_defined?(:DocumentCategory)
+    document_attrs[:category] = DocumentCategory.first
+  elsif Object.const_defined?(:DocumentType)
+    document_attrs[:type] = DocumentType.first
+  end
+  (project.documents.count...2).each do |i|
+    document = Document.create!(document_attrs.merge(title: "Seed Document #{i + 1}"))
+    log("created document id=#{document.id} title=#{document.title}")
+  end
+else
+  log("project TST already has #{project.documents.count} documents")
+end
+
+# get_wiki_page has no create/list counterpart in this server's API to seed a
+# page through, so integration tests need a pre-existing page here.
+#
+# Up to 17.6 the wiki is a project module and enabling it creates the
+# project's Wiki record; since 17.7 it is no longer a module and a project
+# only gets its Wiki when the first page is created in the UI (the demo
+# seeders create it the same way), so a freshly created project has none.
+#
+# WikiPage#text= takes a raw String on OpenProject 16.6 (a plain `text` column
+# on wiki_pages itself), but a WikiContent instance on 17.x (content moved to
+# a separate, versioned/journaled association). Check for the constant rather
+# than branching on version number, since that's the actual thing that
+# differs.
+wiki = project.wiki || Wiki.create!(project: project, start_page: "Wiki")
+if wiki.pages.empty?
+  page = WikiPage.create!(wiki: wiki, title: "Seed wiki page", author: admin)
+  page.text = if defined?(WikiContent)
+    WikiContent.new(text: "Seeded content for integration tests.", author: admin)
+  else
+    "Seeded content for integration tests."
+  end
+  page.save!
+  log("created wiki page id=#{page.id} title=#{page.title}")
+else
+  log("project TST already has wiki pages")
+end
+
+# get_post has no create/list counterpart in this server's API (see
+# app/ports/post_api.py's own comment on this) -- a Message always requires a
+# parent Forum (Message#validates :forum, :subject, :content, presence:
+# true; Forum#validates :name, :description, presence: true -- see
+# app/models/message.rb / app/models/forum.rb), even though nothing in this
+# MCP's API surface ever reads the Forum resource back. The forums module is
+# already enabled unconditionally above (all_modules), so no extra
+# module-enablement step is needed here.
+if Forum.where(project: project).empty?
+  forum = Forum.create!(project: project, name: "Seed Forum", description: "Seeded for integration tests")
+  message = Message.create!(forum: forum, author: admin, subject: "Seed post", content: "Seeded content for integration tests.")
+  log("created forum id=#{forum.id} message id=#{message.id} subject=#{message.subject}")
+else
+  log("project TST already has a forum")
+end
+
+# get_work_package/list_work_packages custom_fields need at least
+# one real, activated CE-compatible custom field on the TST project's work
+# packages -- a fresh instance has none. Create one simple "string"-format
+# field (is_for_all: true so it applies without a per-type
+# custom_fields_projects/custom_fields_types join row).
+#
+# NOT has_comment: true -- verified live against a real 17.7.1 instance
+# (ActiveRecord::RecordInvalid: "Add a comment text field must be blank"):
+# CustomField#can_have_comment? delegates to
+# `customized_class.can_have_custom_comments?`, which reads
+# `acts_as_customizable`'s per-MODEL `comments:` option -- and
+# app/models/work_package.rb's own `acts_as_customizable
+# validate_on: :saving_custom_fields` call never passes `comments: true`
+# (only app/models/project.rb does: `comments: true, admin_only_allowed:
+# true`). So customComment<N> is Project-only, structurally impossible on a
+# WorkPackage on this codebase, regardless of OpenProject version -- not
+# merely gated to 17.2+ as might be inferred from
+# CustomFieldInjector#inject_comment_value alone (that method is generic
+# over any customizable resource; it never fires for WorkPackage because
+# has_comment? is always false there). custom_comments/
+# custom_comments_truncated on WorkPackageSummary/WorkPackageDetail are kept
+# regardless (harmless, forward-compatible if a future OpenProject version
+# ever changes this), but will always be None in practice for this
+# resource. See this project's own docs/field-hiding.md.
+custom_field = WorkPackageCustomField.find_by(name: "Seed Text Field") || WorkPackageCustomField.create!(
+  name: "Seed Text Field",
+  field_format: "string",
+  is_for_all: true,
+  is_required: false
+)
+log("custom field '#{custom_field.name}' present (id=#{custom_field.id}, format=#{custom_field.field_format})")
+
+# is_for_all only auto-applies a custom field to every PROJECT; it must also
+# be attached to the relevant work-package TYPE(s) for
+# available_custom_fields (what CustomFieldInjector actually renders) to
+# include it -- attach it to every type already enabled on TST above.
+if custom_field.respond_to?(:type_variants)
+  # 17.9+: the custom-field/type join moved to TypeVariant; attach to the
+  # variant each enabled type actually uses in this project.
+  variants = project.project_types.map(&:variant).compact
+  missing_variants = variants.reject { |v| v.custom_fields.include?(custom_field) }
+  unless missing_variants.empty?
+    custom_field.type_variants << missing_variants
+    log("attached custom field '#{custom_field.name}' to type variants: #{missing_variants.map { |v| v.type.name }.join(', ')}")
+  end
+  missing_types = []
+else
+  missing_types = enabled_types_of(project).reject { |t| t.custom_fields.include?(custom_field) }
+end
+unless missing_types.empty?
+  custom_field.types << missing_types
+  log("attached custom field '#{custom_field.name}' to types: #{missing_types.map(&:name).join(', ')}")
+end
+
+# Give the seed work package an actual value for the new custom field so a
+# read-path integration test has something real to assert on, not just
+# "the key exists but is nil".
+seed_wp = project.work_packages.first
+if seed_wp && seed_wp.custom_value_for(custom_field)&.value.to_s.empty?
+  seed_wp.custom_field_values = { custom_field.id => "Seeded custom field value" }
+  seed_wp.save!
+  log("set custom field '#{custom_field.name}' value on work package id=#{seed_wp.id}")
+else
+  log("seed work package already has a value for custom field '#{custom_field.name}' (or no seed work package yet)")
+end
+
+# get_project_phase/get_project_phase_definition have no list/create endpoint
+# in this server's API -- a project has zero Project::Phase rows by default
+# (they're an opt-in "life cycle" concept, not automatically present), so
+# integration tests need one pre-existing here. Project::PhaseDefinition rows
+# ARE instance-wide and pre-seeded by OpenProject itself (Initiating/Planning/
+# Executing/Closing) -- only the per-project Phase instance needs creating.
+if defined?(Project::Phase) && Project::Phase.where(project_id: project.id).empty?
+  definition = Project::PhaseDefinition.first
+  if definition
+    phase = Project::Phase.create!(
+      project: project,
+      definition_id: definition.id,
+      active: true,
+      start_date: Date.today,
+      finish_date: Date.today + 7
+    )
+    log("created project phase id=#{phase.id} definition=#{definition.name}")
+  else
+    log("no Project::PhaseDefinition exists on this instance -- skipping project phase seed")
+  end
+else
+  log("project TST already has a project phase (or Project::Phase model unavailable)")
+end
+
+# --- target_versions fixtures (17.7+) ------------------------------------------
+# Both fixtures below write via a direct ActiveRecord model save, which runs
+# Rails model-level validations/callbacks (including the
+# persist_version_associations after_save hook) but does NOT run
+# WorkPackages::BaseContract -- OpenProject's own service-layer contract,
+# invoked only via the real API/service call chain (WorkPackages::CreateService/
+# UpdateService), never by a bare ActiveRecord save!. This is a genuine,
+# deliberate contract bypass, common for seed data, but described honestly as
+# one here rather than as "the same validated path a real API write would take".
+#
+# Setting::WorkPackageMultipleVersions gates whether writing MORE THAN ONE
+# target version is accepted server-side (base_contract.rb's
+# validate_target_versions_length); reading targetVersions is never gated.
+# targetVersions/this setting are NOT new in 17.8 -- both already exist in the
+# 17.7 sources this project pins (associated_resources :target_versions in
+# 17.7's work_package_representer.rb; Setting::WorkPackageMultipleVersions in
+# 17.7's own model file). What IS 17.8-specific: on 17.7,
+# Setting::WorkPackageMultipleVersions.active? additionally requires
+# OpenProject::FeatureDecisions.work_package_multiple_versions_active? (an
+# experimental feature flag, separate from the plain Setting) -- 17.8 drops
+# that second gate, so setting Setting.work_package_multiple_versions alone
+# is sufficient there. On 17.8+ the setting ships with default: true
+# (OpenProject's config/constants/settings/definition.rb). The setting is
+# explicitly FORCED to a
+# known state below (not just conditionally enabled) so op-17-8 gives
+# deterministic, repeatable behavior regardless of what the image happened to
+# ship with -- forced to false unless SEED_MULTI_VERSIONS=1, forced to true
+# when it is. This also means both states are exercisable on the SAME
+# op-17-8 service/volume across separate up.sh invocations; no second
+# dedicated container is needed. Because of the 17.7 feature-flag gate above,
+# this whole block verifies the setting actually reached the requested state
+# after writing it, rather than assuming Setting.work_package_multiple_versions=
+# alone is sufficient on every version that defines the module.
+if project.respond_to?(:versions) && WorkPackage.new.respond_to?(:target_version_ids=) &&
+   defined?(Setting::WorkPackageMultipleVersions)
+  want_multi = ENV["SEED_MULTI_VERSIONS"] == "1"
+  if Setting::WorkPackageMultipleVersions.active? == want_multi
+    log("Setting::WorkPackageMultipleVersions already #{want_multi ? "enabled" : "disabled"}")
+  else
+    Setting.work_package_multiple_versions = want_multi
+    log("#{want_multi ? "enabled" : "disabled"} Setting::WorkPackageMultipleVersions")
+  end
+  actual_multi = Setting::WorkPackageMultipleVersions.active?
+  if want_multi && !actual_multi
+    log("WARNING: SEED_MULTI_VERSIONS=1 requested but Setting::WorkPackageMultipleVersions.active? " \
+        "is still false after setting Setting.work_package_multiple_versions=true -- on OpenProject " \
+        "17.7 this additionally requires OpenProject::FeatureDecisions." \
+        "work_package_multiple_versions_active?, an experimental flag this seed does not set. " \
+        "Skipping the multi-target-version fixture rather than seeding one the server will reject.")
+  end
+
+  # Single-target-version fixture: exercises the read path and the
+  # single-value write path, both valid regardless of the setting's state --
+  # seeded unconditionally whenever this version supports target_versions.
+  single_version = Version.find_by(project: project, name: "Seed Version 1.0") || Version.create!(
+    project: project,
+    name: "Seed Version 1.0",
+    status: "open"
+  )
+  log("version '#{single_version.name}' present (id=#{single_version.id})")
+
+  if WorkPackage.where(project: project, subject: "Seed work package (single target version)").empty?
+    type = enabled_types_of(project).first || Type.first
+    status = Status.respond_to?(:default) && Status.default ? Status.default : Status.first
+    priority = (IssuePriority.respond_to?(:default) && IssuePriority.default) || IssuePriority.active.first || IssuePriority.first
+    single_version_wp = WorkPackage.new(
+      project: project,
+      type: type,
+      status: status,
+      priority: priority,
+      author: admin,
+      subject: "Seed work package (single target version)"
+    )
+    single_version_wp.target_version_ids = [single_version.id]
+    single_version_wp.save!
+    log("created work package id=#{single_version_wp.id} with 1 target version")
+  else
+    log("project TST already has a single-target-version seed work package")
+  end
+
+  # Multi-target-version fixture, opt-in -- gated on actual_multi (whether
+  # the setting is REALLY active after the force above), not just the
+  # ENV request, since a 17.7 instance without the FeatureDecisions flag
+  # would otherwise get a fixture the server rejects (see the WARNING above).
+  if want_multi && actual_multi
+    second_version = Version.find_by(project: project, name: "Seed Version 2.0") || Version.create!(
+      project: project,
+      name: "Seed Version 2.0",
+      status: "open"
+    )
+    log("version '#{second_version.name}' present (id=#{second_version.id})")
+
+    if WorkPackage.where(project: project, subject: "Seed work package (multi target version)").empty?
+      type = enabled_types_of(project).first || Type.first
+      status = Status.respond_to?(:default) && Status.default ? Status.default : Status.first
+      priority = (IssuePriority.respond_to?(:default) && IssuePriority.default) || IssuePriority.active.first || IssuePriority.first
+      multi_version_wp = WorkPackage.new(
+        project: project,
+        type: type,
+        status: status,
+        priority: priority,
+        author: admin,
+        subject: "Seed work package (multi target version)"
+      )
+      multi_version_wp.target_version_ids = [single_version.id, second_version.id]
+      multi_version_wp.save!
+      log("created work package id=#{multi_version_wp.id} with 2 target versions")
+    else
+      log("project TST already has a multi-target-version seed work package")
+    end
+  elsif want_multi
+    log("multi-version seed skipped -- setting could not be activated on this version (see WARNING above)")
+  else
+    log("multi-version seed not requested (SEED_MULTI_VERSIONS unset)")
+  end
+else
+  log("target_version_ids=/Setting::WorkPackageMultipleVersions not both present on this version " \
+      "(expected together on 17.7+) -- skipping target_versions seed")
+end
+
+# --- Semantic identifiers (17.5+, opt-in) -------------------------------------
+if ENV["SEED_SEMANTIC"] == "1"
+  if defined?(Setting::WorkPackageIdentifier)
+    Setting.work_packages_identifier = "semantic"
+    log("set work_packages_identifier = semantic")
+    # The project above is always created/found as lowercase "tst" -- uppercase
+    # it now, every time (fresh or pre-existing), via the same validation-bypass.
+    if project.identifier != "TST"
+      # Skip the unique validation by updating directly — old "tst" conflicts with
+      # new "TST" on case-insensitive DBs; update_column bypasses that.
+      project.update_column(:identifier, "TST")
+      log("uppercased identifier to #{project.reload.identifier} for semantic mode")
+    end
+    # Allocate semantic ids for existing work packages. Saving is not enough —
+    # OpenProject exposes an explicit allocation method for this. Clear any stale
+    # aliases first so repeated seeds don't accumulate duplicates.
+    sample_wp = project.work_packages.first
+    if sample_wp && sample_wp.respond_to?(:allocate_and_register_semantic_id)
+      project.work_packages.find_each do |w|
+        w.semantic_aliases.destroy_all
+        w.allocate_and_register_semantic_id
+      end
+      log("sample display_id=#{project.work_packages.first.reload.display_id}")
+    end
+  else
+    log("semantic identifiers not supported on this version — left as classic")
+  end
+else
+  log("semantic mode not requested (classic identifiers)")
+end
+
+# --- Nextcloud storage fixture (opt-in, for storage read-tool tests) -----------
+# Creates a Storages::NextcloudStorage + Storages::ProjectStorage row directly,
+# bypassing the live host-reachability/app-installed contract validation
+# (NextcloudCompatibleHostValidator probes the host for the Nextcloud-side
+# "OpenProject Integration" app on every contract-path save, which this
+# fixture doesn't attempt to satisfy). This is NOT a live-connected, browsable
+# storage -- no OAuth handshake happens, storage_files browsing does not work
+# against it. It exists only so GET /api/v3/storages and
+# GET /api/v3/project_storages have a real row to return, for the read-only
+# MCP integration tests. See docker/test/README.md.
+if ENV["SEED_NEXTCLOUD_STORAGE"] == "1"
+  if defined?(Storages::NextcloudStorage)
+    storage = Storages::NextcloudStorage.find_by(name: "Seed Nextcloud Storage")
+    if storage.nil?
+      storage = Storages::NextcloudStorage.new(
+        name: "Seed Nextcloud Storage",
+        host: "http://nextcloud/",
+        creator: admin
+      )
+      storage.save(validate: false)
+      log("created nextcloud storage id=#{storage.id} host=#{storage.host}")
+    else
+      log("nextcloud storage already present (id=#{storage.id})")
+    end
+
+    project_storage = Storages::ProjectStorage.find_by(project: project, storage: storage)
+    if project_storage.nil?
+      project_storage = Storages::ProjectStorage.new(
+        project: project,
+        storage: storage,
+        creator: admin,
+        project_folder_mode: "inactive"
+      )
+      project_storage.save(validate: false)
+      log("created project_storage id=#{project_storage.id} project=#{project.identifier} storage=#{storage.id}")
+    else
+      log("project_storage already present (id=#{project_storage.id})")
+    end
+  else
+    log("Storages::NextcloudStorage not defined on this version -- skipping nextcloud storage seed")
+  end
+else
+  log("nextcloud storage seed not requested (SEED_NEXTCLOUD_STORAGE unset)")
+end
+
+# --- File link fixtures (opt-in, for delete_file_link coverage) ----------------
+# Requires the Nextcloud storage fixture above (SEED_NEXTCLOUD_STORAGE=1) to
+# already have created a Storages::Storage + Storages::ProjectStorage on this
+# project -- a FileLink's create contract requires the work package's project
+# to actually have that storage linked (validate_project_storage_link), so
+# this only runs when that fixture ran successfully. Bypasses AR validation
+# the same way the storage/project_storage rows above do: creating through
+# Storages::FileLinks::CreateContract would additionally require a live
+# Enterprise-token check (check_for_enterprise_token_requirements), which
+# this fixture -- like the storage connection itself -- deliberately never
+# satisfies. This is NOT a live-connected file: origin_id/origin_name are
+# fabricated, nothing in Nextcloud actually exists at that id.
+#
+# Two rows, not one: "seed-file-link-persistent.txt" stays untouched for
+# tests/integration/test_write_denials.py's read-then-deny check (that test
+# must never see its target vanish out from under it), and
+# "seed-file-link-deletable.txt" is what
+# test_storages.py::test_delete_file_link_deletes_seeded_link actually
+# destroys via delete_file_link's successful-delete path -- which previously
+# had no deterministic live coverage at all (see docker/test/README.md).
+# find_or_create means re-running `up.sh` after a test consumed the deletable
+# row seeds it again, so the test suite stays repeatable without requiring a
+# full container recreate between runs.
+if ENV["SEED_FILE_LINK"] == "1"
+  if defined?(Storages::FileLink)
+    project_storage = Storages::ProjectStorage.find_by(project: project)
+    seed_wp = project.work_packages.first
+    if project_storage.nil?
+      log("no project_storage present -- run with SEED_NEXTCLOUD_STORAGE=1 first to seed a file link")
+    elsif seed_wp.nil?
+      log("no seed work package present -- skipping file link seed")
+    else
+      [
+        ["1", "seed-file-link-persistent.txt"],
+        ["2", "seed-file-link-deletable.txt"]
+      ].each do |origin_id, origin_name|
+        file_link = Storages::FileLink.find_by(container: seed_wp, storage: project_storage.storage, origin_name: origin_name)
+        if file_link.nil?
+          file_link = Storages::FileLink.new(
+            storage: project_storage.storage,
+            creator: admin,
+            container: seed_wp,
+            origin_id: origin_id,
+            origin_name: origin_name
+          )
+          file_link.save(validate: false)
+          log("created file_link id=#{file_link.id} name=#{origin_name} work_package=#{seed_wp.id}")
+        else
+          log("file_link '#{origin_name}' already present (id=#{file_link.id})")
+        end
+      end
+    end
+  else
+    log("Storages::FileLink not defined on this version -- skipping file link seed")
+  end
+else
+  log("file link seed not requested (SEED_FILE_LINK unset)")
+end
+
+log("done")

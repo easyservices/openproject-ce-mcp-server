@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+"""Check the API assumptions this MCP client makes against the OpenProject source.
+
+The client hardcodes endpoint paths, response fields and query-filter keys. When
+OpenProject renames or removes one across versions, the client breaks silently
+(this is exactly how the first semantic-identifier resolver regressed: it relied
+on the ``subject_or_id`` filter, which does not match the project-based
+``displayId`` form). This tool verifies, offline, that every symbol the client
+depends on still exists in the source of each target version.
+
+Scope and limits
+----------------
+This is an *existence / symbol* check, not a semantic proof. It catches
+"field/filter/path renamed or removed between versions"; it does NOT catch
+"same symbol, subtly different behaviour" — that is what the Docker runtime
+tests in ``docker/test/`` are for.
+
+Sources come from ``tools/api-check/fetch-sources.sh`` (clones under the umbrella
+directory's ``op-sources/<version>/``, one level above this repo). Run that first.
+
+Usage:
+    python tools/api-check/check_api.py             # curated symbol presence
+    python tools/api-check/check_api.py --all       # every resource + filter used
+    python tools/api-check/check_api.py --constants # hardcoded enum/constant VALUES
+    python tools/api-check/check_api.py --verbose   # also list every OK entry
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
+from pathlib import Path
+
+from op_sources import SOURCES, MissingCheckoutError, pinned_versions, require_checkouts, version_key
+
+ROOT = Path(__file__).resolve().parents[2]
+PINS = pinned_versions()
+VERSIONS = list(PINS)
+
+
+@dataclass(frozen=True)
+class Assumption:
+    """One API symbol the client depends on.
+
+    ``pattern`` is a fixed string grepped (literally) under ``subtree``.
+
+    Expected presence per version is the allowlist of known, intentional version
+    differences, expressed two ways:
+    - ``present_from``: the symbol was introduced in this version; expected
+      absent in every earlier version, present from this one on (e.g. "17.4").
+    - ``expect``: explicit per-version overrides (rarely needed).
+    A version covered by neither defaults to present.
+    """
+
+    symbol: str
+    kind: str  # "path" | "field" | "filter"
+    pattern: str
+    subtree: str = "lib/api/v3"
+    present_from: str | None = None
+    expect: dict[str, bool] = field(default_factory=dict)
+
+    def expected_present(self, version: str) -> bool:
+        if version in self.expect:
+            return self.expect[version]
+        if self.present_from is not None:
+            return version_key(version) >= version_key(self.present_from)
+        return True
+
+
+# Curated assumptions. Extend this list as the client grows; it is deliberately
+# manual — auto-extracting every path from client.py produces false positives
+# (f-string fragments, dynamic segments) that are noisier than they are worth.
+# Endpoint paths are all declared in the v3 path helper, which is the robust
+# source of truth (individual *_api.rb layouts vary). Filters and fields live in
+# their own files.
+_PATH_HELPER = "lib/api/v3/utilities/path_helper.rb"
+_WP_FILTERS = "app/models/queries/work_packages/filter"
+_BACKLOGS_SPRINTS = "modules/backlogs/lib/api/v3/sprints"
+_WP_REPRESENTER = "lib/api/v3/work_packages/work_package_representer.rb"
+_USER_REPRESENTER = "lib/api/v3/users/user_representer.rb"
+_VERSION_REPRESENTER = "lib/api/v3/versions/version_representer.rb"
+_MEMBERSHIP_REPRESENTER = "lib/api/v3/memberships/membership_representer.rb"
+
+ASSUMPTIONS: list[Assumption] = [
+    # --- Endpoint paths the client builds (checked against the path helper) ---
+    Assumption("work_packages endpoint", "path", "work_packages", subtree=_PATH_HELPER),
+    Assumption("projects endpoint", "path", "projects", subtree=_PATH_HELPER),
+    Assumption("relations endpoint", "path", "relations", subtree=_PATH_HELPER),
+    Assumption("time_entries endpoint", "path", "time_entries", subtree=_PATH_HELPER),
+    Assumption("memberships endpoint", "path", "memberships", subtree=_PATH_HELPER),
+    Assumption("versions endpoint", "path", "versions", subtree=_PATH_HELPER),
+    Assumption("statuses endpoint", "path", "status", subtree=_PATH_HELPER),
+    # --- Work-package response fields the resolver / writes depend on ---
+    Assumption(
+        "displayId field", "field", "displayId", subtree="lib/api/v3/work_packages", present_from="17.4"
+    ),  # introduced in 17.4
+    # Source uses the Ruby property name (snake_case); the representer renders it
+    # as "lockVersion" in JSON.
+    Assumption("lockVersion field", "field", "lock_version", subtree="lib/api/v3/work_packages"),
+    Assumption(
+        "semantic identifier model", "field", "semantic_id?", subtree="app/models/work_package", present_from="17.4"
+    ),  # model lands in 17.4; setting activates it in 17.5
+    # --- Response fields never backfilled into this list when they were added
+    # to the client. Patterns include the declaring macro
+    # (property/date_property/date_time_property/link), not just the bare field
+    # name, and subtree is the specific representer file, not its whole
+    # resource directory -- a bare name like "readonly" or "created_at" would
+    # still match comments/other methods/unrelated files in the wider
+    # directory even if the actual response-field declaration were removed,
+    # which would prove nothing. Macro names confirmed identical from 16.0
+    # through 17.6 for every entry below (spot-checked both ends of the matrix).
+    Assumption("scheduleManually field", "field", "property :schedule_manually", subtree=_WP_REPRESENTER),
+    Assumption("ignoreNonWorkingDays field", "field", "property :ignore_non_working_days", subtree=_WP_REPRESENTER),
+    Assumption("derivedStartDate field", "field", "date_property :derived_start_date", subtree=_WP_REPRESENTER),
+    Assumption("derivedDueDate field", "field", "date_property :derived_due_date", subtree=_WP_REPRESENTER),
+    # Rendered "percentageDone" in JSON; the Ruby property is done_ratio.
+    Assumption("percentageDone field", "field", "property :done_ratio", subtree=_WP_REPRESENTER),
+    Assumption("derivedPercentageDone field", "field", "property :derived_done_ratio", subtree=_WP_REPRESENTER),
+    Assumption("readonly field", "field", "property :readonly", subtree=_WP_REPRESENTER),
+    Assumption(
+        "hasProjectAttributes field",
+        "field",
+        "property :has_project_attributes",
+        subtree=_WP_REPRESENTER,
+        present_from="17.7",
+    ),  # absent before 17.7 (confirmed against the full pinned 16.0-17.7 range)
+    # Ruby source spells these without an underscore (firstname/lastname), not
+    # first_name/last_name.
+    Assumption("firstName field", "field", "property :firstname", subtree=_USER_REPRESENTER),
+    Assumption("lastName field", "field", "property :lastname", subtree=_USER_REPRESENTER),
+    # A `link`, not a `property` -- the camelCase name is the Ruby symbol too.
+    Assumption(
+        "defaultAssignee field",
+        "field",
+        "link :defaultAssignee",
+        subtree="lib/api/v3/categories/category_representer.rb",
+    ),
+    Assumption(
+        "favorited field",
+        "field",
+        "property :favorited",
+        subtree="lib/api/v3/projects/project_representer.rb",
+        present_from="17.0",
+    ),  # absent 16.0-16.6
+    Assumption("version createdAt field", "field", "date_time_property :created_at", subtree=_VERSION_REPRESENTER),
+    Assumption("version updatedAt field", "field", "date_time_property :updated_at", subtree=_VERSION_REPRESENTER),
+    Assumption(
+        "membership createdAt field", "field", "date_time_property :created_at", subtree=_MEMBERSHIP_REPRESENTER
+    ),
+    Assumption(
+        "membership updatedAt field", "field", "date_time_property :updated_at", subtree=_MEMBERSHIP_REPRESENTER
+    ),
+    # --- Query filters the client builds ---
+    # Present in both lines. Note: this filter matches subject text and the
+    # numeric id, NOT the project-based displayId — which is why resolving a
+    # semantic reference via this filter fails (see _resolve_work_package_id).
+    Assumption("subject_or_id filter", "filter", "subject_or_id_filter.rb", subtree=_WP_FILTERS),
+    Assumption("status_id filter", "filter", "status_filter.rb", subtree=_WP_FILTERS),
+    # Check the registered filter key itself (self.key), not just that
+    # a similarly-named file exists -- the file could survive a key rename.
+    Assumption("assigned_to_id filter", "filter", ":assigned_to_id", subtree=f"{_WP_FILTERS}/assigned_to_filter.rb"),
+    Assumption("priority_id filter", "filter", ":priority_id", subtree=f"{_WP_FILTERS}/priority_filter.rb"),
+    Assumption("type_id filter", "filter", ":type_id", subtree=f"{_WP_FILTERS}/type_filter.rb"),
+    Assumption(
+        "involved (relations) filter", "filter", "involved_filter.rb", subtree="app/models/queries/relations/filters"
+    ),
+    # Date-filter operators "=d"/"<>d". Check the literal registered
+    # symbol in its specific operator file, not just that a similarly-named
+    # file exists -- the wrong thing to prove would be "some file named
+    # on_date.rb still exists" when what the client depends on is the exact
+    # operator string it sends.
+    Assumption(
+        "on_date (=d) filter operator",
+        "filter",
+        'set_symbol "=d"',
+        subtree="app/models/queries/operators/on_date.rb",
+    ),
+    Assumption(
+        "between_date (<>d) filter operator",
+        "filter",
+        'set_symbol "<>d"',
+        subtree="app/models/queries/operators/between_date.rb",
+    ),
+    # --- Endpoints/operators behind the CE coverage-expansion tools. Each has a
+    # different minimum version, recorded so the matrix flags a tool used on too
+    # old an instance. (time-entry start/end lives in the costs module, which is
+    # not in the sparse checkout, so it is verified at runtime instead.)
+    Assumption("emoji_reactions endpoint", "path", "emoji_reactions", subtree="lib/api/v3", present_from="16.1"),
+    Assumption("reminders endpoint", "path", "reminders", subtree="lib/api/v3"),  # present since 16.0
+    Assumption("favorites endpoint", "path", "favorites", subtree="lib/api/v3", present_from="16.5"),
+    Assumption(
+        "version open status operator",
+        "filter",
+        "open_status.rb",
+        subtree="app/models/queries/operators/versions",
+        present_from="16.4",
+    ),
+    # --- Backlogs sprint endpoints + the work-package-side write link.
+    # Collection and detail are independent route blocks in the same file, so
+    # each gets its own entry rather than one that only proves the file exists.
+    Assumption(
+        "sprints collection endpoint",
+        "path",
+        "resources :sprints",
+        subtree=f"{_BACKLOGS_SPRINTS}/sprints_api.rb",
+        present_from="17.3",
+    ),
+    Assumption(
+        "sprints detail endpoint",
+        "path",
+        "route_param :id",
+        subtree=f"{_BACKLOGS_SPRINTS}/sprints_api.rb",
+        present_from="17.3",
+    ),
+    Assumption(
+        "projects/{id}/sprints endpoint",
+        "path",
+        "resources :sprints",
+        subtree=f"{_BACKLOGS_SPRINTS}/sprints_by_project_api.rb",
+        present_from="17.3",
+    ),
+    # Checks the setter itself, not just `resource :sprint` -- a bare
+    # `resource :sprint` match would only prove the link is rendered, not that
+    # it's writable, which is what the client actually depends on.
+    Assumption(
+        "sprint work-package write link",
+        "field",
+        "associated_resource_default_setter(:sprint, :sprint, :sprint)",
+        subtree="modules/backlogs/lib/open_project/backlogs/patches/api/work_package_representer.rb",
+        present_from="17.3",
+    ),
+]
+
+
+def _find_any(root: Path, name_pattern: str) -> bool:
+    """True if the name of `root` or of anything under it matches `name_pattern`, like `find -name`."""
+    # Not find(1): Windows ships an unrelated find.exe. Not Path.rglob: it reads
+    # the pattern as a path, so a symbol such as ":displayId" is a drive on Windows.
+    return fnmatchcase(root.name, name_pattern) or any(
+        fnmatchcase(name, name_pattern) for _, dirs, files in os.walk(root) for name in (*dirs, *files)
+    )
+
+
+def _present(version: str, asm: Assumption) -> bool:
+    """True if the symbol's pattern is found anywhere under its subtree."""
+    base = SOURCES / version / asm.subtree
+    if not base.exists():
+        # Subtree missing entirely also counts as "not present".
+        return False
+    # Literal, recursive, filename+content search. -r covers content; the
+    # filename-style patterns (``*_api.rb``) are matched by also grepping the
+    # file list, so we use a combined approach: ripgrep-free, plain grep.
+    try:
+        # Content match.
+        content = (
+            subprocess.run(
+                ["grep", "-rqF", "--", asm.pattern, str(base)],
+                capture_output=True,
+                check=False,
+            ).returncode
+            == 0
+        )
+        if content:
+            return True
+        # Filename match (for *_api.rb / directory-name patterns).
+        return _find_any(base, f"*{asm.pattern}*")
+    except FileNotFoundError as exc:  # grep missing
+        print(f"error: required tool not found: {exc}", file=sys.stderr)
+        raise
+
+
+# --- Constant / enum checks (values, not just symbol presence) ---
+#
+# The assumptions above verify a symbol EXISTS. These verify that a hardcoded set
+# of VALUES in the client still matches the source — an enum value or payload key
+# that OpenProject renames would pass the existence check yet break at runtime.
+# Each constant names the client's expected set and a regex that extracts the
+# source's set from one file; the client set must be a subset of the source set.
+# Only versions whose source file exists are checked (these models arrived at
+# different releases), so missing files are reported as "n/a", not a failure.
+
+CLIENT_PY = ROOT / "src" / "openproject_ce_mcp_server" / "client.py"
+
+
+@dataclass(frozen=True)
+class Constant:
+    name: str
+    client_values: frozenset[str]
+    source_file: str  # path under op-sources/<version>/
+    source_regex: str  # each match group(1) is one source value
+
+
+CONSTANTS: list[Constant] = [
+    Constant(
+        "emoji reactions",
+        frozenset(
+            {
+                "thumbs_up",
+                "thumbs_down",
+                "grinning_face_with_smiling_eyes",
+                "confused_face",
+                "heart",
+                "party_popper",
+                "rocket",
+                "eyes",
+            }
+        ),
+        "app/models/emoji_reaction.rb",
+        # EMOJI_MAP entries: `    thumbs_up: "..."`
+        r"^\s+([a-z_]+):\s*\"",
+    ),
+    Constant(
+        "version statuses",
+        frozenset({"open", "closed", "locked"}),
+        "app/models/version.rb",
+        # VERSION_STATUSES = %w(open locked closed)
+        r"VERSION_STATUSES\s*=\s*%w\(([^)]*)\)",  # special-cased: split group on spaces
+    ),
+    Constant(
+        "version status operators",
+        frozenset({"o", "c", "l"}),
+        "app/models/queries/operators/versions",  # directory
+        r'set_symbol\s+"([a-z])"',
+    ),
+]
+
+
+def _extract_source_values(version: str, const: Constant) -> set[str] | None:
+    """Return the set of values found in the source, or None if the file is absent."""
+    target = SOURCES / version / const.source_file
+    if not target.exists():
+        return None
+    texts: list[str] = []
+    if target.is_dir():
+        for f in sorted(target.rglob("*.rb")):
+            texts.append(f.read_text(encoding="utf-8", errors="replace"))
+    else:
+        texts.append(target.read_text(encoding="utf-8", errors="replace"))
+    values: set[str] = set()
+    rx = re.compile(const.source_regex, re.MULTILINE)
+    for text in texts:
+        for m in rx.finditer(text):
+            captured = m.group(1)
+            # %w(...) style: one match holds a space-separated list.
+            if " " in captured:
+                values.update(captured.split())
+            else:
+                values.add(captured)
+    return values
+
+
+def run_constants(verbose: bool = False) -> int:
+    header = f"{'constant':<28} " + " ".join(f"{v:<8}" for v in VERSIONS) + " verdict"
+    print(header)
+    print("-" * len(header))
+    failures: list[str] = []
+    for const in CONSTANTS:
+        cells = []
+        verdict = "ok"
+        for v in VERSIONS:
+            source_values = _extract_source_values(v, const)
+            if source_values is None:
+                cells.append(f"{'(n/a)':<8}")
+                continue
+            missing = const.client_values - source_values
+            if not missing:
+                cells.append(f"{'match':<8}")
+            else:
+                cells.append(f"{'DRIFT!':<8}")
+                verdict = "DRIFT"
+                failures.append(f"{const.name}: {v} — client values not in source: {sorted(missing)}")
+        if verdict != "ok" or verbose:
+            print(f"{const.name:<28} " + " ".join(cells) + f" {verdict}")
+
+    print()
+    if failures:
+        print(f"FAIL: {len(failures)} constant drift(s):")
+        for fmsg in failures:
+            print(f"  - {fmsg}")
+        return 1
+    print(
+        f"OK: all {len(CONSTANTS)} hardcoded constant sets are a subset of the "
+        f"source across the versions that define them."
+    )
+    return 0
+
+
+# --- Full auto-extracted coverage (every resource + filter the client uses) ---
+
+CLIENT = ROOT / "src" / "openproject_ce_mcp_server" / "client.py"
+# The layered app/ architecture migration moved almost every
+# domain's real HTTP calls out of client.py into app/adapters/httpx_*_api.py
+# (self._transport.get_json/post_json/patch_json/delete/delete_json, the
+# direct analog of client.py's own self._get/_post/_patch/_delete), and moved
+# filter-dict construction into app/services/*.py as well as some adapters.
+# Scanning CLIENT alone finds almost nothing since that migration --
+# extended to scan both app/
+# subtrees too, so this tool's --all coverage doesn't silently go blind as a
+# side effect of an otherwise behavior-preserving refactor.
+APP_ADAPTERS = ROOT / "src" / "openproject_ce_mcp_server" / "app" / "adapters"
+APP_SERVICES = ROOT / "src" / "openproject_ce_mcp_server" / "app" / "services"
+
+# Resources with no lib/api/v3 footprint at all -- neither the core tree nor
+# any module's own (see _resource_roots) -- so _resource_present can never
+# find them. Reported as "module" (not source-verified here) rather than
+# missing. They exist in CE and are verified at runtime instead.
+#
+# documents/file_links/sprints/time_entries used to be listed here too, back
+# when _resource_present only searched the core lib/api/v3 tree and CE
+# feature-module resources (Documents, Storages, Backlogs, Costs) were
+# invisible to it. Searching modules/*/lib/api/v3 as well (see
+# _resource_roots) finds all four across the full pinned range (sprints
+# only from 17.3 on, when Backlogs' own sprints_api.rb route lands -- caught
+# and reported correctly by the normal "introduced after 16.0" cell, not a
+# special case), so they no longer need this unconditional exemption. Only
+# grids and job_statuses were confirmed to have zero hits anywhere in the
+# pinned source range.
+MODULE_RESOURCES = {
+    "grids": "my_page",
+    "job_statuses": "job_statuses",
+}
+# Path-helper / directory names that differ from the client's path segment.
+RESOURCE_ALIASES = {"statuses": "status", "my_preferences": "user_preferences"}
+# Client path segments that are not standalone API resources (skip them).
+RESOURCE_SKIP = {"api", "v3"}
+
+# Client filter keys whose source filter file is named differently, and keys
+# that are query parameters rather than registered filters (skip those).
+FILTER_ALIASES = {
+    "status_id": "status",
+    "project_id": "project",
+    "assignee": "assigned_to",
+    "assigned_to_id": "assigned_to",
+    "priority_id": "priority",
+    "type_id": "type",
+    "version_id": "version",
+    "observed_in_version_id": "observed_in_versions",
+}
+# Filter keys of module resources, mapped to the query tree they belong to.
+# Unscoped keys are looked up in core only: a module's filter of the same name
+# (documents also has "title") must not stand in for the one the client uses.
+FILTER_QUERY_SCOPES = {
+    "title": "meetings",
+}
+FILTER_SKIP = {"date", "scope", "context"}  # query params / matchers, not filter files
+
+
+def _all_source_texts() -> list[str]:
+    """client.py, plus every app/adapters and app/services module -- see the
+    module-level comment above APP_ADAPTERS for why both app/ subtrees are
+    included, not just client.py."""
+    texts = [CLIENT.read_text()]
+    for subtree in (APP_ADAPTERS, APP_SERVICES):
+        if subtree.exists():
+            texts.extend(p.read_text() for p in subtree.glob("*.py"))
+    return texts
+
+
+def _extract_client_resources() -> set[str]:
+    used: set[str] = set()
+    for text in _all_source_texts():
+        # client.py's own self._get/_post/_patch/_delete AND app/adapters'
+        # self._transport.get_json/post_json/patch_json/delete/delete_json --
+        # same f-string-first-path-segment shape in both.
+        for m in re.findall(
+            r'self\._(?:get|post|patch|delete)\(\s*f?"([^"]+)"'
+            # get_binary (streamed downloads, e.g. attachment content) and
+            # post_multipart (file uploads) are otherwise-invisible transport
+            # methods -- found missing when neither the attachment-content
+            # endpoint nor the attachment-upload endpoint showed up in --all
+            # coverage despite both existing in httpx_attachment_api.py.
+            r'|self\._transport\.(?:get_json|post_json|patch_json|delete_json|delete|get_binary|post_multipart)\(\s*f?"([^"]+)"'
+            # Generic-verb request shapes -- client.py's self._request("METHOD", ...)
+            # and app/'s self._transport.request_raw("METHOD", ...) both take the
+            # HTTP verb as a separate first argument, so the path is the SECOND
+            # string literal, not the first (found via the workspaces/favorite
+            # endpoint, which uses exactly this shape on both branches and was
+            # otherwise invisible to this extractor).
+            r'|self\._request\(\s*"[A-Z]+",\s*f?"([^"]+)"'
+            r'|self\._transport\.request_raw\(\s*"[A-Z]+",\s*f?"([^"]+)"',
+            text,
+        ):
+            path = next(g for g in m if g)
+            seg = re.sub(r"\{[^}]*\}", "", path.lstrip("/")).split("/")[0]
+            if re.fullmatch(r"[a-z_]+", seg) and seg not in RESOURCE_SKIP:
+                used.add(seg)
+        for m in re.findall(r'_api_href\(f?"([a-z_]+)', text):
+            used.add(m)
+    return used
+
+
+def _extract_client_filters() -> set[str]:
+    keys: set[str] = set()
+    for text in _all_source_texts():
+        keys.update(re.findall(r'\{"([A-Za-z_]+)":\s*\{"operator"', text))
+    return keys - FILTER_SKIP
+
+
+def _resource_roots(version: str) -> list[Path]:
+    """Every lib/api/v3 tree this version's source ships: the core one, plus
+    each module's own (fetch-sources.sh's sparse-checkout pulls both -- see
+    its SPARSE_PATHS comment "every module's API subtree (Backlogs,
+    Meetings, etc.)"). A resource like `meetings`/`storages`/`cost_entries`
+    lives under modules/<name>/lib/api/v3, never under the core tree, so
+    checking only the core root silently treats every such CE feature module
+    as "missing" at every version -- caught via --all reporting a false
+    12-resource regression at 17.7 that didn't reproduce with any older
+    pinned version singled out, which would have been a red herring for an
+    actual client/source incompatibility.
+    """
+    base = SOURCES / version
+    roots = [base / "lib" / "api" / "v3"]
+    modules_dir = base / "modules"
+    if modules_dir.is_dir():
+        roots.extend(sorted(modules_dir.glob("*/lib/api/v3")))
+    return [r for r in roots if r.exists()]
+
+
+def _resource_present(version: str, resource: str) -> bool:
+    """Robust presence check: directory, path-helper entry, or *_api.rb file,
+    searched across the core lib/api/v3 tree and every module's own (see
+    _resource_roots)."""
+    roots = _resource_roots(version)
+    if not roots:
+        return False
+    name = RESOURCE_ALIASES.get(resource, resource)
+    for api in roots:
+        if (api / name).is_dir():
+            return True
+        helper = api / "utilities" / "path_helper.rb"
+        if helper.exists():
+            hit = (
+                subprocess.run(
+                    ["grep", "-qE", rf"\b{name}\b", str(helper)], capture_output=True, check=False
+                ).returncode
+                == 0
+            )
+            if hit:
+                return True
+        if _find_any(api, f"*{name}*"):
+            return True
+    return False
+
+
+def _filter_present(version: str, filter_key: str) -> bool:
+    base = SOURCES / version
+    scope = FILTER_QUERY_SCOPES.get(filter_key)
+    if scope is None:
+        qroots = [base / "app" / "models" / "queries"]
+    else:
+        qroots = [
+            qroot / scope for qroot in (base / "app" / "models" / "queries", *base.glob("modules/*/app/models/queries"))
+        ]
+    # Wire keys are camelCase where the Ruby file is snake_case (readIAN -> read_ian_filter.rb).
+    name = re.sub(r"(?<=[a-z])(?=[A-Z])", "_", FILTER_ALIASES.get(filter_key, filter_key)).lower()
+    # Filters are <name>_filter.rb files (allow plural dir layouts).
+    return any(_find_any(qroot, f"{name}_filter.rb") for qroot in qroots if qroot.exists())
+
+
+def run_full_coverage() -> int:
+    resources = sorted(_extract_client_resources())
+    filters = sorted(_extract_client_filters())
+    rows: list[tuple[str, str, list[str]]] = []
+    introduced_late: list[str] = []
+    missing_at_latest: list[str] = []
+
+    for r in resources:
+        if r in MODULE_RESOURCES:
+            rows.append((r, "resource", ["module"] * len(VERSIONS)))
+            continue
+        cells = ["yes" if _resource_present(v, r) else "—" for v in VERSIONS]
+        rows.append((r, "resource", cells))
+        if cells[0] == "—" and "yes" in cells:
+            introduced_late.append(f"{r} (from {VERSIONS[cells.index('yes')]})")
+        if cells[-1] == "—":
+            missing_at_latest.append(f"{r} (resource)")
+    for f in filters:
+        cells = ["yes" if _filter_present(v, f) else "—" for v in VERSIONS]
+        rows.append((f, "filter", cells))
+        if cells[0] == "—" and "yes" in cells:
+            introduced_late.append(f"{f} filter (from {VERSIONS[cells.index('yes')]})")
+        if cells[-1] == "—":
+            missing_at_latest.append(f"{f} (filter)")
+
+    header = f"{'access':<28} {'kind':<9} " + " ".join(f"{v:<6}" for v in VERSIONS)
+    print(header)
+    print("-" * len(header))
+    for name, kind, cells in rows:
+        print(f"{name:<28} {kind:<9} " + " ".join(f"{c:<6}" for c in cells))
+
+    print()
+    module_only = [n for n, k, c in rows if c and c[0] == "module"]
+    print(f"{len(resources)} resources + {len(filters)} filters checked across {VERSIONS[0]}..{VERSIONS[-1]}.")
+    if module_only:
+        print(f"module-only (not source-verifiable, CE): {', '.join(module_only)}")
+    if introduced_late:
+        print("introduced after 16.0 (a tool using these needs a newer server):")
+        for x in introduced_late:
+            print(f"  - {x}")
+    else:
+        print("No source-verifiable accesses were introduced after 16.0.")
+
+    if missing_at_latest:
+        print()
+        print(
+            f"FAIL: {len(missing_at_latest)} client-used resource/filter(s) missing at the latest pinned version ({VERSIONS[-1]}):"
+        )
+        for x in missing_at_latest:
+            print(f"  - {x}")
+        return 1
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--verbose", action="store_true", help="list every checked symbol, not just mismatches")
+    parser.add_argument(
+        "--all", action="store_true", help="auto-extract and map EVERY resource + filter the client uses"
+    )
+    parser.add_argument(
+        "--constants", action="store_true", help="verify hardcoded enum/constant VALUES against the source"
+    )
+    args = parser.parse_args()
+
+    try:
+        require_checkouts(PINS, SOURCES)
+    except MissingCheckoutError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.constants:
+        return run_constants(verbose=args.verbose)
+    if args.all:
+        return run_full_coverage()
+
+    header = f"{'symbol':<32} {'kind':<8} " + " ".join(f"{v:<8}" for v in VERSIONS) + " verdict"
+    print(header)
+    print("-" * len(header))
+
+    unexpected: list[str] = []
+    for asm in ASSUMPTIONS:
+        cells = []
+        verdict = "ok"
+        for v in VERSIONS:
+            present = _present(v, asm)
+            expected = asm.expected_present(v)
+            if present == expected:
+                mark = "yes" if present else "(n/a)"
+            else:
+                mark = "PRESENT!" if present else "MISSING!"
+                verdict = "UNEXPECTED"
+                unexpected.append(
+                    f"{asm.symbol}: {v} expected {'present' if expected else 'absent'} "
+                    f"but was {'present' if present else 'absent'}"
+                )
+            cells.append(f"{mark:<8}")
+        if verdict != "ok" or args.verbose:
+            print(f"{asm.symbol:<32} {asm.kind:<8} " + " ".join(cells) + f" {verdict}")
+
+    print()
+    if unexpected:
+        print(f"FAIL: {len(unexpected)} unexpected API difference(s):")
+        for u in unexpected:
+            print(f"  - {u}")
+        print("\nIf a difference is intentional, update the `expect` field of the assumption in check_api.py.")
+        return 1
+
+    print(f"OK: all {len(ASSUMPTIONS)} API assumptions match the expected presence across {', '.join(VERSIONS)}.")
+    print("Note: this is a symbol-existence check, not a behaviour proof — see docker/test/ for runtime verification.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

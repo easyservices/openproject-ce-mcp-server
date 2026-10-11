@@ -1,0 +1,163 @@
+"""Application Service for the Actions & Capabilities domain.
+
+Depends on the ActionCapabilityApi Protocol, never HttpxActionCapabilityApi
+concretely (enforced by the architecture-boundary test). No dedicated
+Resolver for either method: `capability_id` is an opaque string filter value,
+not a semantic reference needing lookup.
+
+`list_actions` is a purely project-independent Service method: Actions has no
+project concept at all in the OpenProject API, so it takes no
+`ProjectRefResolver` dependency, unlike most other project-scoped domains.
+
+`list_capabilities`, by contrast, IS project-scoped when a `project` ref is
+given (its `context` filter targets a specific project) -- so it depends on
+`ProjectRefResolver`, same seam as Categories/Memberships/Documents. Both
+methods share `access.ensure_read_enabled("membership", ...)` as their gate,
+so a single Service bundling both, rather than two separate Services, avoids
+depending on the exact same seam twice for no behavioral difference.
+
+`list_capabilities` also allowlist-checks each RETURNED record's own
+`context` link (via `scope.ensure_project_link_allowed`; the global context,
+a capability without a project, goes through the optional-link contract
+instead and is visible only under a wide-open read scope; same "nullable link,
+no dedicated policy file" shape as `ViewService._allowed` -- Capabilities has
+no dedicated policy file for the same reason Views doesn't), independent of
+whether a `project` filter was supplied server-side. This matters because
+capability records carry a genuine `context.href` (a real
+`/api/v3/projects/{id}` link per the OpenProject API docs), not just a
+display title: a `capability_id`-only call has no `project` parameter to
+resolve/check, so without this per-record check, a restrictive
+`OPENPROJECT_READ_PROJECTS` scope would leak capability records (including
+project names/principals) for `capability_id`-only calls. The server-side
+`context` filter remains a narrowing optimization when `project` is given,
+not the security boundary -- the per-record check runs regardless.
+
+`capability_id` is filtered via the server-side single-item `GET
+/capabilities/{id}` endpoint, not a collection `id` filter -- OpenProject's
+capabilities collection endpoint accepts only `action`/`principal`/`context`
+filters, with no `id` filter of its own.
+
+The `context` filter's project-scoping value is `p{id}` (project), NOT
+`w{id}` (workspace): `Queries::Capabilities::Filters::ContextFilter#split_values`
+only matches "[gp] followed by digits" on 16.0-16.6 (`w` isn't introduced
+until 17.0, where the regex becomes `[gwp]`, verified across all supported
+versions). `p` remains accepted on every version 16.0-17.6 despite a
+`@deprecated ... for 17.2` comment in the 17.x source that was apparently
+never acted on -- it is the only prefix that works across the whole
+supported version matrix.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+from ...config import Settings
+from ...models import ActionListResult, CapabilityListResult
+from ..errors import InvalidInputError
+from ..origin import api_prefix_from_url
+from ..pagination import effective_limit as _effective_limit
+from ..pagination import paginate_server
+from ..policies import access, hidden_fields
+from ..policies import scope as scope_policy
+from ..ports.action_capability_api import ActionCapabilityApi
+from ..ports.project_ref import ProjectRefResolver
+
+
+def _context_href(context_link: dict[str, Any] | None) -> Any:
+    return context_link.get("href") if isinstance(context_link, dict) else None
+
+
+class ActionCapabilityService:
+    def __init__(
+        self,
+        *,
+        api: ActionCapabilityApi,
+        settings: Settings,
+        project_id_to_identifier: Mapping[int, str],
+        resolve_project_ref: ProjectRefResolver,
+    ) -> None:
+        self._api = api
+        self._settings = settings
+        self._project_id_to_identifier = project_id_to_identifier
+        self._resolve_project_ref = resolve_project_ref
+        self._global_context_href = f"{api_prefix_from_url(settings.base_url)}capabilities/contexts/global"
+
+    def _context_allowed(self, context_link: dict[str, Any] | None) -> bool:
+        ensure = scope_policy.ensure_project_link_allowed
+        if _context_href(context_link) == self._global_context_href:
+            # A capability without a project: allowed only where the read
+            # scope is wide open, like any explicitly unscoped link.
+            ensure, context_link = scope_policy.ensure_project_link_allowed_if_present, {"href": None}
+        return scope_policy.payload_allowed(
+            lambda: ensure(
+                context_link, settings=self._settings, project_id_to_identifier=self._project_id_to_identifier
+            )
+        )
+
+    def _context_matches_project(self, context_link: dict[str, Any] | None, project_id: int) -> bool:
+        return scope_policy.project_id_from_href(_context_href(context_link), settings=self._settings) == project_id
+
+    async def list_actions(self, *, offset: int = 1, limit: int | None = None) -> ActionListResult:
+        access.ensure_read_enabled("membership", settings=self._settings)
+        effective_limit = _effective_limit(limit, settings=self._settings)
+        records, total = await self._api.list_actions(offset=offset, page_size=effective_limit)
+        results = [
+            hidden_fields.apply_hidden_fields("action", record.summary, settings=self._settings) for record in records
+        ]
+        next_offset, truncated = paginate_server(offset=offset, limit=effective_limit, total=total)
+        return ActionListResult(
+            offset=offset,
+            limit=effective_limit,
+            total=total,
+            count=len(results),
+            next_offset=next_offset,
+            truncated=truncated,
+            results=results,
+        )
+
+    async def list_capabilities(
+        self,
+        *,
+        project: str | None = None,
+        capability_id: str | None = None,
+        offset: int = 1,
+        limit: int | None = None,
+    ) -> CapabilityListResult:
+        access.ensure_read_enabled("membership", settings=self._settings)
+        if project is None and capability_id is None:
+            raise InvalidInputError("At least one of project or capability_id is required for capabilities.")
+        effective_limit = _effective_limit(limit, settings=self._settings)
+
+        project_id: int | None = None
+        if project is not None:
+            project_payload = await self._resolve_project_ref(project, write=False)
+            project_id = int(project_payload["id"])
+
+        if capability_id is not None:
+            record = await self._api.get_capability(capability_id)
+            records = [record] if self._context_allowed(record.context_link) else []
+            if project_id is not None:
+                records = [r for r in records if self._context_matches_project(r.context_link, project_id)]
+            total = len(records)
+        else:
+            filters: list[dict[str, object]] = [{"context": {"operator": "=", "values": [f"p{project_id}"]}}]
+            fetched, total = await self._api.list_capabilities(
+                filters=filters, offset=offset, page_size=effective_limit
+            )
+            records = [r for r in fetched if self._context_allowed(r.context_link)]
+
+        results = [
+            hidden_fields.apply_hidden_fields("capability", record.summary, settings=self._settings)
+            for record in records
+        ]
+        next_offset, truncated = paginate_server(offset=offset, limit=effective_limit, total=total)
+        return CapabilityListResult(
+            offset=offset,
+            limit=effective_limit,
+            total=total,
+            count=len(results),
+            next_offset=next_offset,
+            truncated=truncated,
+            results=results,
+        )

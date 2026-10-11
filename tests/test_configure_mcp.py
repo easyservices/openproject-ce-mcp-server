@@ -1,0 +1,3630 @@
+from __future__ import annotations
+
+import dataclasses
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
+from pathlib import Path
+
+import httpx
+import pytest
+
+# The interactive setup lives in the package at src/openproject_ce_mcp_server/setup_cli.py.
+# Load it explicitly by file path so it resolves the same way under every pytest
+# runner regardless of sys.path (and independent of the root configure_mcp.py shim).
+_SPEC = importlib.util.spec_from_file_location(
+    "openproject_ce_mcp_server_setup_cli",
+    Path(__file__).resolve().parent.parent / "src" / "openproject_ce_mcp_server" / "setup_cli.py",
+)
+assert _SPEC and _SPEC.loader
+c = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(c)
+
+ENV = {
+    "OPENPROJECT_BASE_URL": "https://op.example.com",
+    "OPENPROJECT_API_TOKEN": 'opapi-with"quote\\and-backslash',
+}
+
+# A real absolute path in native format for whichever OS runs the tests —
+# Path.is_absolute() only recognizes drive-letter/UNC paths as absolute on
+# Windows, so a hardcoded POSIX literal like "/tmp/uploads" fails there.
+ATTACHMENT_ROOT = str(Path(tempfile.gettempdir()) / "uploads")
+CMD = "/home/user/openproject-ce-mcp-server/.venv/bin/openproject-ce-mcp-server"
+
+
+# ── JSON merge (mcpServers / servers) ──────────────────────────────────────────
+
+
+def test_merge_json_new_file_mcp_servers() -> None:
+    data = json.loads(c._merge_json("", "mcpServers", CMD, ENV, stdio=False))
+    server = data["mcpServers"]["openproject"]
+    assert server["command"] == CMD
+    assert server["env"] == ENV
+    assert "type" not in server
+
+
+def test_merge_json_servers_uses_stdio() -> None:
+    data = json.loads(c._merge_json("", "servers", CMD, ENV, stdio=True))
+    server = data["servers"]["openproject"]
+    assert server["type"] == "stdio"
+    assert server["command"] == CMD
+
+
+def test_merge_json_preserves_other_servers_and_settings() -> None:
+    existing = json.dumps(
+        {
+            "mcpServers": {"other": {"command": "/bin/other"}},
+            "theme": "dark",
+            "unrelated": {"nested": [1, 2, 3]},
+        }
+    )
+    out = json.loads(c._merge_json(existing, "mcpServers", CMD, ENV, stdio=False))
+    # openproject added…
+    assert out["mcpServers"]["openproject"]["command"] == CMD
+    # …other server kept…
+    assert out["mcpServers"]["other"] == {"command": "/bin/other"}
+    # …and unrelated top-level settings untouched.
+    assert out["theme"] == "dark"
+    assert out["unrelated"] == {"nested": [1, 2, 3]}
+
+
+def test_merge_json_replaces_existing_openproject() -> None:
+    existing = json.dumps({"mcpServers": {"openproject": {"command": "/old/path", "env": {"X": "1"}}}})
+    out = json.loads(c._merge_json(existing, "mcpServers", CMD, ENV, stdio=False))
+    assert out["mcpServers"]["openproject"]["command"] == CMD
+    assert out["mcpServers"]["openproject"]["env"] == ENV
+
+
+def test_toml_quote_escapes_specials() -> None:
+    assert c._toml_quote('a"b\\c') == '"a\\"b\\\\c"'
+
+
+# ── Codex TOML merge (text-level, no TOML writer) ──────────────────────────────
+
+
+def test_merge_codex_toml_new_file_round_trips() -> None:
+    data = tomllib.loads(c._merge_codex_toml("", CMD, ENV))
+    server = data["mcp_servers"]["openproject"]
+    assert server["command"] == CMD
+    # Quotes and backslashes in the token must survive TOML escaping.
+    assert server["env"]["OPENPROJECT_API_TOKEN"] == ENV["OPENPROJECT_API_TOKEN"]
+
+
+def test_merge_codex_toml_preserves_other_tables() -> None:
+    existing = '[some_setting]\nkey = "value"\n\n[mcp_servers.other]\ncommand = "/bin/other"\n'
+    merged = c._merge_codex_toml(existing, CMD, ENV)
+    data = tomllib.loads(merged)
+    assert data["some_setting"]["key"] == "value"
+    assert data["mcp_servers"]["other"]["command"] == "/bin/other"
+    assert data["mcp_servers"]["openproject"]["command"] == CMD
+
+
+def test_merge_codex_toml_replaces_existing_openproject() -> None:
+    existing = (
+        '[mcp_servers.openproject]\ncommand = "/old"\n\n'
+        '[mcp_servers.openproject.env]\nOLD = "1"\n\n'
+        '[mcp_servers.keep]\ncommand = "/bin/keep"\n'
+    )
+    merged = c._merge_codex_toml(existing, CMD, ENV)
+    data = tomllib.loads(merged)
+    assert data["mcp_servers"]["openproject"]["command"] == CMD
+    assert "OLD" not in data["mcp_servers"]["openproject"].get("env", {})
+    # A sibling server that shares the prefix name must NOT be dropped.
+    assert data["mcp_servers"]["keep"]["command"] == "/bin/keep"
+
+
+# ── detection ───────────────────────────────────────────────────────────────────
+
+
+def test_detects_codex_via_config_dir(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(c, "_home", lambda: tmp_path)
+    monkeypatch.setattr(c.shutil, "which", lambda _name: None)
+    assert c._detect_codex() is False
+    (tmp_path / ".codex").mkdir()
+    assert c._detect_codex() is True
+
+
+def test_detects_claude_code_via_binary(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(c, "_home", lambda: tmp_path)
+    monkeypatch.setattr(c.shutil, "which", lambda name: "/usr/bin/claude" if name == "claude" else None)
+    assert c._detect_claude_code() is True
+
+
+def test_clients_only_offers_detected(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(c, "_home", lambda: tmp_path)
+    monkeypatch.setattr(c.shutil, "which", lambda _name: None)
+    # No client artifacts present → nothing detected.
+    assert [cl for cl in c._clients() if cl.detected()] == []
+
+
+@pytest.mark.parametrize(
+    ("is_windows", "is_macos", "expected_root"),
+    [
+        (True, False, Path("AppData") / "Roaming"),
+        (False, True, Path("Library") / "Application Support"),
+        (False, False, Path(".config")),
+    ],
+)
+def test_claude_desktop_path_uses_platform_config_root(
+    monkeypatch,
+    tmp_path: Path,
+    is_windows: bool,
+    is_macos: bool,
+    expected_root: Path,
+) -> None:
+    monkeypatch.setattr(c, "_IS_WINDOWS", is_windows)
+    monkeypatch.setattr(c, "_IS_MACOS", is_macos)
+    monkeypatch.setattr(c, "_home", lambda: tmp_path)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "AppData" / "Roaming"))
+
+    assert c._claude_desktop_path() == (tmp_path / expected_root / "Claude" / "claude_desktop_config.json")
+
+
+# ── write + backup ──────────────────────────────────────────────────────────────
+
+
+def _codex_client(target: Path, *, detect: bool = True, project_target: Path | None = None) -> c.Client:
+    return c.Client(
+        "codex",
+        "Codex",
+        target,
+        "toml",
+        lambda: detect,
+        "docs/codex.md",
+        project_target=project_target,
+        restart_hint="reload Codex",
+    )
+
+
+def _json_client(target: Path, *, detect: bool = True, project_target: Path | None = None) -> c.Client:
+    return c.Client(
+        "claude-code",
+        "Claude Code",
+        target,
+        "json",
+        lambda: detect,
+        "docs/claude.md",
+        root_key="mcpServers",
+        project_target=project_target,
+        restart_hint="run /mcp",
+    )
+
+
+def test_write_client_config_creates_file(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / "nested" / "config.toml"
+    assert c._write_client_config(_codex_client(target), CMD, ENV) == "changed"
+    assert target.exists()
+    data = tomllib.loads(target.read_text())
+    assert data["mcp_servers"]["openproject"]["command"] == CMD
+
+
+def test_write_client_config_backs_up_and_preserves(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".claude.json"
+    target.write_text(json.dumps({"mcpServers": {"other": {"command": "/x"}}, "theme": "dark"}))
+    monkeypatch.setattr(c, "_backup", lambda p: shutil.copy2(p, p.with_name(f"{p.name}.bak.fixed")))
+    assert c._write_client_config(_json_client(target), CMD, ENV) == "changed"
+    backup = tmp_path / ".claude.json.bak.fixed"
+    assert backup.exists(), "existing config must be backed up before rewriting"
+    result = json.loads(target.read_text())
+    # openproject merged in, existing server + unrelated settings preserved.
+    assert result["mcpServers"]["openproject"]["command"] == CMD
+    assert result["mcpServers"]["other"] == {"command": "/x"}
+    assert result["theme"] == "dark"
+
+
+def test_write_client_config_skips_unparseable_file(monkeypatch, tmp_path: Path, capsys) -> None:
+    target = tmp_path / ".claude.json"
+    target.write_text("{ this is not valid json ")
+    monkeypatch.setattr(c, "_backup", lambda p: None)
+    assert c._write_client_config(_json_client(target), CMD, ENV) == "failed"
+    # Original file left untouched.
+    assert target.read_text() == "{ this is not valid json "
+    assert "could not be parsed" in capsys.readouterr().out
+
+
+def test_backup_preserves_extension(tmp_path: Path) -> None:
+    target = tmp_path / "config.toml"
+    target.write_text("x = 1\n")
+    c._backup(target)
+    backups = list(tmp_path.glob("config.toml.bak.*"))
+    assert len(backups) == 1
+    # _backup copies (not moves): the original stays in place until the
+    # atomic replace swaps in new content, which this call never does.
+    assert target.exists()
+    assert target.read_text() == "x = 1\n"
+    assert backups[0].read_text() == "x = 1\n"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows does not honor POSIX chmod bits, even when _IS_WINDOWS is forced False",
+)
+def test_backup_chmods_backup_on_posix(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(c, "_IS_WINDOWS", False)
+    target = tmp_path / "config.toml"
+    target.write_text("x = 1\n")
+    target.chmod(0o644)
+
+    c._backup(target)
+
+    backup = next(tmp_path.glob("config.toml.bak.*"))
+    assert backup.stat().st_mode & 0o777 == 0o600
+
+
+def test_atomic_write_existing_target_untouched_on_replace_failure(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / "config.toml"
+    target.write_text("original\n")
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(c.os, "replace", _boom)
+    with pytest.raises(OSError):
+        c._atomic_write(target, "new content\n")
+    # The original survives byte-for-byte: _backup copies rather than moves,
+    # so a failed replace never leaves the target missing or half-written.
+    assert target.read_text() == "original\n"
+    assert list(tmp_path.glob("*.tmp")) == [], "no orphaned temp file after a failed replace"
+
+
+def test_atomic_write_no_partial_file_on_new_target_failure(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / "config.toml"  # does not exist yet
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(c.os, "replace", _boom)
+    with pytest.raises(OSError):
+        c._atomic_write(target, "new content\n")
+    assert not target.exists(), "a failed first-time write must not leave a partial target"
+    assert list(tmp_path.glob("*.tmp")) == [], "no orphaned temp file after a failed replace"
+
+
+def test_atomic_write_cleans_up_temp_file_on_write_failure(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / "config.toml"
+
+    class _BoomFile:
+        def __init__(self, fd: int) -> None:
+            self._fd = fd
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            os.close(self._fd)
+            return False
+
+        def write(self, _text):
+            raise OSError("simulated disk-full mid-write")
+
+    monkeypatch.setattr(c.os, "fdopen", lambda fd, *a, **k: _BoomFile(fd))
+    with pytest.raises(OSError):
+        c._atomic_write(target, "new content\n")
+    assert not target.exists()
+    assert list(tmp_path.glob(".*.tmp")) == [], "no orphaned temp file after a failed write"
+
+
+def test_git_warning_noops_when_git_missing(monkeypatch, tmp_path: Path, capsys) -> None:
+    def _missing_git(*_args, **_kwargs):
+        raise OSError("git not found")
+
+    monkeypatch.setattr(c.subprocess, "run", _missing_git)
+
+    c._git_warning_for_unignored_file(tmp_path / ".mcp.json")
+
+    assert capsys.readouterr().out == ""
+
+
+def test_git_warning_noops_outside_git_repo(monkeypatch, tmp_path: Path, capsys) -> None:
+    def _run(cmd, **_kwargs):
+        assert "rev-parse" in cmd
+        return subprocess.CompletedProcess(cmd, 128, stdout="", stderr="not a repo")
+
+    monkeypatch.setattr(c.subprocess, "run", _run)
+
+    c._git_warning_for_unignored_file(tmp_path / ".mcp.json")
+
+    assert capsys.readouterr().out == ""
+
+
+def test_git_warning_noops_when_file_is_ignored(monkeypatch, tmp_path: Path, capsys) -> None:
+    calls = []
+
+    def _run(cmd, **_kwargs):
+        calls.append(cmd)
+        if "rev-parse" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="true\n", stderr="")
+        if "check-ignore" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(c.subprocess, "run", _run)
+
+    c._git_warning_for_unignored_file(tmp_path / ".mcp.json")
+
+    assert any("check-ignore" in cmd for cmd in calls)
+    assert capsys.readouterr().out == ""
+
+
+def test_git_warning_prints_when_file_is_not_ignored(monkeypatch, tmp_path: Path, capsys) -> None:
+    def _run(cmd, **_kwargs):
+        if "rev-parse" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout="true\n", stderr="")
+        if "check-ignore" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(c.subprocess, "run", _run)
+
+    target = tmp_path / ".mcp.json"
+    c._git_warning_for_unignored_file(target)
+
+    out = capsys.readouterr().out
+    assert str(target) in out
+    assert "not ignored" in out
+    assert ".gitignore" in out
+
+
+# ── registration mode (asked up front, non-interactive) ─────────────────────────
+
+
+class _AnswerBook:
+    """Matches queued answers to wizard prompts by prompt content, not call order.
+
+    Each key is a literal substring expected to appear in exactly one live prompt's
+    text (checked on every call, not just at construction time — a
+    construction-time-only "is one key nested in another" check would miss two
+    independent keys that both happen to match the same longer prompt). A key's
+    value is a single answer or a queue: a validation retry loop that reprompts
+    with a label extending the initial one is naturally covered by one key with
+    a multi-item queue, spanning the initial ask plus its retries.
+    """
+
+    def __init__(self, answers: Mapping[str, str | Sequence[str]]) -> None:
+        self._queues: dict[str, list[str]] = {
+            key: [value] if isinstance(value, str) else list(value) for key, value in answers.items()
+        }
+
+    def __call__(self, prompt: str) -> str:
+        matches = [key for key in self._queues if key in prompt]
+        if not matches:
+            raise AssertionError(f"no answer registered for prompt: {prompt!r}")
+        if len(matches) > 1:
+            raise AssertionError(f"multiple answers match prompt {prompt!r}: {matches}")
+        queue = self._queues[matches[0]]
+        if not queue:
+            raise AssertionError(f"answer queue exhausted for {matches[0]!r} (prompt: {prompt!r})")
+        return queue.pop(0)
+
+    def assert_consumed(self) -> None:
+        leftover = {key: queue for key, queue in self._queues.items() if queue}
+        if leftover:
+            raise AssertionError(f"answers registered but never consumed: {leftover}")
+
+
+def _input_with_token_fallback(book: _AnswerBook, secret: str) -> Callable[[str], str]:
+    """`input()` mock for tests that patch getpass.getpass with `secret`.
+
+    On a real Windows platform, _prompt_secret() reads the token via input()
+    instead of getpass.getpass() — route that one prompt straight to
+    `secret` here too, same as the getpass patch, so the same test behaves
+    identically regardless of which OS actually runs it.
+    """
+
+    def _input(prompt: str = "") -> str:
+        if "OpenProject API token" in prompt:
+            return secret
+        return book(prompt)
+
+    return _input
+
+
+@contextmanager
+def _answers(monkeypatch, answers: Mapping[str, str | Sequence[str]]):
+    """Drive ``_choose_targets`` (or similar) with prompt-keyed answers.
+
+    Yields the ``_AnswerBook`` and asserts everything was consumed on a normal
+    exit — if the ``with`` body raises, that exception propagates first and this
+    check is skipped, so a genuine failure is never masked.
+    """
+    book = _AnswerBook(answers)
+    monkeypatch.setattr("builtins.input", lambda prompt="": book(prompt))
+    yield book
+    book.assert_consumed()
+
+
+def test_answer_book_raises_on_two_independent_keys_matching_one_prompt() -> None:
+    # "Enable" and "writes" don't contain each other (neither is a substring of
+    # the other), so a construction-time-only "is one key nested in another"
+    # check would miss this — both still match "Enable admin writes?" and the
+    # runtime check in __call__ must catch it.
+    book = _AnswerBook({"Enable": "y", "writes": "n"})
+    with pytest.raises(AssertionError, match="multiple answers match"):
+        book("Enable admin writes?")
+
+
+def test_answer_book_raises_on_unregistered_prompt() -> None:
+    book = _AnswerBook({"Configure globally": "y"})
+    with pytest.raises(AssertionError, match="no answer registered"):
+        book("Some other prompt")
+
+
+def test_answer_book_assert_consumed_reports_leftover_key() -> None:
+    book = _AnswerBook({"Configure globally": "y", "Configure project-scoped": "n"})
+    book("Configure globally (user-wide)?")
+    with pytest.raises(AssertionError, match="Configure project-scoped"):
+        book.assert_consumed()
+
+
+def test_answer_book_does_not_mutate_caller_supplied_list() -> None:
+    caller_list = ["y", "n"]
+    book = _AnswerBook({"Write scope": caller_list})
+    book("Write scope")
+    assert caller_list == ["y", "n"], "must copy, not pop from the caller's own list"
+
+
+def test_choose_targets_both_gates_no(monkeypatch, tmp_path: Path) -> None:
+    codex = _codex_client(tmp_path / "config.toml", project_target=tmp_path / ".codex" / "config.toml")
+    # global gate no, project gate no → nothing.
+    with _answers(monkeypatch, {"Configure globally": "", "Configure project-scoped": ""}):
+        assert c._choose_targets([codex]) == ([], [], [], [])
+
+
+def test_choose_targets_global_only(monkeypatch, tmp_path: Path) -> None:
+    codex = _codex_client(tmp_path / "config.toml", project_target=tmp_path / ".codex" / "config.toml")
+    # global gate yes, per-client yes; project gate is skipped because scopes are
+    # configured in separate runs.
+    with _answers(monkeypatch, {"Configure globally": "y", "Configure Codex?": "y"}):
+        global_clients, project_clients, remove_global_clients, remove_project_clients = c._choose_targets([codex])
+    assert global_clients == [codex]
+    assert project_clients == []
+    assert remove_global_clients == []
+    assert remove_project_clients == []
+
+
+def test_choose_targets_project_only(monkeypatch, tmp_path: Path) -> None:
+    codex = _codex_client(tmp_path / "config.toml", project_target=tmp_path / ".codex" / "config.toml")
+    # global gate no; project gate yes, per-client yes.
+    answers = {"Configure globally": "", "Configure project-scoped": "y", "Configure Codex?": "y"}
+    with _answers(monkeypatch, answers):
+        global_clients, project_clients, remove_global_clients, remove_project_clients = c._choose_targets([codex])
+    assert global_clients == []
+    assert project_clients == [codex]
+    assert remove_global_clients == []
+    assert remove_project_clients == []
+
+
+def test_choose_targets_project_offers_undetected(monkeypatch, tmp_path: Path) -> None:
+    # A client NOT detected still gets offered in the project gate (default n),
+    # answer y anyway → it is selected. It is NOT offered in the global gate
+    # (not even prompted: the global gate is skipped entirely when nothing is
+    # detected, so no "Configure globally" key is registered here).
+    codex = _codex_client(tmp_path / "config.toml", detect=False, project_target=tmp_path / ".codex" / "config.toml")
+    answers = {"Configure project-scoped": "y", "Configure Codex?": "y"}
+    with _answers(monkeypatch, answers):
+        global_clients, project_clients, remove_global_clients, remove_project_clients = c._choose_targets([codex])
+    assert global_clients == []
+    assert project_clients == [codex]
+    assert remove_global_clients == []
+    assert remove_project_clients == []
+
+
+def test_choose_targets_claude_code_default_yes_when_alone(monkeypatch, tmp_path: Path) -> None:
+    # Claude Code undetected + no other project client detected → project default y,
+    # so pressing Enter selects it. Global gate skipped entirely (nothing detected).
+    claude = _json_client(tmp_path / ".claude.json", detect=False, project_target=tmp_path / ".mcp.json")
+    answers = {"Configure project-scoped": "y", "Configure Claude Code?": ""}
+    with _answers(monkeypatch, answers):
+        global_clients, project_clients, remove_global_clients, remove_project_clients = c._choose_targets([claude])
+    assert project_clients == [claude]
+    assert global_clients == []
+    assert remove_global_clients == []
+    assert remove_project_clients == []
+
+
+def test_choose_targets_offers_global_removal_when_global_gate_no(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".claude.json"
+    target.write_text(json.dumps({"mcpServers": {"openproject": {"env": ENV}}}))
+    claude = _json_client(target, project_target=tmp_path / ".mcp.json")
+
+    answers = {
+        "Configure globally": "n",
+        "Remove existing global Claude Code": "y",
+        "Configure project-scoped": "n",
+    }
+    with _answers(monkeypatch, answers):
+        global_clients, project_clients, remove_global_clients, remove_project_clients = c._choose_targets([claude])
+
+    assert global_clients == []
+    assert project_clients == []
+    assert remove_global_clients == [claude]
+    assert remove_project_clients == []
+
+
+def test_choose_targets_offers_project_removal_when_project_gate_no(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".mcp.json"
+    target.write_text(json.dumps({"mcpServers": {"openproject": {"env": ENV}}}))
+    claude = _json_client(tmp_path / ".claude.json", detect=False, project_target=target)
+
+    answers = {"Configure project-scoped": "n", "Remove existing project-scoped Claude Code": "y"}
+    with _answers(monkeypatch, answers):
+        global_clients, project_clients, remove_global_clients, remove_project_clients = c._choose_targets([claude])
+
+    assert global_clients == []
+    assert project_clients == []
+    assert remove_global_clients == []
+    assert remove_project_clients == [claude]
+
+
+def test_choose_targets_global_config_can_remove_existing_project(monkeypatch, tmp_path: Path) -> None:
+    project_target = tmp_path / ".mcp.json"
+    project_target.write_text(json.dumps({"mcpServers": {"openproject": {"env": ENV}}}))
+    claude = _json_client(tmp_path / ".claude.json", project_target=project_target)
+
+    answers = {
+        "Configure globally": "y",
+        "Configure Claude Code?": "y",
+        "Remove existing project-scoped Claude Code": "y",
+    }
+    with _answers(monkeypatch, answers):
+        global_clients, project_clients, remove_global_clients, remove_project_clients = c._choose_targets([claude])
+
+    assert global_clients == [claude]
+    assert project_clients == []
+    assert remove_global_clients == []
+    assert remove_project_clients == [claude]
+
+
+def test_has_openproject_config_detects_json_entry_without_env(tmp_path: Path) -> None:
+    target = tmp_path / ".mcp.json"
+    target.write_text(json.dumps({"mcpServers": {"openproject": {"command": "old"}}}))
+    claude = _json_client(tmp_path / ".claude.json", project_target=target)
+
+    assert c._has_openproject_config(claude, target) is True
+
+
+def test_has_openproject_config_detects_codex_toml_via_text_scan(tmp_path: Path) -> None:
+    # _has_openproject_config never uses tomllib for the "toml" format --
+    # always a line-by-line text/regex scan, regardless of tomllib's
+    # availability -- so this only exercises that text-scan path directly.
+    target = tmp_path / "config.toml"
+    target.write_text('[mcp_servers.openproject]\ncommand = "old"\n')
+    codex = _codex_client(tmp_path / "global.toml", project_target=target)
+
+    assert c._has_openproject_config(codex, target) is True
+
+
+def test_apply_global_registration_writes_chosen(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".claude.json"
+    client = _json_client(target)
+    c._apply_global_registration([client], CMD, ENV)
+    assert target.exists()
+    data = json.loads(target.read_text())
+    assert data["mcpServers"]["openproject"]["command"] == CMD
+
+
+def test_apply_global_registration_empty_is_noop(tmp_path: Path) -> None:
+    # No clients chosen → nothing written, no error.
+    c._apply_global_registration([], CMD, ENV)
+
+
+# ── regression: TOML multi-line array preservation (bug #1) ─────────────────────
+
+
+def test_merge_codex_toml_preserves_multiline_array_table() -> None:
+    # A multi-line array value has continuation lines that start with "[". The old
+    # skip logic toggled on any line starting with "[", flipping skipping off
+    # mid-table and leaking orphaned array fragments into the output. The table
+    # (and the openproject block) must both survive as valid TOML.
+    existing = '[mcp_servers.other]\ncommand = "/bin/other"\nargs = [\n  "--flag",\n  "--another",\n]\n'
+    merged = c._merge_codex_toml(existing, CMD, ENV)
+    data = tomllib.loads(merged)
+    assert data["mcp_servers"]["other"]["command"] == "/bin/other"
+    assert data["mcp_servers"]["other"]["args"] == ["--flag", "--another"]
+    assert data["mcp_servers"]["openproject"]["command"] == CMD
+
+
+def test_strip_codex_openproject_keeps_array_continuation_lines() -> None:
+    # Text-level check: continuation lines beginning with "[" must not be
+    # treated as table headers.
+    existing = "[keep]\nvalues = [\n  [1, 2],\n  [3, 4],\n]\n"
+    kept = c._strip_codex_openproject(existing)
+    assert "values = [" in kept
+    assert "[1, 2]," in kept
+    assert "[3, 4]," in kept
+
+
+# ── regression: dotted / inline openproject refusal (bug #2) ────────────────────
+
+
+def test_merge_codex_toml_refuses_inline_table() -> None:
+    existing = 'mcp_servers.openproject = { command = "/old" }\n'
+    with pytest.raises(c.CodexMergeError):
+        c._merge_codex_toml(existing, CMD, ENV)
+
+
+def test_merge_codex_toml_refuses_dotted_key() -> None:
+    existing = 'mcp_servers.openproject.command = "/old"\n'
+    with pytest.raises(c.CodexMergeError):
+        c._merge_codex_toml(existing, CMD, ENV)
+
+
+def test_write_client_config_skips_dotted_codex(monkeypatch, tmp_path, capsys) -> None:
+    target = tmp_path / "config.toml"
+    original = 'mcp_servers.openproject.command = "/old"\n'
+    target.write_text(original)
+    monkeypatch.setattr(c, "_backup", lambda p: None)
+    assert c._write_client_config(_codex_client(target), CMD, ENV) == "failed"
+    # File left byte-for-byte untouched.
+    assert target.read_text() == original
+    assert "could not be parsed" in capsys.readouterr().out
+
+
+# ── regression: non-dict JSON refusal (bug #4) ──────────────────────────────────
+
+
+def test_merge_json_refuses_non_dict_toplevel() -> None:
+    with pytest.raises(ValueError):
+        c._merge_json("[1, 2, 3]", "mcpServers", CMD, ENV, stdio=False)
+
+
+def test_merge_json_refuses_non_dict_root_key() -> None:
+    with pytest.raises(ValueError):
+        c._merge_json('{"mcpServers": []}', "mcpServers", CMD, ENV, stdio=False)
+
+
+def test_write_client_config_skips_non_dict_json(monkeypatch, tmp_path, capsys) -> None:
+    target = tmp_path / ".claude.json"
+    original = "[1, 2, 3]"
+    target.write_text(original)
+    monkeypatch.setattr(c, "_backup", lambda p: None)
+    assert c._write_client_config(_json_client(target), CMD, ENV) == "failed"
+    # Existing (unexpected-shape) data must not be clobbered.
+    assert target.read_text() == original
+    assert "could not be parsed" in capsys.readouterr().out
+
+
+# ── regression: backup timestamp collision (bug #6) ─────────────────────────────
+
+
+def test_backup_collision_keeps_both(monkeypatch, tmp_path: Path) -> None:
+    # Freeze the timestamp so two backups land in the "same second".
+    class _FixedNow:
+        @staticmethod
+        def now():
+            import datetime as _dt
+
+            return _dt.datetime(2026, 1, 2, 3, 4, 5)
+
+    monkeypatch.setattr(c, "datetime", _FixedNow)
+
+    first = tmp_path / "config.toml"
+    first.write_text("first\n")
+    c._backup(first)
+    # Re-create the same path and back it up again in the same frozen second.
+    first.write_text("second\n")
+    c._backup(first)
+
+    backups = sorted(p.name for p in tmp_path.glob("config.toml.bak.*"))
+    assert len(backups) == 2, f"both backups must be kept, got {backups}"
+    contents = {p.read_text() for p in tmp_path.glob("config.toml.bak.*")}
+    assert contents == {"first\n", "second\n"}
+
+
+# ── uninstall (remove openproject from client configs) ──────────────────────────
+
+
+def test_remove_json_openproject_keeps_others() -> None:
+    existing = json.dumps(
+        {
+            "mcpServers": {"openproject": {"command": "/x"}, "github": {"command": "/gh"}},
+            "theme": "dark",
+        }
+    )
+    out = json.loads(c._remove_json_openproject(existing, "mcpServers"))
+    assert "openproject" not in out["mcpServers"]
+    assert out["mcpServers"]["github"] == {"command": "/gh"}
+    assert out["theme"] == "dark"
+
+
+def test_remove_json_openproject_drops_emptied_map() -> None:
+    existing = json.dumps({"mcpServers": {"openproject": {"command": "/x"}}, "editorMode": "vim"})
+    out = json.loads(c._remove_json_openproject(existing, "mcpServers"))
+    assert "mcpServers" not in out  # emptied map removed
+    assert out["editorMode"] == "vim"
+
+
+def test_remove_json_openproject_noop_when_absent() -> None:
+    existing = json.dumps({"mcpServers": {"github": {"command": "/gh"}}})
+    assert c._remove_json_openproject(existing, "mcpServers") is None
+
+
+def test_remove_codex_openproject_keeps_siblings() -> None:
+    existing = (
+        '[some]\nk = "v"\n\n'
+        '[mcp_servers.openproject]\ncommand = "/x"\n\n'
+        '[mcp_servers.openproject.env]\nA = "1"\n\n'
+        '[mcp_servers.keep]\ncommand = "/keep"\n'
+    )
+    stripped = c._strip_codex_openproject(existing)
+    data = tomllib.loads(stripped)
+    assert "openproject" not in data.get("mcp_servers", {})
+    assert data["mcp_servers"]["keep"]["command"] == "/keep"
+    assert data["some"]["k"] == "v"
+
+
+def test_remove_client_config_backs_up_and_removes(monkeypatch, tmp_path) -> None:
+    target = tmp_path / ".claude.json"
+    target.write_text(json.dumps({"mcpServers": {"openproject": {"command": "/x"}, "gh": {"command": "/gh"}}}))
+    monkeypatch.setattr(c, "_backup", lambda p: shutil.copy2(p, p.with_name(f"{p.name}.bak.fixed")))
+    client = c.Client(
+        "claude-code", "Claude Code", target, "json", lambda: True, "docs/claude.md", root_key="mcpServers"
+    )
+    assert c._remove_client_config(client) == "changed"
+    assert (tmp_path / ".claude.json.bak.fixed").exists()
+    result = json.loads(target.read_text())
+    assert "openproject" not in result["mcpServers"]
+    assert "gh" in result["mcpServers"]
+
+
+def test_remove_client_config_noop_when_no_entry(tmp_path) -> None:
+    target = tmp_path / ".claude.json"
+    target.write_text(json.dumps({"mcpServers": {"gh": {"command": "/gh"}}}))
+    client = c.Client(
+        "claude-code", "Claude Code", target, "json", lambda: True, "docs/claude.md", root_key="mcpServers"
+    )
+    assert c._remove_client_config(client) == "unchanged"
+
+
+def test_remove_client_config_missing_target_is_unchanged(tmp_path) -> None:
+    client = c.Client(
+        "claude-code",
+        "Claude Code",
+        tmp_path / ".claude.json",
+        "json",
+        lambda: True,
+        "docs/claude.md",
+        root_key="mcpServers",
+    )
+    assert c._remove_client_config(client) == "unchanged"
+
+
+def test_remove_client_config_failed_on_unparseable(monkeypatch, tmp_path, capsys) -> None:
+    target = tmp_path / ".claude.json"
+    target.write_text("{ not valid json")
+    client = c.Client(
+        "claude-code", "Claude Code", target, "json", lambda: True, "docs/claude.md", root_key="mcpServers"
+    )
+    assert c._remove_client_config(client) == "failed"
+    assert target.read_text() == "{ not valid json"
+    assert "could not be parsed" in capsys.readouterr().out
+
+
+def test_remove_client_config_read_error_is_failed_not_unchanged(monkeypatch, tmp_path, capsys) -> None:
+    # A permission error (or any non-FileNotFoundError OSError) reading the
+    # target must be reported as "failed" — Path.exists() would have
+    # swallowed this as "doesn't exist" and silently reported "unchanged".
+    target = tmp_path / ".claude.json"
+    target.write_text('{"mcpServers": {}}')
+    client = c.Client(
+        "claude-code", "Claude Code", target, "json", lambda: True, "docs/claude.md", root_key="mcpServers"
+    )
+    monkeypatch.setattr(c.Path, "read_text", lambda self, *a, **k: (_ for _ in ()).throw(PermissionError("denied")))
+    assert c._remove_client_config(client) == "failed"
+    assert "Could not read" in capsys.readouterr().out
+
+
+def test_write_client_config_read_error_is_failed(monkeypatch, tmp_path, capsys) -> None:
+    target = tmp_path / ".claude.json"
+    target.write_text('{"mcpServers": {}}')
+    client = _json_client(target)
+    monkeypatch.setattr(c.Path, "read_text", lambda self, *a, **k: (_ for _ in ()).throw(PermissionError("denied")))
+    assert c._write_client_config(client, CMD, ENV) == "failed"
+    assert "Could not read" in capsys.readouterr().out
+
+
+# ── run mode / command / config-path resolution (installed vs. clone) ───────────
+
+
+def test_installed_mode_true_when_no_repo_markers(monkeypatch, tmp_path: Path) -> None:
+    # Point the repo-root at a bare dir with no pyproject.toml / src tree.
+    monkeypatch.setattr(c, "_REPO_ROOT", tmp_path)
+    assert c._installed_mode() is True
+
+
+def test_installed_mode_false_in_checkout(monkeypatch, tmp_path: Path) -> None:
+    # Simulate a checkout: pyproject.toml at root and this module under src/.
+    (tmp_path / "pyproject.toml").write_text("")
+    pkg = tmp_path / "src" / "openproject_ce_mcp_server"
+    pkg.mkdir(parents=True)
+    setup_file = pkg / "setup_cli.py"
+    setup_file.write_text("")
+    monkeypatch.setattr(c, "_REPO_ROOT", tmp_path)
+    monkeypatch.setattr(c, "__file__", str(setup_file))
+    assert c._installed_mode() is False
+
+
+def test_server_command_clone_uses_venv() -> None:
+    assert c._server_command(installed=False) == (str(c._venv_binary()), True)
+
+
+def test_server_command_installed_prefers_which(monkeypatch) -> None:
+    monkeypatch.setattr(c.shutil, "which", lambda name: "/usr/local/bin/openproject-ce-mcp-server")
+    assert c._server_command(installed=True) == ("/usr/local/bin/openproject-ce-mcp-server", True)
+
+
+def test_server_command_installed_falls_back_to_sibling(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(c.shutil, "which", lambda name: None)
+    monkeypatch.setattr(c, "_IS_WINDOWS", False)
+    launcher = tmp_path / "openproject-ce-mcp-server-setup"
+    launcher.write_text("")
+    sibling = tmp_path / "openproject-ce-mcp-server"
+    sibling.write_text("")
+    monkeypatch.setattr(c.sys, "argv", [str(launcher)])
+    # Sibling found next to the launcher → resolved absolute path.
+    assert c._server_command(installed=True) == (str(sibling), True)
+
+
+def test_server_command_installed_last_resort_bare_name(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(c.shutil, "which", lambda name: None)
+    monkeypatch.setattr(c, "_IS_WINDOWS", False)
+    # launcher dir has no sibling binary; argv[0] is an absolute path in a dir
+    # with no server binary → falls through to the bare name, unresolved.
+    monkeypatch.setattr(c.sys, "argv", [str(tmp_path / "openproject-ce-mcp-server-setup")])
+    assert c._server_command(installed=True) == ("openproject-ce-mcp-server", False)
+
+
+def test_resolve_generic_mcp_example_clone_uses_launch_directory(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PWD", str(tmp_path))
+    assert c._resolve_generic_mcp_example(None, installed=False) == tmp_path / c._GENERIC_EXAMPLE_FILENAME
+
+
+def test_project_cwd_prefers_pwd_for_uv_directory(monkeypatch, tmp_path: Path) -> None:
+    launch_dir = tmp_path / "launch"
+    repo_dir = tmp_path / "repo"
+    launch_dir.mkdir()
+    repo_dir.mkdir()
+    monkeypatch.chdir(repo_dir)
+    monkeypatch.setenv("PWD", str(launch_dir))
+    assert c._project_cwd() == launch_dir
+    assert c._resolve_generic_mcp_example("local", installed=False) == launch_dir / c._GENERIC_EXAMPLE_FILENAME
+
+
+def test_resolve_generic_mcp_example_installed_project_dir_uses_cwd(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PWD", str(tmp_path))
+    (tmp_path / ".git").mkdir()
+    assert c._resolve_generic_mcp_example(None, installed=True) == tmp_path / c._GENERIC_EXAMPLE_FILENAME
+
+
+def test_resolve_generic_mcp_example_installed_bare_dir_is_global(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)  # no project markers
+    monkeypatch.setenv("PWD", str(tmp_path))
+    assert c._resolve_generic_mcp_example(None, installed=True) is None
+
+
+def test_resolve_generic_mcp_example_local_forces_cwd(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PWD", str(tmp_path))
+    assert c._resolve_generic_mcp_example("local", installed=True) == tmp_path / c._GENERIC_EXAMPLE_FILENAME
+
+
+def test_resolve_generic_mcp_example_global_is_none() -> None:
+    assert c._resolve_generic_mcp_example("global", installed=True) is None
+    assert c._resolve_generic_mcp_example("global", installed=False) is None
+
+
+def test_looks_like_project_dir(tmp_path: Path) -> None:
+    assert c._looks_like_project_dir(tmp_path) is False
+    (tmp_path / ".git").mkdir()
+    assert c._looks_like_project_dir(tmp_path) is True
+
+
+def test_install_deps_skipped_when_installed(monkeypatch) -> None:
+    called = []
+    monkeypatch.setattr(c.subprocess, "run", lambda *a, **k: called.append(a))
+    c._install_deps("uv", installed=True)
+    assert called == []
+
+
+def test_install_deps_uv_sync_branch(monkeypatch) -> None:
+    called = []
+    monkeypatch.setattr(c.subprocess, "run", lambda *a, **k: called.append((a, k)))
+    c._install_deps("uv", installed=False)
+    assert called == [((["uv", "sync"],), {"cwd": c._REPO_ROOT, "check": True})]
+
+
+def test_install_deps_venv_pip_fallback_creates_venv(monkeypatch, tmp_path: Path) -> None:
+    fake_venv = tmp_path / ".venv"
+    assert not fake_venv.exists()
+    monkeypatch.setattr(c, "VENV", fake_venv)
+    called = []
+    monkeypatch.setattr(c.subprocess, "run", lambda *a, **k: called.append((a, k)))
+    c._install_deps(None, installed=False)
+    pip = fake_venv / ("Scripts" if c._IS_WINDOWS else "bin") / "pip"
+    assert called == [
+        (([c.sys.executable, "-m", "venv", str(fake_venv)],), {"check": True}),
+        (([str(pip), "install", "-e", "."],), {"cwd": c._REPO_ROOT, "check": True}),
+    ]
+
+
+def test_install_deps_venv_pip_fallback_reuses_existing_venv(monkeypatch, tmp_path: Path) -> None:
+    fake_venv = tmp_path / ".venv"
+    fake_venv.mkdir()
+    monkeypatch.setattr(c, "VENV", fake_venv)
+    called = []
+    monkeypatch.setattr(c.subprocess, "run", lambda *a, **k: called.append((a, k)))
+    c._install_deps(None, installed=False)
+    pip = fake_venv / ("Scripts" if c._IS_WINDOWS else "bin") / "pip"
+    # Only the pip install call -- venv creation is skipped because VENV already exists.
+    assert called == [(([str(pip), "install", "-e", "."],), {"cwd": c._REPO_ROOT, "check": True})]
+
+
+def test_doc_locations_point_to_independent_project_checkout() -> None:
+    docs = c._doc_locations()
+    assert all(Path(path).is_absolute() for path in docs.values())
+    assert all(Path(path).is_file() for path in docs.values())
+    assert docs["Cursor:"].endswith("docs/cursor.md")
+
+
+def test_read_client_env_json_roundtrip(tmp_path: Path) -> None:
+    target = tmp_path / ".claude.json"
+    target.write_text(json.dumps({"mcpServers": {"openproject": {"env": {"OPENPROJECT_BASE_URL": "https://op.x"}}}}))
+    client = c.Client(
+        "claude-code", "Claude Code", target, "json", lambda: True, "docs/claude.md", root_key="mcpServers"
+    )
+    assert c._read_client_env(client) == {"OPENPROJECT_BASE_URL": "https://op.x"}
+
+
+def test_read_client_env_missing_file_returns_empty(tmp_path: Path) -> None:
+    client = c.Client(
+        "claude-code",
+        "Claude Code",
+        tmp_path / "nope.json",
+        "json",
+        lambda: True,
+        "docs/claude.md",
+        root_key="mcpServers",
+    )
+    assert c._read_client_env(client) == {}
+
+
+def test_merge_prefill_field_wise_priority(tmp_path: Path) -> None:
+    # Global config has a full entry; a project config has only the base URL.
+    # Field-wise merge: project URL wins, global token survives (not discarded).
+    global_f = tmp_path / "global.json"
+    global_f.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://global.example",
+                            "OPENPROJECT_API_TOKEN": "gtok",
+                        }
+                    }
+                }
+            }
+        )
+    )
+    project_f = tmp_path / "project.json"
+    project_f.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://project.example",
+                        }
+                    }
+                }
+            }
+        )
+    )
+    gclient = c.Client("g", "G", global_f, "json", lambda: True, "d", root_key="mcpServers")
+    pclient = c.Client("p", "P", tmp_path / "unused", "json", lambda: True, "d", root_key="mcpServers")
+    merged = c._merge_prefill([(gclient, global_f), (pclient, project_f)])
+    assert merged["OPENPROJECT_BASE_URL"] == "https://project.example"  # project overrides
+    assert merged["OPENPROJECT_API_TOKEN"] == "gtok"  # global token preserved
+
+
+def test_merge_prefill_empty_project_token_does_not_blank_global_token(tmp_path: Path) -> None:
+    # Presence-based override is a deliberate exception for project-scope keys
+    # only — an empty OPENPROJECT_API_TOKEN in a higher-priority
+    # source must NOT blank out a real token from a lower-priority one.
+    global_f = tmp_path / "global.json"
+    global_f.write_text(json.dumps({"mcpServers": {"openproject": {"env": {"OPENPROJECT_API_TOKEN": "gtok"}}}}))
+    project_f = tmp_path / "project.json"
+    project_f.write_text(json.dumps({"mcpServers": {"openproject": {"env": {"OPENPROJECT_API_TOKEN": ""}}}}))
+    gclient = c.Client("g", "G", global_f, "json", lambda: True, "d", root_key="mcpServers")
+    pclient = c.Client("p", "P", tmp_path / "unused", "json", lambda: True, "d", root_key="mcpServers")
+    merged = c._merge_prefill([(gclient, global_f), (pclient, project_f)])
+    assert merged["OPENPROJECT_API_TOKEN"] == "gtok"
+
+
+@pytest.mark.parametrize("scope_key", ["OPENPROJECT_READ_PROJECTS", "OPENPROJECT_WRITE_PROJECTS"])
+def test_merge_prefill_explicit_empty_scope_overrides_broader_global_value(tmp_path: Path, scope_key: str) -> None:
+    """Regression (Codex review round 5): both scope keys are fail-closed --
+    an explicit empty string is a deliberate "nothing readable/writable", not
+    "unset". The pre-fix merge treated empty the same as absent for every
+    key, so a higher-priority (project) config that intentionally locked
+    scope down to none was silently widened back to an earlier, broader
+    global value (e.g. "*") -- the opposite of what re-running the wizard
+    against several existing configs should ever do."""
+    global_f = tmp_path / "global.json"
+    global_f.write_text(json.dumps({"mcpServers": {"openproject": {"env": {scope_key: "*"}}}}))
+    project_f = tmp_path / "project.json"
+    project_f.write_text(json.dumps({"mcpServers": {"openproject": {"env": {scope_key: ""}}}}))
+    gclient = c.Client("g", "G", global_f, "json", lambda: True, "d", root_key="mcpServers")
+    pclient = c.Client("p", "P", tmp_path / "unused", "json", lambda: True, "d", root_key="mcpServers")
+    merged = c._merge_prefill([(gclient, global_f), (pclient, project_f)])
+    assert merged[scope_key] == ""
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("on", True),
+        ("off", False),
+        ("true", True),
+        ("false", False),
+        ("1", True),
+        ("0", False),
+        ("yes", True),
+        ("no", False),
+        ("TRUE", True),
+        ("Off", False),
+    ],
+)
+def test_bool_from_env_matches_runtime_parse_bool_vocabulary(value: str, expected: bool) -> None:
+    """Regression (Opus review): _bool_from_env previously accepted only
+    true/1/yes and false/0/no, a narrower vocabulary than runtime's own
+    _parse_bool (which also accepts on/off). A value like "off" -- valid and
+    honored by Settings.from_env -- was silently treated as unrecognized here
+    and fell back to the caller's `fallback` default instead. For several
+    write flags the wizard passes fallback=True, so re-running configure
+    against a config with e.g. OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE=off
+    would show the prompt defaulting back to Enabled -- accepting the
+    default with a bare Enter would silently re-enable a write the user had
+    deliberately turned off."""
+    assert c._bool_from_env({"K": value}, "K", fallback=not expected) is expected
+
+
+def test_bool_from_env_falls_back_on_unrecognized_value() -> None:
+    # An invalid value must not crash the wizard (unlike runtime's
+    # _parse_bool, which raises ConfigError) -- it's a prefill default, not
+    # a hard validation gate; falling back keeps the wizard usable against a
+    # hand-corrupted config file.
+    assert c._bool_from_env({"K": "garbage"}, "K", fallback=True) is True
+    assert c._bool_from_env({"K": "garbage"}, "K", fallback=False) is False
+
+
+def test_bool_from_env_missing_key_uses_fallback() -> None:
+    assert c._bool_from_env({}, "K", fallback=True) is True
+    assert c._bool_from_env({}, "K", fallback=False) is False
+
+
+def test_shim_reexports_public_names() -> None:
+    # The root configure_mcp.py shim must re-export main and helpers so a
+    # manual source checkout (`python3 configure_mcp.py`) and any importer
+    # keep working.
+    import importlib.util
+
+    shim_path = Path(__file__).resolve().parent.parent / "configure_mcp.py"
+    spec = importlib.util.spec_from_file_location("configure_mcp_shim", shim_path)
+    assert spec and spec.loader
+    shim = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shim)
+    assert callable(shim.main)
+    assert callable(shim._merge_json)
+
+
+def test_setup_cli_main_dispatches_uninstall_argv(monkeypatch) -> None:
+    # Unit-level check of the argv-parsing -> dispatch logic in isolation: does
+    # NOT exercise the configure_mcp.py shim itself (main = _setup_cli.main
+    # there, so calling it directly bypasses the shim's own module-load path).
+    called = []
+    monkeypatch.setattr(c, "_run_uninstall", lambda: called.append(True))
+    c.main(["--uninstall"], interactive=False)
+    assert called == [True]
+
+
+def test_shim_getattr_missing_name_raises_attribute_error() -> None:
+    # PEP 562 __getattr__ delegates known names to _setup_cli but must raise a
+    # clean AttributeError (naming configure_mcp, not _setup_cli) for a
+    # genuinely-missing attribute, not silently return None or leak an
+    # unrelated error from _setup_cli.
+    import importlib.util
+
+    shim_path = Path(__file__).resolve().parent.parent / "configure_mcp.py"
+    spec = importlib.util.spec_from_file_location("configure_mcp_shim", shim_path)
+    assert spec and spec.loader
+    shim = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shim)
+    with pytest.raises(AttributeError, match="configure_mcp.*nonexistent_symbol_xyz"):
+        _ = shim.nonexistent_symbol_xyz
+
+
+# ── gate behaviour: no clients, global gate not offered ─────────────────────────
+
+
+def test_choose_targets_no_detected_skips_global_gate(monkeypatch, tmp_path: Path) -> None:
+    # No detected clients → global gate is not offered at all; project gate still
+    # offers project-capable clients (default n for undetected).
+    codex = _codex_client(tmp_path / "config.toml", detect=False, project_target=tmp_path / ".codex" / "config.toml")
+    # Only the project gate consumes an answer here (global gate skipped). Say no.
+    with _answers(monkeypatch, {"Configure project-scoped": ""}):
+        global_clients, project_clients, remove_global_clients, remove_project_clients = c._choose_targets([codex])
+    assert global_clients == []
+    assert project_clients == []
+    assert remove_global_clients == []
+    assert remove_project_clients == []
+
+
+# ── project-local writes preserve other MCP servers (the "github exists" case) ──
+
+
+def test_write_project_json_preserves_github(tmp_path: Path) -> None:
+    # Existing .mcp.json (Claude/Cursor shape) with a github server must survive;
+    # only mcpServers.openproject is added.
+    target = tmp_path / ".mcp.json"
+    target.write_text(json.dumps({"mcpServers": {"github": {"command": "github-mcp-server"}}}))
+    client = _json_client(tmp_path / ".claude.json", project_target=target)
+    assert c._write_client_config(client, CMD, ENV, target=target) == "changed"
+    data = json.loads(target.read_text())
+    assert data["mcpServers"]["github"]["command"] == "github-mcp-server"
+    assert data["mcpServers"]["openproject"]["command"] == CMD
+
+
+def test_write_project_vscode_servers_stdio_preserves_github(tmp_path: Path) -> None:
+    target = tmp_path / ".vscode" / "mcp.json"
+    target.parent.mkdir()
+    target.write_text(json.dumps({"servers": {"github": {"type": "stdio", "command": "x"}}}))
+    client = c.Client(
+        "vscode",
+        "VS Code",
+        tmp_path / "g.json",
+        "json",
+        lambda: True,
+        "docs/github.md",
+        root_key="servers",
+        stdio=True,
+        project_target=target,
+    )
+    assert c._write_client_config(client, CMD, ENV, target=target) == "changed"
+    data = json.loads(target.read_text())
+    assert data["servers"]["github"]["command"] == "x"
+    assert data["servers"]["openproject"]["type"] == "stdio"
+    assert data["servers"]["openproject"]["command"] == CMD
+
+
+def test_write_project_codex_toml_preserves_github(tmp_path: Path) -> None:
+    target = tmp_path / ".codex" / "config.toml"
+    target.parent.mkdir()
+    target.write_text('[mcp_servers.github]\ncommand = "x"\n')
+    client = _codex_client(tmp_path / "g.toml", project_target=target)
+    assert c._write_client_config(client, CMD, ENV, target=target) == "changed"
+    text = target.read_text()
+    assert "[mcp_servers.github]" in text
+    assert "[mcp_servers.openproject]" in text
+
+
+def test_write_project_invalid_json_left_untouched(tmp_path: Path, capsys) -> None:
+    target = tmp_path / ".mcp.json"
+    target.write_text("{ not valid json ")
+    client = _json_client(tmp_path / ".claude.json", project_target=target)
+    assert c._write_client_config(client, CMD, ENV, target=target) == "failed"
+    assert target.read_text() == "{ not valid json "  # untouched
+    assert "could not be parsed" in capsys.readouterr().out
+
+
+def test_write_project_backs_up_existing(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".mcp.json"
+    target.write_text(json.dumps({"mcpServers": {"github": {"command": "x"}}}))
+    monkeypatch.setattr(c, "_backup", lambda p: p.rename(p.with_name(f"{p.name}.bak.fixed")))
+    client = _json_client(tmp_path / ".claude.json", project_target=target)
+    c._write_client_config(client, CMD, ENV, target=target)
+    assert (tmp_path / ".mcp.json.bak.fixed").exists()  # backup taken for project file
+
+
+def test_write_client_config_target_not_client_target(tmp_path: Path) -> None:
+    # Regression guard: passing target=P writes to P and does NOT touch client.target.
+    global_target = tmp_path / ".claude.json"
+    project_target = tmp_path / ".mcp.json"
+    client = _json_client(global_target, project_target=project_target)
+    c._write_client_config(client, CMD, ENV, target=project_target)
+    assert project_target.exists()
+    assert not global_target.exists()  # global untouched
+
+
+def test_uninstall_removes_openproject_from_project_keeps_github(tmp_path: Path) -> None:
+    target = tmp_path / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "github": {"command": "x"},
+                    "openproject": {"command": CMD},
+                }
+            }
+        )
+    )
+    client = _json_client(tmp_path / ".claude.json", project_target=target)
+    assert c._remove_client_config(client, target=target) == "changed"
+    data = json.loads(target.read_text())
+    assert "openproject" not in data["mcpServers"]
+    assert "github" in data["mcpServers"]
+
+
+def test_remove_generic_example_missing_file_is_unchanged(tmp_path: Path) -> None:
+    assert c._remove_generic_example(tmp_path / c._GENERIC_EXAMPLE_FILENAME) == "unchanged"
+
+
+def test_remove_generic_example_removes_entry_keeps_others(tmp_path: Path) -> None:
+    target = tmp_path / c._GENERIC_EXAMPLE_FILENAME
+    target.write_text(json.dumps({"mcpServers": {"github": {"command": "x"}, "openproject": {"command": CMD}}}))
+    assert c._remove_generic_example(target) == "changed"
+    data = json.loads(target.read_text())
+    assert "openproject" not in data["mcpServers"]
+    assert "github" in data["mcpServers"]
+
+
+def test_remove_generic_example_read_error_is_failed_not_unchanged(monkeypatch, tmp_path: Path, capsys) -> None:
+    target = tmp_path / c._GENERIC_EXAMPLE_FILENAME
+    target.write_text('{"mcpServers": {}}')
+    monkeypatch.setattr(c.Path, "read_text", lambda self, *a, **k: (_ for _ in ()).throw(PermissionError("denied")))
+    assert c._remove_generic_example(target) == "failed"
+    assert "Could not read" in capsys.readouterr().out
+
+
+def test_run_uninstall_removes_generic_example(monkeypatch, tmp_path: Path, capsys) -> None:
+    # No detected clients at all — only the generic example file exists,
+    # covering the case where it was written for a client this tool doesn't
+    # natively support and must still be cleaned up by --uninstall.
+    monkeypatch.setattr(c, "_clients", lambda: [])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PWD", str(tmp_path))
+    example = tmp_path / c._GENERIC_EXAMPLE_FILENAME
+    example.write_text(json.dumps({"mcpServers": {"openproject": {"command": CMD}}}))
+    c._run_uninstall()
+    data = json.loads(example.read_text())
+    assert "openproject" not in data.get("mcpServers", {})
+    assert "Done." in capsys.readouterr().out
+
+
+def test_run_uninstall_reports_failure_and_exits_nonzero(monkeypatch, tmp_path: Path, capsys) -> None:
+    target = tmp_path / ".mcp.json"
+    target.write_text(json.dumps({"mcpServers": {"openproject": {"command": CMD}}}))
+    client = _json_client(tmp_path / ".claude.json", project_target=target)
+    monkeypatch.setattr(c, "_clients", lambda: [client])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PWD", str(tmp_path))
+    monkeypatch.setattr(c, "_remove_client_config", lambda *a, **k: "failed")
+    with pytest.raises(SystemExit) as exc:
+        c._run_uninstall()
+    assert exc.value.code == 1
+    assert str(target) in capsys.readouterr().out
+
+
+# ── main() orchestration (happy paths + abort), prompts fully patched ───────────
+
+
+def _run_main(
+    monkeypatch,
+    tmp_path: Path,
+    clients,
+    answers: Mapping[str, str | Sequence[str]],
+    secret: str = "opapi-tok",
+    *,
+    strict: bool = True,
+    interactive: bool = False,
+    argv: Sequence[str] = (),
+) -> None:
+    """Drive main() with patched infra + prompt-keyed answers for input; getpass.
+
+    ``answers`` feeds the gate/bool/text prompts (input), matched by prompt
+    content via ``_AnswerBook`` — not by call order. The token (getpass) returns
+    ``secret`` directly (there is only one secret-style prompt in the wizard, so
+    it doesn't need to go through the answer book). Returns nothing — assert on
+    written files. If ``main()`` raises (e.g. an expected ``SystemExit``), that
+    propagates immediately and the consumed-check below is skipped, so it never
+    masks a genuine failure. Pass ``strict=False`` to skip the consumed-check on a
+    normal exit too, for a test that deliberately over-registers answers.
+
+    Always passes ``interactive`` explicitly — relying on pytest's
+    stdin/stdout not being a tty would work today, but is incidental, not
+    guaranteed, and would silently start making real network calls (the
+    connection test) if it ever stopped holding. Defaults to
+    False; pass ``interactive=True`` for tests exercising the connection-test/
+    preview/confirm flow itself, in which case ``c._test_connection`` should
+    also be monkeypatched (a real network call must never happen in tests).
+
+    ``argv`` is passed through to ``main()`` verbatim; defaults to ``()``
+    (quick mode, the CLI default). Pass ``argv=["--advanced"]`` to drive the
+    full advanced questionnaire.
+    """
+    monkeypatch.setattr(c, "_check_python", lambda: None)
+    monkeypatch.setattr(c, "_installed_mode", lambda: True)  # installed: no uv sync, cwd paths
+    monkeypatch.setattr(c, "_install_deps", lambda *a, **k: None)
+    monkeypatch.setattr(c, "_server_command", lambda installed: ("openproject-ce-mcp-server", True))
+    monkeypatch.setattr(c, "_clients", lambda: clients)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PWD", str(tmp_path))
+    book = _AnswerBook(answers)
+    monkeypatch.setattr("builtins.input", _input_with_token_fallback(book, secret))
+    monkeypatch.setattr(c.getpass, "getpass", lambda prompt="": secret)
+    c.main(list(argv), interactive=interactive)
+    if strict:
+        book.assert_consumed()
+
+
+# When ``advanced`` is answered yes, the wizard always asks 18 further optional
+# fields regardless of write access; 6 more (the per-category write toggles) are
+# asked additionally when write access is also enabled. Tests that drive the
+# advanced flow but don't care about these specific values merge one or both of
+# these in with "" (keep-default) answers, rather than retyping all 18-24 keys
+# — and rather than relying on iterator-exhaustion padding the way the old
+# positional lists did, which was a silent-absorption failure mode that keying
+# answers by prompt content removes.
+_WRITE_CONTROL_DEFAULTS: dict[str, str] = {
+    "Enable work-package writes": "",
+    "Enable project writes": "",
+    "Enable membership writes": "",
+    "Enable version writes": "",
+    "Enable board writes": "",
+    "Enable meeting writes": "",
+}
+# The 10 individual tool-exposure read booleans are unconditionally asked whenever
+# --advanced is used (regardless of write access) — every advanced-mode test must
+# answer all 10, so tests that don't care about a specific one merge this in with
+# "" (keep existing/default) answers.
+_TOOL_EXPOSURE_DEFAULTS: dict[str, str] = {
+    "Enable project tools?": "",
+    "Enable work-package tools?": "",
+    "Enable membership tools?": "",
+    "Enable version tools?": "",
+    "Enable board tools?": "",
+    "Enable meeting tools?": "",
+    "Enable personal tools (own preferences, notifications)?": "",
+    "Enable extended/rarely-used metadata tools?": "",
+    "Enable admin tools (list/view users and groups)?": "",
+    "Enable user-schedule tools (non-working times, working hours)?": "",
+}
+_ADVANCED_ONLY_DEFAULTS: dict[str, str] = {
+    "Hidden project fields": "",
+    "Hidden work-package fields": "",
+    "Hidden activity fields": "",
+    "Hidden custom fields": "",
+    "Enable admin writes": "",
+    "Enable user-schedule writes": "",
+    "Attachment upload root": "",
+    "Default page size": "",
+    "Max page size": "",
+    "Max total results": "",
+    "List text preview char limit": "",
+    "Request timeout seconds": "",
+    "Verify TLS certificates?": "",
+    "Max retries for 429": "",
+    "Retry base delay seconds": "",
+    "Retry max delay seconds": "",
+    "Log level": "",
+    "Log format (text/json)": "",
+}
+# Quick mode (not --advanced): once "Enable write access?" is answered yes,
+# these 6 per-category Y/N prompts are asked unconditionally. Tests that drive
+# write access on but don't care about the specific per-category split merge
+# this in with "" (keep-default) answers.
+_QUICK_WRITE_SCOPE_DEFAULTS: dict[str, str] = {
+    "Work packages (create": "",
+    "Versions (create": "",
+    "Projects (create": "",
+    "Memberships (create": "",
+    "Boards (create": "",
+    "Meetings (create": "",
+}
+
+
+def test_main_global_only_writes_no_mcp_json(monkeypatch, tmp_path: Path) -> None:
+    gtarget = tmp_path / ".claude.json"
+    claude = _json_client(gtarget, project_target=tmp_path / ".mcp.json")
+    # global gate y, per-client y; project gate is skipped; then creds default
+    # (write access off, advanced off, so nothing beyond these 6 is ever asked).
+    answers = {
+        "Configure globally": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers)
+    assert gtarget.exists(), "global claude config should be written"
+    assert not (tmp_path / ".mcp.json").exists(), "no project .mcp.json for global-only"
+
+
+def test_main_project_cursor_writes_cursor_file(monkeypatch, tmp_path: Path) -> None:
+    ctarget = tmp_path / ".cursor" / "mcp.json"
+    cursor = c.Client(
+        "cursor",
+        "Cursor",
+        tmp_path / "g.json",
+        "json",
+        lambda: True,
+        "docs/cursor.md",
+        root_key="mcpServers",
+        project_target=ctarget,
+        restart_hint="reload",
+    )
+    # global gate n; project gate y, cursor y; then creds default.
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Cursor?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+    _run_main(monkeypatch, tmp_path, [cursor], answers)
+    assert ctarget.exists(), "cursor project config should be written"
+    data = json.loads(ctarget.read_text())
+    assert data["mcpServers"]["openproject"]["command"] == "openproject-ce-mcp-server"
+
+
+def test_prompt_secret_uses_getpass_on_non_windows(monkeypatch) -> None:
+    monkeypatch.setattr(c, "_IS_WINDOWS", False)
+    monkeypatch.setattr(c.getpass, "getpass", lambda prompt="": "opapi-secret")
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda prompt="": (_ for _ in ()).throw(AssertionError("input() must not be used off Windows")),
+    )
+    assert c._prompt_secret("OpenProject API token") == "opapi-secret"
+
+
+def test_prompt_secret_falls_back_to_input_on_windows(monkeypatch) -> None:
+    # getpass.getpass() on Windows reads keystrokes one at a time via msvcrt,
+    # which does not handle clipboard paste correctly (CPython #81607):
+    # Ctrl+V lands as the raw 0x16 control byte instead of the pasted text.
+    # On Windows we must use input() instead so pasted tokens survive intact.
+    monkeypatch.setattr(c, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        c.getpass,
+        "getpass",
+        lambda prompt="": (_ for _ in ()).throw(AssertionError("getpass.getpass() must not be used on Windows")),
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt="": "opapi-secret")
+    assert c._prompt_secret("OpenProject API token") == "opapi-secret"
+
+
+def test_main_neither_aborts_before_token(monkeypatch, tmp_path: Path) -> None:
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    token_asked = {"v": False}
+
+    def _boom(_prompt=""):
+        token_asked["v"] = True
+        return "opapi-x"
+
+    monkeypatch.setattr(c, "_check_python", lambda: None)
+    monkeypatch.setattr(c, "_installed_mode", lambda: True)
+    monkeypatch.setattr(c, "_install_deps", lambda *a, **k: None)
+    monkeypatch.setattr(c, "_server_command", lambda installed: ("openproject-ce-mcp-server", True))
+    monkeypatch.setattr(c, "_clients", lambda: [claude])
+    monkeypatch.chdir(tmp_path)
+    book = _AnswerBook({"Configure globally": "n", "Configure project-scoped": "n"})
+    monkeypatch.setattr("builtins.input", lambda prompt="": book(prompt))
+    monkeypatch.setattr(c.getpass, "getpass", _boom)
+    with pytest.raises(SystemExit) as exc:
+        c.main([])
+    assert exc.value.code == 1
+    assert token_asked["v"] is False, "must abort before asking for the token"
+    assert not (tmp_path / ".mcp.json").exists()
+    book.assert_consumed()
+
+
+def test_main_neither_aborts_before_token_in_clone_mode(monkeypatch, tmp_path: Path) -> None:
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    token_asked = {"v": False}
+
+    def _boom(_prompt=""):
+        token_asked["v"] = True
+        return "opapi-x"
+
+    monkeypatch.setattr(c, "_check_python", lambda: None)
+    monkeypatch.setattr(c, "_installed_mode", lambda: False)
+    monkeypatch.setattr(c, "_find_uv", lambda: "uv")
+    monkeypatch.setattr(c, "_install_deps", lambda *a, **k: None)
+    monkeypatch.setattr(c, "_server_command", lambda installed: ("openproject-ce-mcp-server", True))
+    monkeypatch.setattr(c, "_clients", lambda: [claude])
+    monkeypatch.chdir(tmp_path)
+    book = _AnswerBook({"Configure globally": "n", "Configure project-scoped": "n"})
+    monkeypatch.setattr("builtins.input", lambda prompt="": book(prompt))
+    monkeypatch.setattr(c.getpass, "getpass", _boom)
+    with pytest.raises(SystemExit) as exc:
+        c.main([])
+    assert exc.value.code == 1
+    assert token_asked["v"] is False, "must abort before asking for the token"
+    assert not (tmp_path / ".mcp.json").exists()
+    book.assert_consumed()
+
+
+def test_main_can_remove_existing_global_without_collecting_credentials(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".claude.json"
+    target.write_text(json.dumps({"mcpServers": {"openproject": {"command": "old", "env": ENV}}}))
+    claude = _json_client(target, project_target=tmp_path / ".mcp.json")
+    token_asked = {"v": False}
+
+    def _boom(_prompt=""):
+        token_asked["v"] = True
+        return "opapi-x"
+
+    monkeypatch.setattr(c, "_check_python", lambda: None)
+    monkeypatch.setattr(c, "_installed_mode", lambda: True)
+    monkeypatch.setattr(c, "_install_deps", lambda *a, **k: None)
+    monkeypatch.setattr(c, "_server_command", lambda installed: ("openproject-ce-mcp-server", True))
+    monkeypatch.setattr(c, "_clients", lambda: [claude])
+    monkeypatch.chdir(tmp_path)
+    # no global config, remove existing global, no project config
+    book = _AnswerBook(
+        {
+            "Configure globally": "n",
+            "Remove existing global Claude Code": "y",
+            "Configure project-scoped": "n",
+        }
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt="": book(prompt))
+    monkeypatch.setattr(c.getpass, "getpass", _boom)
+
+    c.main([])
+
+    assert token_asked["v"] is False, "removal-only flow must not ask for credentials"
+    data = json.loads(target.read_text())
+    assert "mcpServers" not in data
+    book.assert_consumed()
+
+
+def test_main_project_prefill_does_not_use_global_values(monkeypatch, tmp_path: Path) -> None:
+    global_target = tmp_path / ".claude.json"
+    project_target = tmp_path / ".mcp.json"
+    global_target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://global.example.com",
+                            "OPENPROJECT_API_TOKEN": "global-token",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    project_target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://project.example.com",
+                            "OPENPROJECT_API_TOKEN": "project-token",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    claude = _json_client(global_target, project_target=project_target)
+
+    # Skip global, keep existing global, configure project. Empty base/token keep
+    # the selected project's values, not the global ones.
+    answers = {
+        "Configure globally": "n",
+        "Remove existing global Claude Code": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, secret="")
+
+    data = json.loads(project_target.read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert env["OPENPROJECT_BASE_URL"] == "https://project.example.com"
+    assert env["OPENPROJECT_API_TOKEN"] == "project-token"
+
+
+def test_main_project_non_claude_writes_generic_mcp_json(monkeypatch, tmp_path: Path) -> None:
+    # Project scope with ONLY a non-Claude client (codex) → generic example
+    # copy-source IS written, under its own inert name — never .mcp.json,
+    # which is Claude Code's own active project config.
+    codex = _codex_client(tmp_path / "g.toml", project_target=tmp_path / ".codex" / "config.toml")
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Codex?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+    _run_main(monkeypatch, tmp_path, [codex], answers)
+    codex_config = tmp_path / ".codex" / "config.toml"
+    example = tmp_path / c._GENERIC_EXAMPLE_FILENAME
+    assert codex_config.exists()
+    assert example.exists(), "generic example copy-source written when no Claude Code project"
+    assert not (tmp_path / ".mcp.json").exists(), "must never write Claude Code's own file for a non-Claude selection"
+    # The example file is a copy-source, not an active config any client loads
+    # — its token is a placeholder, never the real secret duplicated to disk.
+    example_env = json.loads(example.read_text())["mcpServers"]["openproject"]["env"]
+    assert example_env["OPENPROJECT_API_TOKEN"] == c._EXAMPLE_TOKEN_PLACEHOLDER
+    # The actual client file that's really loaded still gets the real token.
+    codex_text = codex_config.read_text()
+    assert "opapi-tok" in codex_text
+    assert c._EXAMPLE_TOKEN_PLACEHOLDER not in codex_text
+
+
+def test_main_project_claude_no_duplicate_mcp_json(monkeypatch, tmp_path: Path) -> None:
+    # Project scope WITH Claude Code → .mcp.json is Claude's project file, written once,
+    # and the generic example write is skipped entirely (no double write / no extra backup).
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers)
+    assert (tmp_path / ".mcp.json").exists()
+    # exactly one .mcp.json, no stray backup from a second write
+    backups = list(tmp_path.glob(".mcp.json.bak.*"))
+    assert backups == [], "Claude Code project write must not double-write .mcp.json"
+    assert not (tmp_path / c._GENERIC_EXAMPLE_FILENAME).exists(), (
+        "no generic example needed when Claude Code is selected"
+    )
+
+
+def test_configure_continues_after_one_client_fails_and_exits_nonzero(monkeypatch, tmp_path: Path, capsys) -> None:
+    # Two project-scoped clients selected in one run; the first one's write
+    # fails (simulated OSError at the atomic-replace step) — the second must
+    # still be written, the failure summary must name the failed path, and
+    # the process must exit non-zero without an unhandled traceback.
+    codex_target = tmp_path / ".codex" / "config.toml"
+    claude_target = tmp_path / ".mcp.json"
+    codex = _codex_client(tmp_path / "g.toml", project_target=codex_target)
+    claude = _json_client(tmp_path / ".claude.json", project_target=claude_target)
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Codex?": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+
+    real_replace = c.os.replace
+
+    def _flaky_replace(src, dst, *a, **k):
+        if str(dst) == str(codex_target):
+            raise OSError("simulated write failure")
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(c.os, "replace", _flaky_replace)
+
+    with pytest.raises(SystemExit) as exc:
+        _run_main(monkeypatch, tmp_path, [codex, claude], answers)
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert str(codex_target) in out, "the failure summary must name the specific failed path"
+    assert not codex_target.exists(), "a failed write must not leave a partial target"
+    assert claude_target.exists(), "the second client must still be written despite the first one failing"
+
+
+def test_main_basic_setup_safe_advanced_defaults(monkeypatch, tmp_path: Path) -> None:
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    # global n, project y, claude y, base/default scopes, write access default
+    # false, advanced default false.
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers)
+
+    data = json.loads((tmp_path / ".mcp.json").read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    # A fresh setup's fail-safe quick-mode default ("no write access") deviates
+    # from Settings' own optimistic True default for the 6 project-scoped write
+    # flags (that default only makes sense once a project scope is granted), so
+    # minimal-diff writing must keep them explicitly false here.
+    assert set(env) == {
+        "OPENPROJECT_BASE_URL",
+        "OPENPROJECT_API_TOKEN",
+        "OPENPROJECT_ENABLE_PROJECT_WRITE",
+        "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE",
+        "OPENPROJECT_ENABLE_MEMBERSHIP_WRITE",
+        "OPENPROJECT_ENABLE_VERSION_WRITE",
+        "OPENPROJECT_ENABLE_BOARD_WRITE",
+        "OPENPROJECT_ENABLE_MEETING_WRITE",
+    }
+    settings = c.Settings.from_env(env)
+    assert settings.enable_work_package_write is False
+    assert settings.enable_project_write is False
+    assert settings.enable_membership_write is False
+    assert settings.enable_version_write is False
+    assert settings.enable_board_write is False
+    assert settings.enable_meeting_write is False
+    assert settings.enable_personal_write is False
+    assert settings.attachment_root == ""
+    assert settings.max_retries == 3
+    assert settings.retry_base_delay == 1.0
+    assert settings.retry_max_delay == 60.0
+
+
+def test_main_fresh_setup_defaults_read_projects_to_empty_not_wildcard(monkeypatch, tmp_path: Path) -> None:
+    # A brand-new setup (no prefill, no legacy keys) must start
+    # fail-closed like the runtime default, not silently suggest "*". That
+    # default is also what minimal-diff writing omits — assert both the
+    # omission and the resolved (still fail-closed) effective value.
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers)
+
+    data = json.loads((tmp_path / ".mcp.json").read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert "OPENPROJECT_READ_PROJECTS" not in env
+    assert c.Settings.from_env(env).read_projects == ()
+
+
+def test_main_write_access_no_disables_write_flags(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://old.example.com",
+                            "OPENPROJECT_API_TOKEN": "old-token",
+                            "OPENPROJECT_WRITE_PROJECTS": "TST",
+                            "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE": "true",
+                            "OPENPROJECT_ENABLE_PROJECT_WRITE": "true",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    claude = _json_client(tmp_path / ".claude.json", project_target=target)
+    # Explicit "no" disables project-scoped writes even though the existing
+    # config has a non-standard (project_write, work_package_write) combo —
+    # an explicit choice always wins over any prefill.
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "*",
+        "Enable write access?": "n",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, secret="")
+
+    data = json.loads(target.read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    # All of these end up at their default (empty/false), so
+    # minimal-diff writing omits them from the file — assert the resolved
+    # effective values instead of the (now-absent) raw keys.
+    assert "OPENPROJECT_WRITE_PROJECTS" not in env
+    settings = c.Settings.from_env(env)
+    assert settings.write_projects == ()
+    assert settings.enable_work_package_write is False
+    assert settings.enable_project_write is False
+    assert settings.enable_membership_write is False
+    assert settings.enable_version_write is False
+    assert settings.enable_board_write is False
+
+
+def test_main_write_access_enter_keeps_existing_scope(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://old.example.com",
+                            "OPENPROJECT_API_TOKEN": "old-token",
+                            "OPENPROJECT_READ_PROJECTS": "DEMO, TEST",
+                            "OPENPROJECT_WRITE_PROJECTS": "TST",
+                            "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE": "true",
+                            "OPENPROJECT_ENABLE_PROJECT_WRITE": "false",
+                            "OPENPROJECT_ENABLE_MEMBERSHIP_WRITE": "false",
+                            "OPENPROJECT_ENABLE_VERSION_WRITE": "false",
+                            "OPENPROJECT_ENABLE_BOARD_WRITE": "false",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    claude = _json_client(tmp_path / ".claude.json", project_target=target)
+    # Enter on every prompt: "Enable write access?" defaults to yes (existing
+    # write scope non-empty), "Writable projects" fires with the existing
+    # scope as its own default, and each per-category default follows its
+    # own existing flag.
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+        "Writable projects": "",
+        "Work packages (create": "",
+        "Versions (create": "",
+        "Projects (create": "",
+        "Memberships (create": "",
+        "Boards (create": "",
+        "Meetings (create": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, secret="")
+
+    data = json.loads(target.read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert env["OPENPROJECT_READ_PROJECTS"] == "DEMO, TEST"
+    assert env["OPENPROJECT_WRITE_PROJECTS"] == "TST"
+    settings = c.Settings.from_env(env)
+    assert settings.enable_work_package_write is True
+    assert settings.enable_project_write is False
+    assert settings.enable_membership_write is False
+    assert settings.enable_version_write is False
+    assert settings.enable_board_write is False
+
+
+def test_main_explicit_empty_new_key_stays_empty(monkeypatch, tmp_path: Path) -> None:
+    # An explicit, deliberately empty OPENPROJECT_READ_PROJECTS/_WRITE_PROJECTS
+    # prefill must stay empty (not silently default to something else).
+    target = tmp_path / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://old.example.com",
+                            "OPENPROJECT_API_TOKEN": "old-token",
+                            "OPENPROJECT_READ_PROJECTS": "",
+                            "OPENPROJECT_WRITE_PROJECTS": "",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    claude = _json_client(tmp_path / ".claude.json", project_target=target)
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, secret="")
+
+    data = json.loads(target.read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    # Both resolve to empty (the default), so minimal-diff writing omits both.
+    assert "OPENPROJECT_READ_PROJECTS" not in env
+    assert "OPENPROJECT_WRITE_PROJECTS" not in env
+    settings = c.Settings.from_env(env)
+    assert settings.read_projects == ()
+    assert settings.write_projects == ()
+
+
+def test_main_write_access_yes_defaults_write_controls_on(monkeypatch, tmp_path: Path) -> None:
+    # Answering yes to every write-category prompt in quick mode enables
+    # every write-group flag (project/membership/work_package/version/board).
+    # There is no auto-confirm prompt anymore: every write/delete always
+    # requires explicit confirm=true, no operator-level bypass exists.
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "DEMO, TEST",
+        "Enable write access?": "y",
+        "Writable projects": "TST",
+        "Work packages (create": "y",
+        "Versions (create": "y",
+        "Projects (create": "y",
+        "Memberships (create": "y",
+        "Boards (create": "y",
+        "Meetings (create": "y",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers)
+
+    data = json.loads((tmp_path / ".mcp.json").read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert env["OPENPROJECT_READ_PROJECTS"] == "DEMO, TEST"
+    assert env["OPENPROJECT_WRITE_PROJECTS"] == "TST"
+    # All 5 flags equal Settings' own True default, so minimal-diff writing
+    # omits them — assert the resolved effective values instead.
+    settings = c.Settings.from_env(env)
+    assert settings.enable_project_write is True
+    assert settings.enable_membership_write is True
+    assert settings.enable_work_package_write is True
+    assert settings.enable_version_write is True
+    assert settings.enable_board_write is True
+
+
+def test_main_skipping_advanced_preserves_existing_advanced_values(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://old.example.com",
+                            "OPENPROJECT_API_TOKEN": "old-token",
+                            "OPENPROJECT_HIDE_PROJECT_FIELDS": "description",
+                            "OPENPROJECT_ENABLE_EXTENDED_READ": "true",
+                            "OPENPROJECT_ATTACHMENT_ROOT": ATTACHMENT_ROOT,
+                            "OPENPROJECT_ATTACHMENT_CONTENT_MAX_BYTES": "1048576",
+                            "OPENPROJECT_MAX_RETRIES": "7",
+                            "OPENPROJECT_RETRY_BASE_DELAY": "2.5",
+                            "OPENPROJECT_RETRY_MAX_DELAY": "30",
+                            "OPENPROJECT_LOG_FORMAT": "json",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    claude = _json_client(tmp_path / ".claude.json", project_target=target)
+
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, secret="")
+
+    data = json.loads(target.read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert env["OPENPROJECT_HIDE_PROJECT_FIELDS"] == "description"
+    assert env["OPENPROJECT_ENABLE_EXTENDED_READ"] == "true"
+    assert env["OPENPROJECT_ATTACHMENT_ROOT"] == ATTACHMENT_ROOT
+    assert env["OPENPROJECT_ATTACHMENT_CONTENT_MAX_BYTES"] == "1048576"
+    assert env["OPENPROJECT_MAX_RETRIES"] == "7"
+    assert env["OPENPROJECT_RETRY_BASE_DELAY"] == "2.5"
+    assert env["OPENPROJECT_RETRY_MAX_DELAY"] == "30"
+    assert env["OPENPROJECT_LOG_FORMAT"] == "json"
+
+
+def test_main_quick_mode_preserves_existing_log_format_without_reprompting(monkeypatch, tmp_path: Path) -> None:
+    """Regression (Codex review round 5): OPENPROJECT_LOG_FORMAT was entirely
+    absent from the wizard -- not read as prefill, not written to the
+    generated env, not in _MINIMAL_ENV_FIELD_MAP -- so re-running configure
+    against an existing json-logging setup silently reverted it to text on
+    every save, even outside --advanced mode where there is no prompt to
+    answer at all."""
+    target = tmp_path / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://old.example.com",
+                            "OPENPROJECT_API_TOKEN": "old-token",
+                            "OPENPROJECT_LOG_FORMAT": "json",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    claude = _json_client(tmp_path / ".claude.json", project_target=target)
+
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, secret="")
+
+    data = json.loads(target.read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert env["OPENPROJECT_LOG_FORMAT"] == "json"
+
+
+# ── quick/advanced mode ─────────────────────────────────────────────
+
+
+def test_main_quick_write_access_no_disables_all_write_flags(monkeypatch, tmp_path: Path) -> None:
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    # "Enable write access?" = no never triggers the per-category prompts at all.
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "*",
+        "Enable write access?": "n",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers)
+
+    data = json.loads((tmp_path / ".mcp.json").read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert "OPENPROJECT_WRITE_PROJECTS" not in env
+    settings = c.Settings.from_env(env)
+    assert settings.write_projects == ()
+    assert settings.enable_work_package_write is False
+    assert settings.enable_project_write is False
+    assert settings.enable_membership_write is False
+    assert settings.enable_version_write is False
+    assert settings.enable_board_write is False
+
+
+def test_main_quick_write_scope_work_packages_only(monkeypatch, tmp_path: Path) -> None:
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "DEMO",
+        "Enable write access?": "y",
+        "Writable projects": "DEMO",
+        "Work packages (create": "y",
+        "Versions (create": "n",
+        "Projects (create": "n",
+        "Memberships (create": "n",
+        "Boards (create": "n",
+        "Meetings (create": "n",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers)
+
+    data = json.loads((tmp_path / ".mcp.json").read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert env["OPENPROJECT_WRITE_PROJECTS"] == "DEMO"
+    settings = c.Settings.from_env(env)
+    assert settings.enable_work_package_write is True
+    assert settings.enable_project_write is False
+    assert settings.enable_membership_write is False
+    assert settings.enable_version_write is False
+    assert settings.enable_board_write is False
+
+
+def test_main_quick_write_scope_all_enables_every_scoped_write(monkeypatch, tmp_path: Path) -> None:
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "*",
+        "Enable write access?": "y",
+        "Writable projects": "*",
+        "Work packages (create": "y",
+        "Versions (create": "y",
+        "Projects (create": "y",
+        "Memberships (create": "y",
+        "Boards (create": "y",
+        "Meetings (create": "y",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers)
+
+    data = json.loads((tmp_path / ".mcp.json").read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    settings = c.Settings.from_env(env)
+    assert settings.enable_work_package_write is True
+    assert settings.enable_project_write is True
+    assert settings.enable_membership_write is True
+    assert settings.enable_version_write is True
+    assert settings.enable_board_write is True
+
+
+def test_main_quick_write_scope_default_is_off_on_fresh_setup(monkeypatch, tmp_path: Path) -> None:
+    # A brand-new setup (no prefill) must default "Enable write access?" to
+    # No, and accepting that default must not ask "Writable projects" or any
+    # per-category question at all.
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers)
+
+    data = json.loads((tmp_path / ".mcp.json").read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert "OPENPROJECT_WRITE_PROJECTS" not in env
+    settings = c.Settings.from_env(env)
+    assert settings.write_projects == ()
+    assert settings.enable_work_package_write is False
+
+
+def test_main_quick_write_scope_prefill_matches_existing_combo(monkeypatch, tmp_path: Path) -> None:
+    # Existing config (new-style keys) has only work_package_write on —
+    # accepting every per-category default must reproduce it exactly,
+    # including the "Writable projects" default.
+    target = tmp_path / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://old.example.com",
+                            "OPENPROJECT_API_TOKEN": "old-token",
+                            "OPENPROJECT_WRITE_PROJECTS": "TST",
+                            "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE": "true",
+                            "OPENPROJECT_ENABLE_PROJECT_WRITE": "false",
+                            "OPENPROJECT_ENABLE_MEMBERSHIP_WRITE": "false",
+                            "OPENPROJECT_ENABLE_VERSION_WRITE": "false",
+                            "OPENPROJECT_ENABLE_BOARD_WRITE": "false",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    claude = _json_client(tmp_path / ".claude.json", project_target=target)
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+        "Writable projects": "",
+        "Work packages (create": "",
+        "Versions (create": "",
+        "Projects (create": "",
+        "Memberships (create": "",
+        "Boards (create": "",
+        "Meetings (create": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, secret="")
+
+    data = json.loads(target.read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert env["OPENPROJECT_WRITE_PROJECTS"] == "TST"
+    settings = c.Settings.from_env(env)
+    assert settings.enable_work_package_write is True
+    assert settings.enable_project_write is False
+    assert settings.enable_membership_write is False
+    assert settings.enable_version_write is False
+    assert settings.enable_board_write is False
+
+
+def test_main_quick_write_scope_custom_combo_prefill_reproduced(monkeypatch, tmp_path: Path) -> None:
+    # A non-standard combo (version_write + board_write only) is just as
+    # reproducible as any other combo now — each category is its own
+    # independent Y/N with its own prefilled default, no "custom"/"keep"
+    # bucketing needed.
+    target = tmp_path / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://old.example.com",
+                            "OPENPROJECT_API_TOKEN": "old-token",
+                            "OPENPROJECT_WRITE_PROJECTS": "DEMO,TEST",
+                            "OPENPROJECT_ENABLE_VERSION_WRITE": "true",
+                            "OPENPROJECT_ENABLE_BOARD_WRITE": "true",
+                            "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE": "false",
+                            "OPENPROJECT_ENABLE_PROJECT_WRITE": "false",
+                            "OPENPROJECT_ENABLE_MEMBERSHIP_WRITE": "false",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    claude = _json_client(tmp_path / ".claude.json", project_target=target)
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+        "Writable projects": "",
+        "Work packages (create": "",
+        "Versions (create": "",
+        "Projects (create": "",
+        "Memberships (create": "",
+        "Boards (create": "",
+        "Meetings (create": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, secret="")
+
+    data = json.loads(target.read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert env["OPENPROJECT_WRITE_PROJECTS"] == "DEMO,TEST"
+    settings = c.Settings.from_env(env)
+    assert settings.enable_version_write is True
+    assert settings.enable_board_write is True
+    assert settings.enable_work_package_write is False
+    assert settings.enable_project_write is False
+    assert settings.enable_membership_write is False
+
+
+def test_main_quick_write_access_no_overrides_existing_custom_combo(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://old.example.com",
+                            "OPENPROJECT_API_TOKEN": "old-token",
+                            "OPENPROJECT_WRITE_PROJECTS": "DEMO,TEST",
+                            "OPENPROJECT_ENABLE_VERSION_WRITE": "true",
+                            "OPENPROJECT_ENABLE_BOARD_WRITE": "true",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    claude = _json_client(tmp_path / ".claude.json", project_target=target)
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "n",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, secret="")
+
+    data = json.loads(target.read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert "OPENPROJECT_WRITE_PROJECTS" not in env
+    settings = c.Settings.from_env(env)
+    assert settings.write_projects == ()
+    assert settings.enable_version_write is False
+    assert settings.enable_board_write is False
+
+
+def test_main_quick_write_scope_dormant_flags_with_empty_write_projects_default_off(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # Regression: a flag left on from a prior config but with an empty
+    # OPENPROJECT_WRITE_PROJECTS grants no actual write access today
+    # (_ensure_project_write_allowed requires both) — "Enable write access?"
+    # must default to No (existing_write_projects is empty), so the per-
+    # category prompts never even fire and the dormant flag's stale "true"
+    # can't silently resurrect itself via an accepted default.
+    target = tmp_path / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://old.example.com",
+                            "OPENPROJECT_API_TOKEN": "old-token",
+                            "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE": "true",
+                            "OPENPROJECT_WRITE_PROJECTS": "",
+                            "OPENPROJECT_READ_PROJECTS": "*",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    claude = _json_client(tmp_path / ".claude.json", project_target=target)
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, secret="")
+
+    data = json.loads(target.read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert "OPENPROJECT_WRITE_PROJECTS" not in env
+    settings = c.Settings.from_env(env)
+    assert settings.write_projects == ()
+    assert settings.enable_work_package_write is False
+
+
+def test_main_quick_write_scope_off_does_not_touch_personal_or_admin_write(monkeypatch, tmp_path: Path) -> None:
+    # "Enable write access?" only governs the five project-scoped write
+    # flags — personal-data and admin writes are independent axes and must
+    # keep their existing value even when write access is disabled.
+    target = tmp_path / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://old.example.com",
+                            "OPENPROJECT_API_TOKEN": "old-token",
+                            "OPENPROJECT_ENABLE_PERSONAL_READ": "true",
+                            "OPENPROJECT_ENABLE_PERSONAL_WRITE": "true",
+                            "OPENPROJECT_ENABLE_ADMIN_READ": "true",
+                            "OPENPROJECT_ENABLE_ADMIN_WRITE": "true",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    claude = _json_client(tmp_path / ".claude.json", project_target=target)
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "n",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, secret="")
+
+    data = json.loads(target.read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    settings = c.Settings.from_env(env)
+    assert settings.enable_work_package_write is False
+    assert settings.enable_project_write is False
+    assert settings.enable_membership_write is False
+    assert settings.enable_version_write is False
+    assert settings.enable_board_write is False
+    assert env["OPENPROJECT_ENABLE_PERSONAL_WRITE"] == "true"
+    assert env["OPENPROJECT_ENABLE_ADMIN_WRITE"] == "true"
+    assert settings.enable_personal_write is True
+    assert settings.enable_admin_write is True
+
+
+def test_main_quick_skips_tool_exposure_prompts(monkeypatch, tmp_path: Path) -> None:
+    # None of the 8 "Enable ... tools?" answers are registered — if any prompt
+    # fired anyway, _AnswerBook would raise. Quick mode must silently keep the
+    # default read exposure.
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers)
+
+    data = json.loads((tmp_path / ".mcp.json").read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    # All 8 read-exposure flags equal their default, so minimal-diff writing omits them.
+    assert not any(k.startswith("OPENPROJECT_ENABLE_") and k.endswith("_READ") for k in env)
+
+
+def test_main_advanced_flag_still_asks_tool_exposure_and_field_hiding(monkeypatch, tmp_path: Path) -> None:
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "n",
+        **_TOOL_EXPOSURE_DEFAULTS,
+        "Enable extended/rarely-used metadata tools?": "y",
+        **_ADVANCED_ONLY_DEFAULTS,
+        "Hidden project fields": "description",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, argv=["--advanced"])
+
+    data = json.loads((tmp_path / ".mcp.json").read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert env["OPENPROJECT_ENABLE_EXTENDED_READ"] == "true"
+    assert env["OPENPROJECT_HIDE_PROJECT_FIELDS"] == "description"
+
+
+def test_main_quick_and_advanced_flags_are_mutually_exclusive() -> None:
+    with pytest.raises(SystemExit) as exc:
+        c.main(["--quick", "--advanced"], interactive=False)
+    assert exc.value.code == 2
+
+
+def test_main_advanced_setup_prompts_for_optional_values(monkeypatch, tmp_path: Path) -> None:
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "DEMO",
+        "Enable write access?": "y",
+        "Writable projects": "TST",
+        **_TOOL_EXPOSURE_DEFAULTS,
+        "Enable personal tools (own preferences, notifications)?": "y",
+        "Enable extended/rarely-used metadata tools?": "y",
+        "Enable personal-data writes": "y",
+        "Enable work-package writes": "y",
+        "Enable project writes": "n",
+        "Enable membership writes": "n",
+        "Enable version writes": "n",
+        "Enable board writes": "n",
+        "Enable meeting writes": "n",
+        "Hidden project fields": "status_explanation",
+        "Hidden work-package fields": "description",
+        "Hidden activity fields": "comment",
+        "Hidden custom fields": "budget",
+        "Enable admin writes": "n",
+        "Enable user-schedule writes": "n",
+        "Attachment upload root": ATTACHMENT_ROOT,
+        "Default page size": "5",
+        "Max page size": "25",
+        "Max total results": "50",
+        "List text preview char limit": "250",
+        "Request timeout seconds": "20",
+        "Verify TLS certificates?": "y",
+        "Max retries for 429": "4",
+        "Retry base delay seconds": "0.5",
+        "Retry max delay seconds": "10",
+        "Log level": "INFO",
+        "Log format (text/json)": "json",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, argv=["--advanced"])
+
+    data = json.loads((tmp_path / ".mcp.json").read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert env["OPENPROJECT_READ_PROJECTS"] == "DEMO"
+    assert env["OPENPROJECT_WRITE_PROJECTS"] == "TST"
+    # work_package_write=true equals Settings' own True default, so
+    # minimal-diff writing omits the key — assert the resolved value instead.
+    assert c.Settings.from_env(env).enable_work_package_write is True
+    assert env["OPENPROJECT_HIDE_PROJECT_FIELDS"] == "status_explanation"
+    assert env["OPENPROJECT_ENABLE_EXTENDED_READ"] == "true"
+    assert env["OPENPROJECT_ENABLE_PERSONAL_READ"] == "true"
+    assert env["OPENPROJECT_ENABLE_PERSONAL_WRITE"] == "true"
+    assert env["OPENPROJECT_ATTACHMENT_ROOT"] == ATTACHMENT_ROOT
+    assert env["OPENPROJECT_DEFAULT_PAGE_SIZE"] == "5"
+    assert env["OPENPROJECT_MAX_RETRIES"] == "4"
+    assert env["OPENPROJECT_RETRY_BASE_DELAY"] == "0.5"
+    assert env["OPENPROJECT_LOG_FORMAT"] == "json"
+
+
+# ── Wizard reconciliation + validation ─────────────
+
+
+def test_main_advanced_deselecting_group_disables_existing_write_flag(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://old.example.com",
+                            "OPENPROJECT_API_TOKEN": "old-token",
+                            "OPENPROJECT_WRITE_PROJECTS": "*",
+                            "OPENPROJECT_ENABLE_BOARD_WRITE": "true",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    claude = _json_client(tmp_path / ".claude.json", project_target=target)
+    # advanced + write access both on → the wizard also asks the 5 write-control
+    # toggles and the 16 always-asked advanced-only fields; none of those are
+    # asserted on here, so they're left at their kept/default answers.
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "y",
+        "Writable projects": "",  # keep existing "*"
+        **_TOOL_EXPOSURE_DEFAULTS,
+        "Enable board tools?": "n",  # deselect boards
+        **_WRITE_CONTROL_DEFAULTS,
+        **_ADVANCED_ONLY_DEFAULTS,
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, secret="", argv=["--advanced"])
+
+    data = json.loads(target.read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert env["OPENPROJECT_ENABLE_BOARD_READ"] == "false"
+    # Reconciliation disabled board_write to false, which now deviates from
+    # Settings' own True default — minimal-diff writing therefore keeps it.
+    assert env["OPENPROJECT_ENABLE_BOARD_WRITE"] == "false"
+    settings = c.Settings.from_env(env)  # must still parse cleanly
+    assert settings.enable_board_write is False
+
+
+def test_main_personal_write_forced_false_when_personal_group_absent_in_advanced(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://old.example.com",
+                            "OPENPROJECT_API_TOKEN": "old-token",
+                            "OPENPROJECT_ENABLE_PERSONAL_WRITE": "true",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    claude = _json_client(tmp_path / ".claude.json", project_target=target)
+    # write access off → no write-control toggles; advanced on → the 16
+    # always-asked advanced-only fields still fire, left at their defaults.
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "n",
+        # personal tools left at "" (default False) — no personal_write slot needed.
+        **_TOOL_EXPOSURE_DEFAULTS,
+        **_ADVANCED_ONLY_DEFAULTS,
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, secret="", argv=["--advanced"])
+
+    data = json.loads(target.read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert "OPENPROJECT_ENABLE_PERSONAL_READ" not in env
+    # personal_write is forced to false (the default) — minimal-diff
+    # writing therefore omits the key entirely.
+    assert "OPENPROJECT_ENABLE_PERSONAL_WRITE" not in env
+    assert c.Settings.from_env(env).enable_personal_write is False
+
+
+def test_main_legacy_migration_reconciles_read_off_write_on_same_scope(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".mcp.json"
+    target.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "openproject": {
+                        "command": "old",
+                        "env": {
+                            "OPENPROJECT_BASE_URL": "https://old.example.com",
+                            "OPENPROJECT_API_TOKEN": "old-token",
+                            "OPENPROJECT_WRITE_PROJECTS": "*",
+                            "OPENPROJECT_ENABLE_BOARD_READ": "false",
+                            "OPENPROJECT_ENABLE_BOARD_WRITE": "true",
+                            "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE": "false",
+                            "OPENPROJECT_ENABLE_PROJECT_WRITE": "false",
+                            "OPENPROJECT_ENABLE_MEMBERSHIP_WRITE": "false",
+                            "OPENPROJECT_ENABLE_VERSION_WRITE": "false",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    claude = _json_client(tmp_path / ".claude.json", project_target=target)
+    # Advanced entirely skipped (quick mode): only board_write is true in the
+    # existing config, so accepting every per-category default carries
+    # board_write=true (and the existing "*" write scope) through unchanged —
+    # proving reconciliation (which then keeps OPENPROJECT_ENABLE_BOARD_READ=
+    # false, since board read was already false in the existing config) fires
+    # even in this non-advanced/migration-only path, not just when the user
+    # answers the advanced tool-exposure prompts by hand.
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+        "Writable projects": "",
+        "Work packages (create": "",
+        "Versions (create": "",
+        "Projects (create": "",
+        "Memberships (create": "",
+        "Boards (create": "",
+        "Meetings (create": "",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, secret="")
+
+    data = json.loads(target.read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    assert env["OPENPROJECT_ENABLE_BOARD_READ"] == "false"
+    # Reconciliation disabled board_write to false, which now deviates from
+    # Settings' own True default — minimal-diff writing therefore keeps it.
+    assert env["OPENPROJECT_ENABLE_BOARD_WRITE"] == "false"
+    assert c.Settings.from_env(env).enable_board_write is False
+
+
+def test_wizard_invariant_generated_config_always_parses_with_settings_from_env(monkeypatch, tmp_path: Path) -> None:
+    """The generated env must always parse via Settings.from_env — enforced
+    structurally inside main() itself; this test is a regression guard, not the
+    mechanism that creates the guarantee."""
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    # Only 4 of the 5 write-control toggles are explicitly answered "y" here
+    # (matching the original list, which ran out after 4) — "Enable board
+    # writes" is left at its merged "" (kept-default) answer. Not asserted on
+    # either way; this test only checks the generated config parses cleanly.
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "DEMO",
+        "Enable write access?": "y",
+        "Writable projects": "TST",
+        **_TOOL_EXPOSURE_DEFAULTS,
+        "Enable personal tools (own preferences, notifications)?": "y",
+        "Enable extended/rarely-used metadata tools?": "y",
+        "Enable personal-data writes": "y",
+        **_WRITE_CONTROL_DEFAULTS,
+        "Enable work-package writes": "y",
+        "Enable project writes": "y",
+        "Enable membership writes": "y",
+        "Enable version writes": "y",
+        **_ADVANCED_ONLY_DEFAULTS,
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, argv=["--advanced"])
+    data = json.loads((tmp_path / ".mcp.json").read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    c.Settings.from_env(env)  # must not raise
+
+
+def test_main_ctrl_c_exits_130_no_traceback(monkeypatch, capsys) -> None:
+    # Ctrl+C during a prompt → clean "Cancelled" message + exit 130, no traceback.
+    # This is the one deliberate, documented exception to the "no direct
+    # builtins.input patch outside _AnswerBook" rule: raising an
+    # exception isn't an "answer" _AnswerBook's string/string-queue API can
+    # express, and it isn't the kind of positional-fragility that rule guards against.
+    monkeypatch.setattr(c, "_check_python", lambda: None)
+    monkeypatch.setattr(c, "_installed_mode", lambda: True)
+    monkeypatch.setattr(c, "_install_deps", lambda *a, **k: None)
+    monkeypatch.setattr(c, "_server_command", lambda installed: ("openproject-ce-mcp-server", True))
+    monkeypatch.setattr(c, "_clients", lambda: [])
+
+    def raise_keyboard_interrupt(_prompt: str = "") -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", raise_keyboard_interrupt)
+    with pytest.raises(SystemExit) as exc:
+        c.main([])
+    assert exc.value.code == 130
+    assert "Cancelled" in capsys.readouterr().err
+
+
+# ── _test_connection ──────────────────────────────────────────────
+
+_CONNECTION_ENV = {"OPENPROJECT_BASE_URL": "https://op.example.com", "OPENPROJECT_API_TOKEN": "tok"}
+
+
+def test_connection_success_returns_ok_with_user_name() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": 1, "name": "Test User", "login": "testuser"}, request=request)
+
+    check = c._test_connection(_CONNECTION_ENV, transport=httpx.MockTransport(handler))
+    assert check.status == "ok"
+    assert check.user_name == "Test User"
+
+
+def test_connection_401_returns_auth_error() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"message": "Unauthorized"}, request=request)
+
+    check = c._test_connection(_CONNECTION_ENV, transport=httpx.MockTransport(handler))
+    assert check.status == "auth_error"
+
+
+def test_connection_403_forbidden_returns_permission_error() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"message": "Forbidden"}, request=request)
+
+    check = c._test_connection(_CONNECTION_ENV, transport=httpx.MockTransport(handler))
+    assert check.status == "permission_error"
+
+
+def test_connection_404_returns_not_found_error() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "Not found"}, request=request)
+
+    check = c._test_connection(_CONNECTION_ENV, transport=httpx.MockTransport(handler))
+    assert check.status == "not_found_error"
+
+
+def test_connection_timeout_returns_network_error() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.TimeoutException("timed out")
+
+    check = c._test_connection(_CONNECTION_ENV, transport=httpx.MockTransport(handler))
+    assert check.status == "network_error"
+
+
+def test_connection_connect_error_returns_network_error() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    check = c._test_connection(_CONNECTION_ENV, transport=httpx.MockTransport(handler))
+    assert check.status == "network_error"
+
+
+def test_connection_invalid_settings_returns_config_error_without_network_call() -> None:
+    called = {"v": False}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        called["v"] = True
+        return httpx.Response(200, json={}, request=request)
+
+    check = c._test_connection({"OPENPROJECT_BASE_URL": ""}, transport=httpx.MockTransport(handler))
+    assert check.status == "config_error"
+    assert called["v"] is False, "must not attempt a network call for invalid settings"
+
+
+# ── interactive connection test + preview/confirm ────────────────
+
+
+def test_main_interactive_declined_confirm_leaves_everything_unchanged(monkeypatch, tmp_path: Path, capsys) -> None:
+    # Removals execute only after credentials/preview, not immediately after
+    # target selection — a declined confirm must leave BOTH the removal and
+    # the write as no-ops.
+    # Also exercises a mixed remove(global) + create(project) preview in one go.
+    gtarget = tmp_path / ".claude.json"
+    gtarget.write_text(json.dumps({"mcpServers": {"openproject": {"env": ENV}}}))
+    ptarget = tmp_path / ".mcp.json"
+    claude = _json_client(gtarget, project_target=ptarget)
+
+    monkeypatch.setattr(c, "_test_connection", lambda env, **_k: c.ConnectionCheck("ok", "", "Test User"))
+
+    answers = {
+        "Configure globally": "n",
+        "Remove existing global Claude Code": "y",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+        "Proceed with these changes?": "n",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, interactive=True)
+
+    data = json.loads(gtarget.read_text())
+    assert "openproject" in data["mcpServers"], "declined confirm must not have removed the global entry"
+    assert not ptarget.exists(), "declined confirm must not have written the project config"
+
+    out = capsys.readouterr().out
+    assert "Remove Claude Code (global)" in out
+    assert "Create Claude Code (project)" in out
+    assert "Connection: OK (connected as Test User)" in out
+    assert "API token: configured (hidden)" in out
+
+
+def test_main_interactive_confirm_yes_applies_mixed_remove_and_create(monkeypatch, tmp_path: Path) -> None:
+    gtarget = tmp_path / ".claude.json"
+    gtarget.write_text(json.dumps({"mcpServers": {"openproject": {"env": ENV}}}))
+    ptarget = tmp_path / ".mcp.json"
+    claude = _json_client(gtarget, project_target=ptarget)
+
+    monkeypatch.setattr(c, "_test_connection", lambda env, **_k: c.ConnectionCheck("ok", "", "Test User"))
+
+    answers = {
+        "Configure globally": "n",
+        "Remove existing global Claude Code": "y",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+        "Proceed with these changes?": "y",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, interactive=True)
+
+    data = json.loads(gtarget.read_text())
+    assert "openproject" not in data.get("mcpServers", {})
+    assert ptarget.exists()
+
+
+def test_main_interactive_remove_only_declined_confirm_leaves_file_unchanged(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".claude.json"
+    target.write_text(json.dumps({"mcpServers": {"openproject": {"env": ENV}}}))
+    claude = _json_client(target, project_target=tmp_path / ".mcp.json")
+
+    # No _test_connection monkeypatch needed: a pure-removal flow never collects
+    # credentials, so the connection test is never attempted (env stays None).
+    answers = {
+        "Configure globally": "n",
+        "Remove existing global Claude Code": "y",
+        "Configure project-scoped": "n",
+        "Proceed with these changes?": "n",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, interactive=True)
+
+    data = json.loads(target.read_text())
+    assert "openproject" in data["mcpServers"]
+
+
+def test_main_interactive_remove_only_confirm_yes_removes(monkeypatch, tmp_path: Path) -> None:
+    target = tmp_path / ".claude.json"
+    target.write_text(json.dumps({"mcpServers": {"openproject": {"env": ENV}}}))
+    claude = _json_client(target, project_target=tmp_path / ".mcp.json")
+
+    answers = {
+        "Configure globally": "n",
+        "Remove existing global Claude Code": "y",
+        "Configure project-scoped": "n",
+        "Proceed with these changes?": "y",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, interactive=True)
+
+    data = json.loads(target.read_text())
+    assert "mcpServers" not in data
+
+
+def test_main_interactive_network_error_proceed_unverified(monkeypatch, tmp_path: Path, capsys) -> None:
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+
+    monkeypatch.setattr(c, "_test_connection", lambda env, **_k: c.ConnectionCheck("network_error", "timed out", None))
+
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+        "Retry the connection check": "proceed",
+        "Proceed with these changes?": "y",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, interactive=True)
+
+    assert (tmp_path / ".mcp.json").exists()
+    assert "UNVERIFIED" in capsys.readouterr().out
+
+
+def test_main_interactive_network_error_retry_then_ok(monkeypatch, tmp_path: Path) -> None:
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+
+    results = iter(
+        [
+            c.ConnectionCheck("network_error", "timed out", None),
+            c.ConnectionCheck("ok", "", "Test User"),
+        ]
+    )
+    monkeypatch.setattr(c, "_test_connection", lambda env, **_k: next(results))
+
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+        "Retry the connection check": "retry",
+        "Proceed with these changes?": "y",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, interactive=True)
+
+    assert (tmp_path / ".mcp.json").exists()
+
+
+def test_main_interactive_network_error_edit_reenters_credentials(monkeypatch, tmp_path: Path) -> None:
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+
+    results = iter(
+        [
+            c.ConnectionCheck("network_error", "timed out", None),
+            c.ConnectionCheck("ok", "", "Test User"),
+        ]
+    )
+    monkeypatch.setattr(c, "_test_connection", lambda env, **_k: next(results))
+
+    # "edit" re-prompts every credential field from scratch, so each is asked twice.
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": ["", ""],
+        "Readable projects": ["", ""],
+        "Enable write access?": ["", ""],
+        "Retry the connection check": "edit",
+        "Proceed with these changes?": "y",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, interactive=True)
+
+    assert (tmp_path / ".mcp.json").exists()
+
+
+def test_main_interactive_auth_error_forces_credential_reentry_no_menu(monkeypatch, tmp_path: Path, capsys) -> None:
+    # Unlike network_error, a non-network error gets no retry/proceed/edit menu —
+    # it forces credential re-entry outright, never a silent proceed.
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+
+    results = iter(
+        [
+            c.ConnectionCheck("auth_error", "bad token", None),
+            c.ConnectionCheck("ok", "", "Test User"),
+        ]
+    )
+    monkeypatch.setattr(c, "_test_connection", lambda env, **_k: next(results))
+
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": ["", ""],
+        "Readable projects": ["", ""],
+        "Enable write access?": ["", ""],
+        "Proceed with these changes?": "y",
+    }
+    _run_main(monkeypatch, tmp_path, [claude], answers, interactive=True)
+
+    assert (tmp_path / ".mcp.json").exists()
+    out = capsys.readouterr().out
+    assert "Connection check failed" in out
+    assert "re-enter your credentials" in out
+
+
+def test_main_interactive_credentials_exhausted_aborts_without_writing(monkeypatch, tmp_path: Path) -> None:
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+
+    monkeypatch.setattr(c, "_test_connection", lambda env, **_k: c.ConnectionCheck("auth_error", "bad token", None))
+
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": ["", "", ""],
+        "Readable projects": ["", "", ""],
+        "Enable write access?": ["", "", ""],
+    }
+    with pytest.raises(SystemExit) as exc:
+        _run_main(monkeypatch, tmp_path, [claude], answers, interactive=True)
+    assert exc.value.code == 1
+    assert not (tmp_path / ".mcp.json").exists()
+
+
+# ── interactive auto-detection (must key on stdin alone, not stdout) ────────────
+
+
+def _run_main_autodetect(monkeypatch, tmp_path: Path, clients, answers, argv=(), secret="opapi-tok"):
+    """Like `_run_main`, but does NOT force `interactive=` — exercises `main()`'s
+    real `interactive=None` auto-detection path instead. Callers monkeypatch
+    `sys.stdin.isatty`/`sys.stdout.isatty` before calling this."""
+    monkeypatch.setattr(c, "_check_python", lambda: None)
+    monkeypatch.setattr(c, "_installed_mode", lambda: True)
+    monkeypatch.setattr(c, "_install_deps", lambda *a, **k: None)
+    monkeypatch.setattr(c, "_server_command", lambda installed: ("openproject-ce-mcp-server", True))
+    monkeypatch.setattr(c, "_clients", lambda: clients)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PWD", str(tmp_path))
+    book = _AnswerBook(answers)
+    monkeypatch.setattr("builtins.input", _input_with_token_fallback(book, secret))
+    monkeypatch.setattr(c.getpass, "getpass", lambda prompt="": secret)
+    c.main(list(argv))
+    return book
+
+
+def test_main_interactive_autodetect_ignores_redirected_stdout(monkeypatch, tmp_path: Path) -> None:
+    # P1 fix: piping stdout (e.g. `configure | tee log`) makes stdout.isatty()
+    # False even though a human is still typing at a real terminal — the old
+    # `stdin.isatty() and stdout.isatty()` check silently downgraded that
+    # session to non-interactive, skipping the connection test/preview/confirm
+    # the README promises can't be skipped. Detection must key on stdin alone.
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    monkeypatch.setattr(c, "_test_connection", lambda env, **_k: c.ConnectionCheck("ok", "", "Test User"))
+    monkeypatch.setattr(c.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(c.sys.stdout, "isatty", lambda: False)
+
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+        "Proceed with these changes?": "y",
+    }
+    book = _run_main_autodetect(monkeypatch, tmp_path, [claude], answers)
+
+    assert (tmp_path / ".mcp.json").exists()
+    book.assert_consumed()  # "Proceed with these changes?" WAS asked → stayed interactive
+
+
+def test_main_non_interactive_flag_forces_skip_even_with_real_stdin(monkeypatch, tmp_path: Path) -> None:
+    # The explicit --non-interactive opt-out (for scripted installs) must win
+    # even when a real terminal happens to be attached to stdin.
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    monkeypatch.setattr(c.sys.stdin, "isatty", lambda: True)
+
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code?": "y",
+        "OpenProject base URL": "",
+        "Readable projects": "",
+        "Enable write access?": "",
+    }
+    book = _run_main_autodetect(monkeypatch, tmp_path, [claude], answers, argv=["--non-interactive"])
+
+    assert (tmp_path / ".mcp.json").exists()
+    book.assert_consumed()  # no "Proceed with these changes?" key needed — never asked
+
+
+# ── _minimal_env (minimal-diff config writing) ──────────────────────────
+
+# Every optional field explicitly set to its own default's string form — proves
+# _minimal_env recognizes "explicitly set but equal to default" (not just
+# "absent"), which is the actually interesting case; a key that was never in
+# the dict at all trivially stays absent.
+_FULL_DEFAULT_ENV: dict[str, str] = {
+    "OPENPROJECT_BASE_URL": "https://op.example.com",
+    "OPENPROJECT_API_TOKEN": "tok",
+    "OPENPROJECT_READ_PROJECTS": "",
+    "OPENPROJECT_WRITE_PROJECTS": "",
+    "OPENPROJECT_ENABLE_PROJECT_READ": "true",
+    "OPENPROJECT_ENABLE_PROJECT_WRITE": "true",
+    "OPENPROJECT_ENABLE_WORK_PACKAGE_READ": "true",
+    "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE": "true",
+    "OPENPROJECT_ENABLE_MEMBERSHIP_READ": "true",
+    "OPENPROJECT_ENABLE_MEMBERSHIP_WRITE": "true",
+    "OPENPROJECT_ENABLE_VERSION_READ": "true",
+    "OPENPROJECT_ENABLE_VERSION_WRITE": "true",
+    "OPENPROJECT_ENABLE_BOARD_READ": "true",
+    "OPENPROJECT_ENABLE_BOARD_WRITE": "true",
+    "OPENPROJECT_ENABLE_MEETING_READ": "true",
+    "OPENPROJECT_ENABLE_MEETING_WRITE": "true",
+    "OPENPROJECT_ENABLE_PERSONAL_READ": "false",
+    "OPENPROJECT_ENABLE_PERSONAL_WRITE": "false",
+    "OPENPROJECT_ENABLE_ADMIN_READ": "false",
+    "OPENPROJECT_ENABLE_ADMIN_WRITE": "false",
+    "OPENPROJECT_ENABLE_USER_SCHEDULE_READ": "false",
+    "OPENPROJECT_ENABLE_USER_SCHEDULE_WRITE": "false",
+    "OPENPROJECT_ENABLE_EXTENDED_READ": "false",
+    "OPENPROJECT_HIDE_PROJECT_FIELDS": "",
+    "OPENPROJECT_HIDE_WORK_PACKAGE_FIELDS": "",
+    "OPENPROJECT_HIDE_ACTIVITY_FIELDS": "",
+    "OPENPROJECT_HIDE_CUSTOM_FIELDS": "",
+    "OPENPROJECT_ATTACHMENT_ROOT": "",
+    "OPENPROJECT_ATTACHMENT_CONTENT_MAX_BYTES": "5242880",
+    "OPENPROJECT_TIMEOUT": "12",
+    "OPENPROJECT_VERIFY_SSL": "true",
+    "OPENPROJECT_DEFAULT_PAGE_SIZE": "10",
+    "OPENPROJECT_MAX_PAGE_SIZE": "50",
+    "OPENPROJECT_MAX_RESULTS": "100",
+    "OPENPROJECT_TEXT_LIMIT": "500",
+    "OPENPROJECT_MAX_RETRIES": "3",
+    "OPENPROJECT_RETRY_BASE_DELAY": "1.0",
+    "OPENPROJECT_RETRY_MAX_DELAY": "60.0",
+    "OPENPROJECT_LOG_LEVEL": "WARNING",
+    "OPENPROJECT_LOG_FORMAT": "text",
+}
+
+
+def _minimal_env_for(env: dict[str, str]) -> dict[str, str]:
+    candidate = c.Settings.from_env(env)
+    return c._minimal_env(env, candidate)
+
+
+def test_minimal_env_all_defaults_keeps_only_base_url_and_token() -> None:
+    minimal = _minimal_env_for(dict(_FULL_DEFAULT_ENV))
+    assert minimal == {
+        "OPENPROJECT_BASE_URL": "https://op.example.com",
+        "OPENPROJECT_API_TOKEN": "tok",
+    }
+
+
+@pytest.mark.parametrize(
+    ("env_key", "deviated_value"),
+    [
+        ("OPENPROJECT_READ_PROJECTS", "DEMO"),
+        ("OPENPROJECT_WRITE_PROJECTS", "DEMO"),
+        ("OPENPROJECT_ENABLE_PERSONAL_READ", "true"),
+        ("OPENPROJECT_ENABLE_EXTENDED_READ", "true"),
+        ("OPENPROJECT_ENABLE_ADMIN_READ", "true"),
+        ("OPENPROJECT_HIDE_PROJECT_FIELDS", "description"),
+        ("OPENPROJECT_HIDE_WORK_PACKAGE_FIELDS", "description"),
+        ("OPENPROJECT_HIDE_ACTIVITY_FIELDS", "comment"),
+        ("OPENPROJECT_HIDE_CUSTOM_FIELDS", "budget"),
+        ("OPENPROJECT_ENABLE_PROJECT_WRITE", "false"),
+        ("OPENPROJECT_ENABLE_MEMBERSHIP_WRITE", "false"),
+        ("OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE", "false"),
+        ("OPENPROJECT_ENABLE_VERSION_WRITE", "false"),
+        ("OPENPROJECT_ENABLE_BOARD_WRITE", "false"),
+        ("OPENPROJECT_ATTACHMENT_ROOT", ATTACHMENT_ROOT),
+        ("OPENPROJECT_ATTACHMENT_CONTENT_MAX_BYTES", "1048576"),
+        ("OPENPROJECT_TIMEOUT", "20"),
+        ("OPENPROJECT_VERIFY_SSL", "false"),
+        ("OPENPROJECT_DEFAULT_PAGE_SIZE", "5"),
+        ("OPENPROJECT_MAX_PAGE_SIZE", "25"),
+        ("OPENPROJECT_MAX_RESULTS", "50"),
+        ("OPENPROJECT_TEXT_LIMIT", "250"),
+        ("OPENPROJECT_MAX_RETRIES", "4"),
+        ("OPENPROJECT_RETRY_BASE_DELAY", "0.5"),
+        ("OPENPROJECT_RETRY_MAX_DELAY", "10"),
+        ("OPENPROJECT_LOG_LEVEL", "INFO"),
+        ("OPENPROJECT_LOG_FORMAT", "json"),
+    ],
+)
+def test_minimal_env_keeps_a_single_deviated_key(env_key: str, deviated_value: str) -> None:
+    env = dict(_FULL_DEFAULT_ENV)
+    env[env_key] = deviated_value
+    minimal = _minimal_env_for(env)
+    assert minimal[env_key] == deviated_value
+    assert set(minimal) == {"OPENPROJECT_BASE_URL", "OPENPROJECT_API_TOKEN", env_key}
+
+
+@pytest.mark.parametrize(
+    ("read_key", "write_key"),
+    [
+        ("OPENPROJECT_ENABLE_PROJECT_READ", "OPENPROJECT_ENABLE_PROJECT_WRITE"),
+        ("OPENPROJECT_ENABLE_WORK_PACKAGE_READ", "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE"),
+        ("OPENPROJECT_ENABLE_MEMBERSHIP_READ", "OPENPROJECT_ENABLE_MEMBERSHIP_WRITE"),
+        ("OPENPROJECT_ENABLE_VERSION_READ", "OPENPROJECT_ENABLE_VERSION_WRITE"),
+        ("OPENPROJECT_ENABLE_BOARD_READ", "OPENPROJECT_ENABLE_BOARD_WRITE"),
+    ],
+)
+def test_minimal_env_keeps_read_flag_off_alongside_its_forced_write_flag(read_key: str, write_key: str) -> None:
+    # Disabling a core read flag (default true) forces its paired write flag
+    # (also default true) off too — Settings.from_env rejects write=true with
+    # read=false. Two keys deviate together, not a clean single-field case.
+    env = dict(_FULL_DEFAULT_ENV)
+    env[read_key] = "false"
+    env[write_key] = "false"
+    minimal = _minimal_env_for(env)
+    assert minimal[read_key] == "false"
+    assert minimal[write_key] == "false"
+    assert set(minimal) == {"OPENPROJECT_BASE_URL", "OPENPROJECT_API_TOKEN", read_key, write_key}
+
+
+def test_minimal_env_keeps_personal_write_alongside_its_required_read_flag() -> None:
+    # PERSONAL_WRITE=true is only valid with PERSONAL_READ=true (an AND-gate,
+    # since both default false, unlike the core-5 scopes) — not a clean
+    # single-field deviation, so it gets its own test rather than the
+    # parametrized one above.
+    env = dict(_FULL_DEFAULT_ENV)
+    env["OPENPROJECT_ENABLE_PERSONAL_READ"] = "true"
+    env["OPENPROJECT_ENABLE_PERSONAL_WRITE"] = "true"
+    minimal = _minimal_env_for(env)
+    assert minimal["OPENPROJECT_ENABLE_PERSONAL_READ"] == "true"
+    assert minimal["OPENPROJECT_ENABLE_PERSONAL_WRITE"] == "true"
+    assert set(minimal) == {
+        "OPENPROJECT_BASE_URL",
+        "OPENPROJECT_API_TOKEN",
+        "OPENPROJECT_ENABLE_PERSONAL_READ",
+        "OPENPROJECT_ENABLE_PERSONAL_WRITE",
+    }
+
+
+def test_minimal_env_keeps_admin_write_alongside_its_required_read_flag() -> None:
+    # ADMIN_WRITE=true is only valid with ADMIN_READ=true — same AND-gate
+    # shape as personal, so it gets its own test too.
+    env = dict(_FULL_DEFAULT_ENV)
+    env["OPENPROJECT_ENABLE_ADMIN_READ"] = "true"
+    env["OPENPROJECT_ENABLE_ADMIN_WRITE"] = "true"
+    minimal = _minimal_env_for(env)
+    assert minimal["OPENPROJECT_ENABLE_ADMIN_READ"] == "true"
+    assert minimal["OPENPROJECT_ENABLE_ADMIN_WRITE"] == "true"
+    assert set(minimal) == {
+        "OPENPROJECT_BASE_URL",
+        "OPENPROJECT_API_TOKEN",
+        "OPENPROJECT_ENABLE_ADMIN_READ",
+        "OPENPROJECT_ENABLE_ADMIN_WRITE",
+    }
+
+
+def test_minimal_env_keeps_original_string_not_a_reformatted_settings_value() -> None:
+    # "12.0" for a default-12.0 timeout must be recognized as "= default" (and
+    # omitted) — not written back as a differently-formatted "12".
+    env = dict(_FULL_DEFAULT_ENV)
+    env["OPENPROJECT_TIMEOUT"] = "12.0"
+    minimal = _minimal_env_for(env)
+    assert "OPENPROJECT_TIMEOUT" not in minimal
+
+    # A genuinely deviated float value is kept verbatim, not reformatted either.
+    env["OPENPROJECT_TIMEOUT"] = "20.50"
+    minimal = _minimal_env_for(env)
+    assert minimal["OPENPROJECT_TIMEOUT"] == "20.50"
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        _FULL_DEFAULT_ENV,
+        {**_FULL_DEFAULT_ENV, "OPENPROJECT_READ_PROJECTS": "DEMO, TEST", "OPENPROJECT_ENABLE_BOARD_WRITE": "false"},
+        {
+            **_FULL_DEFAULT_ENV,
+            "OPENPROJECT_ENABLE_PERSONAL_READ": "true",
+            "OPENPROJECT_ENABLE_EXTENDED_READ": "true",
+            "OPENPROJECT_ENABLE_ADMIN_READ": "true",
+            "OPENPROJECT_ENABLE_PERSONAL_WRITE": "true",
+            "OPENPROJECT_TIMEOUT": "30",
+            "OPENPROJECT_LOG_LEVEL": "ERROR",
+            "OPENPROJECT_LOG_FORMAT": "json",
+        },
+    ],
+)
+def test_minimal_env_round_trips_to_the_same_effective_settings(env: dict[str, str]) -> None:
+    # The real regression safety net: whatever _minimal_env trims away must
+    # never change the *effective* settings a later Settings.from_env resolves.
+    minimal = _minimal_env_for(dict(env))
+    original_settings = c.Settings.from_env(env)
+    minimal_settings = c.Settings.from_env(minimal)
+    for f in dataclasses.fields(c.Settings):
+        if f.name in ("base_url", "api_token"):
+            continue
+        assert getattr(original_settings, f.name) == getattr(minimal_settings, f.name), f.name
+
+
+# ── scope-pair key ordering (read/write config reorder) ────────────────────────
+
+# The full canonical order: project allowlists together, then each scope's
+# read immediately followed by its write, then the one read-only scope
+# (extended) with no write pendant, trailing. Every generator (the wizard's
+# `env` dict, `_MINIMAL_ENV_FIELD_MAP`, `.mcp.json.example`) must produce this
+# exact order for whichever of these keys it actually emits.
+_CANONICAL_SCOPE_KEY_ORDER: tuple[str, ...] = (
+    "OPENPROJECT_READ_PROJECTS",
+    "OPENPROJECT_WRITE_PROJECTS",
+    "OPENPROJECT_ENABLE_PROJECT_READ",
+    "OPENPROJECT_ENABLE_PROJECT_WRITE",
+    "OPENPROJECT_ENABLE_WORK_PACKAGE_READ",
+    "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE",
+    "OPENPROJECT_ENABLE_MEMBERSHIP_READ",
+    "OPENPROJECT_ENABLE_MEMBERSHIP_WRITE",
+    "OPENPROJECT_ENABLE_VERSION_READ",
+    "OPENPROJECT_ENABLE_VERSION_WRITE",
+    "OPENPROJECT_ENABLE_BOARD_READ",
+    "OPENPROJECT_ENABLE_BOARD_WRITE",
+    "OPENPROJECT_ENABLE_MEETING_READ",
+    "OPENPROJECT_ENABLE_MEETING_WRITE",
+    "OPENPROJECT_ENABLE_PERSONAL_READ",
+    "OPENPROJECT_ENABLE_PERSONAL_WRITE",
+    "OPENPROJECT_ENABLE_ADMIN_READ",
+    "OPENPROJECT_ENABLE_ADMIN_WRITE",
+    "OPENPROJECT_ENABLE_USER_SCHEDULE_READ",
+    "OPENPROJECT_ENABLE_USER_SCHEDULE_WRITE",
+    "OPENPROJECT_ENABLE_EXTENDED_READ",
+)
+
+# Deviates every single scope-pair key from its own default (the 6 core reads
+# and their writes forced off; personal/admin/user-schedule/extended forced
+# on; both project allowlists set) so every key in _CANONICAL_SCOPE_KEY_ORDER
+# actually survives minimal-diff writing — letting the assertion below be an
+# exact equality against the full canonical list, not just a subsequence check.
+_ALL_SCOPE_KEYS_DEVIATED_ANSWERS: dict[str, str] = {
+    "Configure globally": "n",
+    "Configure project-scoped": "y",
+    "OpenProject base URL": "",
+    "Readable projects": "*",
+    "Enable write access?": "y",
+    "Writable projects": "TST",
+    "Enable project tools?": "n",
+    "Enable project writes": "n",
+    "Enable work-package tools?": "n",
+    "Enable work-package writes": "n",
+    "Enable membership tools?": "n",
+    "Enable membership writes": "n",
+    "Enable version tools?": "n",
+    "Enable version writes": "n",
+    "Enable board tools?": "n",
+    "Enable board writes": "n",
+    "Enable meeting tools?": "n",
+    "Enable meeting writes": "n",
+    "Enable personal tools (own preferences, notifications)?": "y",
+    "Enable personal-data writes": "y",
+    "Enable admin tools (list/view users and groups)?": "y",
+    "Enable user-schedule tools (non-working times, working hours)?": "y",
+    "Enable extended/rarely-used metadata tools?": "y",
+    **_ADVANCED_ONLY_DEFAULTS,
+    "Enable admin writes": "y",
+    "Enable user-schedule writes": "y",
+}
+
+
+def _assert_scope_keys_in_canonical_order(env: Mapping[str, str]) -> None:
+    present = [key for key in _CANONICAL_SCOPE_KEY_ORDER if key in env]
+    # Every key was deliberately deviated from its default above, so all of
+    # them must have survived minimal-diff writing — this is an exact
+    # equality against the full list, not merely a subsequence check, so an
+    # unrelated key sitting between a pair (breaking true adjacency) would
+    # also be caught by comparing against list(env) filtered the same way.
+    assert present == list(_CANONICAL_SCOPE_KEY_ORDER)
+    actual_scope_keys = [key for key in env if key in _CANONICAL_SCOPE_KEY_ORDER]
+    assert actual_scope_keys == present
+
+
+def test_generated_json_config_orders_scope_pairs_canonically(monkeypatch, tmp_path: Path) -> None:
+    claude = _json_client(tmp_path / ".claude.json", project_target=tmp_path / ".mcp.json")
+    answers = {**_ALL_SCOPE_KEYS_DEVIATED_ANSWERS, "Configure Claude Code?": "y"}
+    _run_main(monkeypatch, tmp_path, [claude], answers, argv=["--advanced"])
+
+    data = json.loads((tmp_path / ".mcp.json").read_text())
+    env = data["mcpServers"]["openproject"]["env"]
+    _assert_scope_keys_in_canonical_order(env)
+
+
+def test_generated_toml_config_orders_scope_pairs_canonically(monkeypatch, tmp_path: Path) -> None:
+    codex = _codex_client(tmp_path / "config.toml", project_target=tmp_path / ".codex" / "config.toml")
+    answers = {**_ALL_SCOPE_KEYS_DEVIATED_ANSWERS, "Configure Codex?": "y"}
+    _run_main(monkeypatch, tmp_path, [codex], answers, argv=["--advanced"])
+
+    data = tomllib.loads((tmp_path / ".codex" / "config.toml").read_text())
+    env = data["mcp_servers"]["openproject"]["env"]
+    _assert_scope_keys_in_canonical_order(env)
+
+
+def test_minimal_env_orders_keys_canonically() -> None:
+    # Deviate one key per scope pair (plus both allowlists and extended) so
+    # _minimal_env's output can be checked against the exact canonical order,
+    # not just set equality.
+    env = dict(_FULL_DEFAULT_ENV)
+    env["OPENPROJECT_READ_PROJECTS"] = "DEMO"
+    env["OPENPROJECT_WRITE_PROJECTS"] = "DEMO"
+    env["OPENPROJECT_ENABLE_PROJECT_READ"] = "false"
+    env["OPENPROJECT_ENABLE_PROJECT_WRITE"] = "false"
+    env["OPENPROJECT_ENABLE_WORK_PACKAGE_READ"] = "false"
+    env["OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE"] = "false"
+    env["OPENPROJECT_ENABLE_MEMBERSHIP_READ"] = "false"
+    env["OPENPROJECT_ENABLE_MEMBERSHIP_WRITE"] = "false"
+    env["OPENPROJECT_ENABLE_VERSION_READ"] = "false"
+    env["OPENPROJECT_ENABLE_VERSION_WRITE"] = "false"
+    env["OPENPROJECT_ENABLE_BOARD_READ"] = "false"
+    env["OPENPROJECT_ENABLE_BOARD_WRITE"] = "false"
+    env["OPENPROJECT_ENABLE_MEETING_READ"] = "false"
+    env["OPENPROJECT_ENABLE_MEETING_WRITE"] = "false"
+    env["OPENPROJECT_ENABLE_PERSONAL_READ"] = "true"
+    env["OPENPROJECT_ENABLE_PERSONAL_WRITE"] = "true"
+    env["OPENPROJECT_ENABLE_ADMIN_READ"] = "true"
+    env["OPENPROJECT_ENABLE_ADMIN_WRITE"] = "true"
+    env["OPENPROJECT_ENABLE_USER_SCHEDULE_READ"] = "true"
+    env["OPENPROJECT_ENABLE_USER_SCHEDULE_WRITE"] = "true"
+    env["OPENPROJECT_ENABLE_EXTENDED_READ"] = "true"
+
+    minimal = _minimal_env_for(env)
+    present = [key for key in _CANONICAL_SCOPE_KEY_ORDER if key in minimal]
+    assert present == list(_CANONICAL_SCOPE_KEY_ORDER)
+    actual_scope_keys = [key for key in minimal if key in _CANONICAL_SCOPE_KEY_ORDER]
+    assert actual_scope_keys == present
+
+
+# ── Real _clients() end-to-end, not the mock Client fixtures above ─────────────
+
+
+def test_configure_writes_valid_project_scoped_config_for_every_real_client(monkeypatch, tmp_path: Path) -> None:
+    """Drives the actual `_clients()` definitions (not the `_json_client`/
+    `_toml_client` mock fixtures every other test in this file uses) through a
+    real project-scoped `main()` run, then structurally validates every file
+    it writes against that client's real format (JSON or TOML) and the
+    top-level key/table this project's own docs promise for each client.
+
+    Every other test in this file proves the wizard's *logic*
+    against synthetic clients; this one proves the wizard's output is valid
+    for the four real, currently-documented, project-scoped-capable clients
+    all at once, in one real run, the way a user actually experiences it.
+    Claude Desktop is excluded: `project_target=None` in its real `_clients()`
+    entry (global-only, matching its own real-world config model), so it has
+    no project-scoped file to validate here.
+
+    Both `.target` (e.g. ~/.codex/config.toml, ~/.claude.json) and
+    `.project_target` (e.g. cwd/.mcp.json) are live, real paths on the
+    machine running this test, and BOTH are computed eagerly, once, at
+    `_clients()`-construction time (`_home()` for the former,
+    `_project_cwd()` -- which reads $PWD -- for the latter) -- never
+    resolved lazily on access. `_home` and $PWD/cwd must therefore both be
+    patched BEFORE `_clients()` is ever called, not just before `main()`.
+    Getting this wrong doesn't just risk a harmless read: an earlier version
+    of this test patched $PWD/cwd only via `monkeypatch.chdir`/`setenv`
+    *after* already calling the real `_clients()` (to build the
+    `project_capable` assertion below) and then pinned `c._clients` to
+    return that already-built, stale-cwd list -- which made `main()`
+    genuinely overwrite this repo checkout's own real `.mcp.json`,
+    `.codex/config.toml`, `.vscode/mcp.json`, and `.cursor/mcp.json` on a
+    live run of this test (caught, and the checkout's working tree restored,
+    2026-09-05 -- see git history around that date for the incident). Every
+    real client's own detection is also forced deterministically True here,
+    so answers don't depend on what's actually installed on the host, and
+    the global gate's "n" branch doesn't fall into `_offer_removal` reading
+    real global configs the developer running the suite happens to have.
+    """
+    monkeypatch.setattr(c, "_home", lambda: tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PWD", str(tmp_path))
+    real_clients = c._clients()
+    for client in real_clients:
+        client._detect = lambda: True
+    project_capable = [client for client in real_clients if client.project_target is not None]
+    # Fails loudly (not silently under-testing) if a future _clients() change
+    # removes project-scoped support from one of the five without anyone
+    # noticing here.
+    assert {client.key for client in project_capable} == {"claude-code", "codex", "vscode", "cursor"}
+    for client in project_capable:
+        assert client.project_target is not None
+        assert client.project_target.is_relative_to(tmp_path), (
+            f"{client.key}.project_target {client.project_target} escaped tmp_path -- would write into a real directory"
+        )
+
+    monkeypatch.setattr(c, "_clients", lambda: real_clients)
+    monkeypatch.setattr(c, "_check_python", lambda: None)
+    monkeypatch.setattr(c, "_installed_mode", lambda: True)
+    monkeypatch.setattr(c, "_install_deps", lambda *a, **k: None)
+    monkeypatch.setattr(c, "_server_command", lambda installed: ("openproject-ce-mcp-server", True))
+    answers = {
+        "Configure globally": "n",
+        "Configure project-scoped": "y",
+        "Configure Claude Code": "y",
+        "Configure Codex": "y",
+        "Configure VS Code": "y",
+        "Configure Cursor": "y",
+        "OpenProject base URL": "https://op.example.com",
+        "Readable projects": "DEMO, TEST",
+        "Enable write access?": "n",
+    }
+    book = _AnswerBook(answers)
+    monkeypatch.setattr("builtins.input", _input_with_token_fallback(book, "opapi-real-client-check"))
+    monkeypatch.setattr(c.getpass, "getpass", lambda prompt="": "opapi-real-client-check")
+    c.main([], interactive=False)
+    book.assert_consumed()
+
+    # Claude Code: .mcp.json, {"mcpServers": {"openproject": {...}}}
+    mcp_json = json.loads((tmp_path / ".mcp.json").read_text())
+    openproject_entry = mcp_json["mcpServers"]["openproject"]
+    assert openproject_entry["env"]["OPENPROJECT_BASE_URL"] == "https://op.example.com"
+    assert openproject_entry["env"]["OPENPROJECT_API_TOKEN"] == "opapi-real-client-check"
+
+    # Codex: .codex/config.toml, [mcp_servers.openproject]
+    codex_toml = tomllib.loads((tmp_path / ".codex" / "config.toml").read_text())
+    codex_entry = codex_toml["mcp_servers"]["openproject"]
+    assert codex_entry["env"]["OPENPROJECT_BASE_URL"] == "https://op.example.com"
+
+    # VS Code: .vscode/mcp.json, {"servers": {"openproject": {...}}} (not
+    # "mcpServers" -- VS Code's own top-level key differs from every other
+    # client here, per this project's own root_key="servers" in _clients()).
+    vscode_json = json.loads((tmp_path / ".vscode" / "mcp.json").read_text())
+    vscode_entry = vscode_json["servers"]["openproject"]
+    assert vscode_entry["env"]["OPENPROJECT_BASE_URL"] == "https://op.example.com"
+
+    # Cursor: .cursor/mcp.json, {"mcpServers": {"openproject": {...}}}
+    cursor_json = json.loads((tmp_path / ".cursor" / "mcp.json").read_text())
+    cursor_entry = cursor_json["mcpServers"]["openproject"]
+    assert cursor_entry["env"]["OPENPROJECT_BASE_URL"] == "https://op.example.com"
+
+    # Every written env carries the same scope answer -- proves the same
+    # collected answers reached all four writers identically, not just that
+    # each file independently parses.
+    for entry in (openproject_entry, codex_entry, vscode_entry, cursor_entry):
+        assert entry["env"]["OPENPROJECT_READ_PROJECTS"] == "DEMO, TEST"
+
+
+def test_configure_writes_valid_global_config_for_claude_desktop(monkeypatch, tmp_path: Path) -> None:
+    """Companion to the project-scoped real-client test above: Claude Desktop
+    is `project_target=None` (global-only) in the real `_clients()` list, so
+    it is the one real client never exercised by that test. Drives the real
+    `_clients()` definition through a real global-only `main()` run, patching
+    `_home` -- the same safe, already-established hook every other
+    global-scope test in this file uses (see e.g.
+    test_main_global_only_writes_no_mcp_json) -- rather than touching the
+    real per-user Application Support directory.
+    """
+    # _home must be patched BEFORE _clients() is ever called: Client.target for
+    # claude-desktop is computed eagerly, once, from _claude_desktop_path() ->
+    # _platform_config_root() -> _home() at _clients()-construction time, not
+    # resolved lazily on access. Patching _home afterwards would leave the
+    # already-built claude_desktop.target pointing at the real, live
+    # ~/Library/Application Support/Claude/claude_desktop_config.json.
+    # Also pin cwd/$PWD to tmp_path, defense-in-depth: every OTHER real
+    # client's project_target (claude-code, codex, vscode, cursor) is still
+    # eagerly computed from the real launch directory unless this is patched
+    # too, and only this test's own control-flow reasoning (global-only
+    # answers never reach a project-scoped write) keeps that from mattering
+    # -- reasoning that already broke once for the project-scoped test above
+    # (see its docstring). Pinning cwd/$PWD here removes the need to trust
+    # that reasoning at all.
+    monkeypatch.setattr(c, "_home", lambda: tmp_path)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "AppData" / "Roaming"))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PWD", str(tmp_path))
+    real_clients_probe = c._clients()
+    claude_desktop_probe = next(client for client in real_clients_probe if client.key == "claude-desktop")
+    assert claude_desktop_probe.project_target is None
+    desktop_target = c._claude_desktop_path()
+    assert claude_desktop_probe.target == desktop_target
+    assert desktop_target.is_relative_to(tmp_path), f"claude-desktop.target {desktop_target} escaped tmp_path"
+    for client in real_clients_probe:
+        if client.project_target is not None:
+            assert client.project_target.is_relative_to(tmp_path), (
+                f"{client.key}.project_target {client.project_target} escaped tmp_path"
+            )
+
+    real_clients_factory = c._clients
+
+    def _clients_claude_desktop_only() -> list[c.Client]:
+        # _run_configure() calls c._clients() itself, fresh -- it does not
+        # reuse any list built here, so patching instances from a locally-held
+        # list would be silently ineffective. Wrapping the factory instead
+        # forces every OTHER real client undetected so only Claude Desktop is
+        # offered, isolating this test to the one client under test (this dev
+        # machine has Claude Code/Codex actually installed, so their real
+        # _detect() would otherwise also fire and the wizard would ask about
+        # them too).
+        built = real_clients_factory()
+        for client in built:
+            if client.key != "claude-desktop":
+                client._detect = lambda: False
+            else:
+                client._detect = lambda: True
+        return built
+
+    monkeypatch.setattr(c, "_clients", _clients_claude_desktop_only)
+    monkeypatch.setattr(c, "_check_python", lambda: None)
+    monkeypatch.setattr(c, "_installed_mode", lambda: True)
+    monkeypatch.setattr(c, "_install_deps", lambda *a, **k: None)
+    monkeypatch.setattr(c, "_server_command", lambda installed: ("openproject-ce-mcp-server", True))
+    answers = {
+        "Configure globally": "y",
+        "Configure Claude Desktop app?": "y",
+        "OpenProject base URL": "https://op.example.com",
+        "Readable projects": "DEMO, TEST",
+        "Enable write access?": "n",
+    }
+    book = _AnswerBook(answers)
+    monkeypatch.setattr("builtins.input", _input_with_token_fallback(book, "opapi-desktop-check"))
+    monkeypatch.setattr(c.getpass, "getpass", lambda prompt="": "opapi-desktop-check")
+    c.main([], interactive=False)
+    book.assert_consumed()
+
+    data = json.loads(desktop_target.read_text())
+    entry = data["mcpServers"]["openproject"]
+    assert entry["env"]["OPENPROJECT_BASE_URL"] == "https://op.example.com"
+    assert entry["env"]["OPENPROJECT_API_TOKEN"] == "opapi-desktop-check"
+    assert entry["env"]["OPENPROJECT_READ_PROJECTS"] == "DEMO, TEST"

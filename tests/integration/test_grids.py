@@ -1,0 +1,245 @@
+"""Integration tests for grid CRUD operations.
+
+Uses scope="/my/page" (the personal-dashboard carve-out) rather than a
+project-scoped href -- it's writable for create/update regardless of
+OPENPROJECT_WRITE_PROJECTS and needs no project resolution, keeping this
+test independent of the test project's own configuration. Deletion is a
+different story -- see test_create_get_update_delete_grid's delete step.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+
+import pytest
+
+from openproject_ce_mcp_server.client import InvalidInputError, OpenProjectClient, PermissionDeniedError
+
+from .conftest import disposable_project_identifier
+
+pytestmark = pytest.mark.integration
+
+
+async def test_list_grids(client: OpenProjectClient, grid_ids: list[int]) -> None:
+    # A brand-new instance genuinely has zero grids until one is visited/
+    # created (a project overview grid is not seeded at project creation) --
+    # create one instead of assuming pre-existing state.
+    created = await client.grid.create(name="[integration-test] list probe", scope="/my/page", confirm=True)
+    assert created.ready, created.validation_errors
+    assert created.grid_id is not None
+    grid_ids.append(created.grid_id)
+
+    result = await client.grid.list()
+    assert result is not None
+    assert result.count > 0
+    assert result.results[0].scope
+
+
+async def test_create_get_update_delete_grid(client: OpenProjectClient, grid_ids: list[int]) -> None:
+    # Create
+    result = await client.grid.create(
+        name="[integration-test] grid",
+        scope="/my/page",
+        row_count=4,
+        column_count=6,
+        confirm=True,
+    )
+    assert result.ready, result.validation_errors
+    grid_id = result.grid_id
+    assert grid_id is not None and grid_id > 0
+    grid_ids.append(grid_id)
+
+    # Read
+    grid = await client.grid.get(grid_id)
+    assert grid.id == grid_id
+    assert grid.scope == "/my/page"
+
+    # Update
+    update_result = await client.grid.update(
+        grid_id=grid_id,
+        row_count=5,
+        confirm=True,
+    )
+    assert update_result.ready, update_result.validation_errors
+
+    updated = await client.grid.get(grid_id)
+    assert updated.row_count == 5
+
+    # Delete -- OpenProject rejects deletion of /my/page grids for every user,
+    # including admin (verified against OpenProject's own API implementation:
+    # Grids::Grid#user_deletable? is hardcoded false, Grids::MyPage never
+    # overrides it, and Grids::DeleteContract's delete_permission requires
+    # model.user_deletable? -- only Boards::Grid overrides it to true). There
+    # is no API path that deletes a /my/page grid; this grid is intentionally
+    # left behind, same as every prior run of this test, not a cleanup gap.
+    with pytest.raises(PermissionDeniedError):
+        await client.grid.delete(grid_id=grid_id, confirm=True)
+
+
+async def test_update_grid_changes_dimensions(client: OpenProjectClient, project_refs: list[str]) -> None:
+    """update_grid POSTs grids/{id}/form then PATCHes grids/{id}. Uses a
+    freshly created, disposable project
+    for the grid's scope: OpenProject only allows one grid per scope, and
+    test_project already has one (its own overview dashboard), so creating a
+    second grid there fails with "Scope has already been taken". Cleanup of
+    the grid itself happens implicitly when project_refs deletes the project
+    (not via the grid_ids fixture, since that fixture's client is scoped only
+    to test_project's write allowlist, not this disposable project)."""
+    unrestricted_settings = dataclasses.replace(client.settings, read_projects=("*",), write_projects=("*",))
+    unrestricted_client = OpenProjectClient(unrestricted_settings)
+    await unrestricted_client.initialize()
+
+    new_identifier = disposable_project_identifier()
+    create_project_result = await unrestricted_client.project.create(
+        name=f"[integration-test] {new_identifier}", identifier=new_identifier, confirm=True
+    )
+    assert create_project_result.ready, create_project_result.validation_errors
+    project_refs.append(new_identifier)
+
+    # rowCount/columnCount must be large enough to contain the server's
+    # default project-overview widget layout (spans rows 1-4, columns 1-3) or
+    # the form rejects the create with a widget-constraint validation error.
+    create_result = await unrestricted_client.grid.create(
+        name=f"[integration-test] {new_identifier}",
+        scope=f"/projects/{new_identifier}",
+        row_count=4,
+        column_count=3,
+        confirm=True,
+    )
+    assert create_result.ready, create_result.validation_errors
+    grid_id = create_result.grid_id
+    assert grid_id is not None
+
+    updated = await unrestricted_client.grid.update(grid_id=grid_id, row_count=5, column_count=4, confirm=True)
+    assert updated.state == "confirmed"
+    assert updated.result is not None
+    assert updated.result.row_count == 5
+    assert updated.result.column_count == 4
+
+
+async def test_create_grid_rejects_hidden_name_field(client: OpenProjectClient, test_project: str) -> None:
+    """Regression: create_grid/update_grid bypassed OPENPROJECT_HIDE_GRID_FIELDS
+    entirely on writes -- the "grid" entity was missing from
+    HIDE_FIELD_ENV_BY_ENTITY altogether, so no grid field could ever be
+    hidden on a write, unlike every other write-capable entity."""
+    hidden_settings = dataclasses.replace(client.settings, hidden_fields={"grid": ("name",)})
+    hidden_client = OpenProjectClient(hidden_settings)
+    await hidden_client.initialize()
+
+    with pytest.raises(InvalidInputError, match="OPENPROJECT_HIDE_GRID_FIELDS"):
+        await hidden_client.grid.create(
+            name="[integration-test] hidden field",
+            scope=f"/projects/{test_project}",
+            confirm=False,
+        )
+
+
+async def test_create_update_delete_grid_denied_outside_write_allowlist(
+    client: OpenProjectClient, project_refs: list[str]
+) -> None:
+    """Must use a project-scoped grid, not /my/page -- ensure_grid_allowed
+    (grid_policy.py) deliberately bypasses the allowlist entirely for
+    /my/page, so a /my/page grid would prove nothing about allowlist
+    enforcement here.
+
+    Also must NOT reuse the shared denied_client fixture directly: creating
+    the grid in a freshly created, disposable project (required because
+    OpenProject only allows one grid per scope, and test_project's own
+    dashboard grid already occupies that scope) means the target project is
+    outside denied_client's READ scope too (only test_project is readable),
+    and ensure_project_write_link_allowed (scope.py) runs the READ-allowlist
+    check first -- so a denied_client-based test would raise
+    PermissionDeniedError from the wrong (read) gate before ever reaching
+    the write-allowlist check this test is meant to exercise. This
+    purpose-built client keeps read wide open (`*`) while restricting only
+    the write allowlist to a non-matching identifier, so the denial reliably
+    comes from the write gate.
+    """
+    write_denied_settings = dataclasses.replace(
+        client.settings,
+        read_projects=("*",),
+        write_projects=("no-such-project-for-integration-tests",),
+    )
+    write_denied_client = OpenProjectClient(write_denied_settings)
+    await write_denied_client.initialize()
+
+    unrestricted_settings = dataclasses.replace(client.settings, read_projects=("*",), write_projects=("*",))
+    unrestricted_client = OpenProjectClient(unrestricted_settings)
+    await unrestricted_client.initialize()
+
+    new_identifier = disposable_project_identifier()
+    create_project_result = await unrestricted_client.project.create(
+        name=f"[integration-test] {new_identifier}", identifier=new_identifier, confirm=True
+    )
+    assert create_project_result.ready, create_project_result.validation_errors
+    project_refs.append(new_identifier)
+
+    with pytest.raises(PermissionDeniedError):
+        await write_denied_client.grid.create(
+            name=f"[integration-test] {new_identifier}",
+            scope=f"/projects/{new_identifier}",
+            row_count=4,
+            column_count=3,
+            confirm=True,
+        )
+
+    created = await unrestricted_client.grid.create(
+        name=f"[integration-test] {new_identifier} existing",
+        scope=f"/projects/{new_identifier}",
+        row_count=4,
+        column_count=3,
+        confirm=True,
+    )
+    assert created.ready, created.validation_errors
+    grid_id = created.grid_id
+    assert grid_id is not None
+
+    with pytest.raises(PermissionDeniedError):
+        await write_denied_client.grid.update(grid_id=grid_id, row_count=5, confirm=True)
+
+    with pytest.raises(PermissionDeniedError):
+        await write_denied_client.grid.delete(grid_id=grid_id, confirm=True)
+
+
+async def test_list_grids_paginates_beyond_a_single_page(client: OpenProjectClient) -> None:
+    """Regression: list_grids never sent offset/pageSize to OpenProject at
+    all (always requesting the server's own default page), so a limit
+    smaller than the total available grids silently returned everything the
+    server happened to include in that first page rather than genuinely
+    paginating. OpenProject only allows one grid per scope, so this relies
+    on the instance's pre-existing grids (dashboards/project overviews are
+    themselves grids) rather than creating multiple new ones."""
+    unfiltered = await client.grid.list(limit=100)
+    if unfiltered.total < 2:
+        pytest.skip("Not enough grids on this instance to prove pagination")
+
+    first_page = await client.grid.list(limit=1)
+    assert first_page.count == 1
+    assert first_page.truncated
+    assert first_page.next_offset == 2
+
+    second_page = await client.grid.list(limit=1, offset=2)
+    assert second_page.count == 1
+    assert second_page.results[0].id != first_page.results[0].id
+
+
+async def test_a_projects_boards_page_grid_is_matched_by_its_project(start_scoped_client) -> None:
+    """A boards page grid's scope is /projects/<identifier>/boards; a restrictive
+    allowlist naming that project, by identifier or by name, must reach it."""
+    unrestricted = await start_scoped_client(read_projects=("*",), write_projects=("*",))
+    grids = await unrestricted.grid.list(limit=100)
+    boards_grids = [grid for grid in grids.results if grid.scope and grid.scope.endswith("/boards")]
+    if not boards_grids:
+        pytest.skip("this instance has no boards page grid")
+    target = boards_grids[0]
+    identifier = target.scope.split("/")[-2]
+    project = await unrestricted.project.get(identifier)
+
+    for allowlist in ((identifier,), (project.name,)):
+        scoped = await start_scoped_client(read_projects=allowlist, write_projects=allowlist)
+        assert (await scoped.grid.get(target.id)).id == target.id
+        assert target.id in [grid.id for grid in (await scoped.grid.list(limit=100)).results]
+
+    elsewhere = await start_scoped_client(read_projects=("no-such-project",), write_projects=("no-such-project",))
+    with pytest.raises(PermissionDeniedError):
+        await elsewhere.grid.get(target.id)

@@ -1,0 +1,253 @@
+"""Application Service for the Groups domain.
+
+Depends on the GroupApi Protocol, never HttpxGroupApi concretely (enforced
+by the architecture-boundary test). No `ProjectRefResolver`: Groups have no
+project concept at all, following `RoleService`'s/`UserService`'s
+zero-Resolver template. No dedicated policy file: nothing here needs
+client-side project-link filtering.
+
+`list_groups()` needs BOTH `pagination.paginate_server` (no-search branch)
+and `pagination.paginate_client` (search branch, over-fetch-then-filter),
+byte-identical to `list_users`'s structure but filtering only on `name`
+(Groups has no login/email fields to search).
+
+`create()`/`update()` have NO form endpoint -- modeled on `NewsService`'s
+no-form write shape (build the payload dict directly, no validation-errors
+branch) rather than `UserService`'s form-based flow. `GroupWriteResult.result`
+is typed `GroupSummary`, not `GroupDetail`.
+
+`update()`'s member diff (`add_user_ids`/`remove_user_ids`) is a genuine
+behavioral requirement, not incidental structure: the `PATCH groups/{id}`
+endpoint requires a COMPLETE `_links.members` array, not a delta -- no
+add/remove operation exists. This Service fetches the current membership via
+`self._api.get_member_ids()` (a raw href->id extraction the Adapter exposes
+separately from `get_group()`, since `GroupDetail.members` only carries
+display names, not ids), computes `current | add - remove` in Python, and
+builds the full replacement list.
+
+`create()`/`update()`/`delete()` all check `access.ensure_write_enabled(
+"admin", ...)` UNCONDITIONALLY (not gated inside the confirm branch), even
+though `update()` has a prior GET (for the member diff) it could otherwise
+gate on the way `NewsService.update()` gates on its own prior GET. This means
+a caller without `OPENPROJECT_ENABLE_ADMIN_WRITE` is rejected immediately on
+`update()`, even for a pure preview, and can never see a member-diff preview
+-- deliberate, not News' more-permissive-preview pattern. Wired via
+`_finalize_write`'s `gate_before_preview=True` (OPM-2705), same as Storage and
+User.delete().
+
+`create()`/`update()` call `hidden_fields.ensure_field_writable("group",
+<field>, ...)` for every field they write ("name", "members"), matching
+every other full-CRUD sibling's write-hardening.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ...config import Settings
+from ...models import GroupDetail, GroupListResult, GroupSummary, GroupWriteResult
+from ..api_href import api_href as _api_href
+from ..pagination import effective_limit as _effective_limit
+from ..pagination import paginate_server, scan_records_and_paginate
+from ..policies import access, hidden_fields
+from ..ports.group_api import GroupApi
+from ._write_outcome import _finalize_write, _WriteOutcome
+
+
+class GroupService:
+    def __init__(self, *, api: GroupApi, settings: Settings, api_prefix: str) -> None:
+        self._api = api
+        self._settings = settings
+        self._api_prefix = api_prefix
+
+    def _stamp(self, value: Any) -> Any:
+        return hidden_fields.apply_hidden_fields("group", value, settings=self._settings)
+
+    async def list_groups(
+        self, *, search: str | None = None, offset: int = 1, limit: int | None = None
+    ) -> GroupListResult:
+        access.ensure_read_enabled("admin", settings=self._settings)
+        effective_limit = _effective_limit(limit, settings=self._settings)
+
+        if search is not None:
+            search_key = search.casefold()
+
+            def _record_matches(record: Any) -> bool:
+                return search_key in (record.summary.name or "").casefold()
+
+            # No server-side name filter exists for /groups, so scan every
+            # server page (Groups is genuinely OffsetPaginatedCollection
+            # server-side, verified against OpenProject's own API
+            # implementation) instead of trusting the server's pre-filter
+            # total.
+            raw_items, truncated = await scan_records_and_paginate(
+                lambda o, ps: self._api.list_groups(offset=o, page_size=ps),
+                item_allowed=_record_matches,
+                server_page_size=self._settings.max_page_size,
+                offset=offset,
+                limit=effective_limit,
+                key=lambda r: r.summary.id,
+            )
+            results = [self._stamp(record.summary) for record in raw_items]
+            total = len(results)
+            return GroupListResult(
+                offset=offset,
+                limit=effective_limit,
+                total=total,
+                count=total,
+                next_offset=offset + 1 if truncated else None,
+                truncated=truncated,
+                results=results,
+            )
+
+        records, total = await self._api.list_groups(offset=offset, page_size=effective_limit)
+        results = [self._stamp(record.summary) for record in records]
+        next_offset, truncated = paginate_server(offset=offset, limit=effective_limit, total=total)
+        return GroupListResult(
+            offset=offset,
+            limit=effective_limit,
+            total=total,
+            count=len(results),
+            next_offset=next_offset,
+            truncated=truncated,
+            results=results,
+        )
+
+    async def get_group(self, group_id: int) -> GroupDetail:
+        access.ensure_read_enabled("admin", settings=self._settings)
+        record = await self._api.get_group(group_id)
+        return self._stamp(record.to_detail())
+
+    async def create(self, *, name: str, user_ids: list[int] | None = None, confirm: bool = False) -> GroupWriteResult:
+        # Checked unconditionally, before any field validation -- there is no
+        # prior GET here to gate an unauthorized preview request on, so this
+        # explicit pre-check is the only thing standing between a disabled
+        # ADMIN_WRITE and a caller with a hidden "name"/"members" field
+        # getting [VALIDATION_FAILED] instead of the correct
+        # [CAPABILITY_DISABLED] -- same shape as update()'s own pre-check
+        # below; `_finalize_write`'s own `gate_before_preview` re-check is
+        # then a harmless no-I/O redundant check.
+        access.ensure_write_enabled("admin", settings=self._settings)
+        hidden_fields.ensure_field_writable("group", "name", settings=self._settings)
+        body: dict[str, Any] = {"name": name}
+        if user_ids:
+            hidden_fields.ensure_field_writable("group", "members", settings=self._settings)
+            body["_links"] = {
+                "members": [{"href": _api_href(f"users/{uid}", api_prefix=self._api_prefix)} for uid in user_ids]
+            }
+        payload_preview: dict[str, Any] = {"name": name, "user_ids": user_ids or []}
+
+        async def _commit(p: dict[str, Any]) -> GroupSummary:
+            return self._stamp(await self._api.commit_create(body))  # type: ignore[no-any-return]
+
+        outcome = await _finalize_write(
+            confirm=confirm,
+            payload=payload_preview,
+            validation_errors={},
+            identity={"group_id": None},
+            ensure_write_enabled=lambda: access.ensure_write_enabled("admin", settings=self._settings),
+            commit=_commit,
+            committed_identity=lambda d: {"group_id": d.id},
+            rejected_message="",
+            preview_message="OpenProject is ready to create the group. Ask for confirmation, then call again with confirm=true.",
+            success_message="Group created successfully.",
+            gate_before_preview=True,
+        )
+        return self._to_write_result("create", outcome)
+
+    async def update(
+        self,
+        group_id: int,
+        *,
+        name: str | None = None,
+        add_user_ids: list[int] | None = None,
+        remove_user_ids: list[int] | None = None,
+        confirm: bool = False,
+    ) -> GroupWriteResult:
+        # Checked unconditionally, even though a prior GET already happens
+        # below for the member diff. See this module's docstring for the
+        # resulting preview-visibility tradeoff. Must fire before that GET,
+        # so this is an explicit pre-check -- `_finalize_write`'s own
+        # `gate_before_preview` re-check below is then a harmless no-I/O
+        # redundant check (ensure_write_enabled is a pure settings read).
+        access.ensure_write_enabled("admin", settings=self._settings)
+        body: dict[str, Any] = {}
+        if name is not None:
+            hidden_fields.ensure_field_writable("group", "name", settings=self._settings)
+            body["name"] = name
+        # The groups PATCH endpoint requires a complete members list (full
+        # replacement, not delta). Fetch current members and compute the new
+        # complete set from the add/remove requests -- a genuine behavioral
+        # requirement to preserve, not incidental structure to simplify away.
+        if add_user_ids or remove_user_ids:
+            hidden_fields.ensure_field_writable("group", "members", settings=self._settings)
+            current_ids = await self._api.get_member_ids(group_id)
+            new_ids = current_ids.copy()
+            if add_user_ids:
+                new_ids.update(add_user_ids)
+            if remove_user_ids:
+                new_ids -= set(remove_user_ids)
+            body["_links"] = {
+                "members": [{"href": _api_href(f"users/{uid}", api_prefix=self._api_prefix)} for uid in sorted(new_ids)]
+            }
+
+        payload_preview: dict[str, Any] = {}
+        if name is not None:
+            payload_preview["name"] = name
+        if add_user_ids:
+            payload_preview["add_user_ids"] = add_user_ids
+        if remove_user_ids:
+            payload_preview["remove_user_ids"] = remove_user_ids
+
+        async def _commit(p: dict[str, Any]) -> GroupSummary:
+            return self._stamp(await self._api.commit_update(group_id, body))  # type: ignore[no-any-return]
+
+        outcome = await _finalize_write(
+            confirm=confirm,
+            payload=payload_preview,
+            validation_errors={},
+            identity={"group_id": group_id},
+            ensure_write_enabled=lambda: access.ensure_write_enabled("admin", settings=self._settings),
+            commit=_commit,
+            committed_identity=lambda d: {"group_id": d.id},
+            rejected_message="",
+            preview_message="OpenProject is ready to update the group. Ask for confirmation, then call again with confirm=true.",
+            success_message="Group updated successfully.",
+            gate_before_preview=True,
+        )
+        return self._to_write_result("update", outcome)
+
+    async def delete(self, group_id: int, *, confirm: bool = False) -> GroupWriteResult:
+        # No detail fetched on either branch -- delete's commit callable
+        # returns None, matching the pre-existing result=None shape.
+        payload = {"id": group_id}
+
+        async def _commit(p: dict[str, Any]) -> None:
+            await self._api.commit_delete(group_id)
+
+        outcome = await _finalize_write(
+            confirm=confirm,
+            payload=payload,
+            validation_errors={},
+            identity={"group_id": group_id},
+            ensure_write_enabled=lambda: access.ensure_write_enabled("admin", settings=self._settings),
+            commit=_commit,
+            committed_identity=lambda d: {"group_id": group_id},
+            rejected_message="",
+            preview_message="OpenProject is ready to delete the group. Ask for confirmation, then call again with confirm=true.",
+            success_message="Group deleted successfully.",
+            gate_before_preview=True,
+        )
+        return self._to_write_result("delete", outcome)
+
+    def _to_write_result(self, action: str, outcome: _WriteOutcome[GroupSummary | None]) -> GroupWriteResult:
+        return GroupWriteResult(
+            action=action,
+            state=outcome.state,
+            ready=outcome.ready,
+            message=outcome.message,
+            payload=outcome.payload,
+            validation_errors=outcome.validation_errors,
+            result=outcome.detail,
+            **outcome.identity,
+        )

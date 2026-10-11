@@ -1,0 +1,186 @@
+"""Application Service for the Sprints (Backlogs) domain.
+
+Depends on the SprintApi Protocol, never HttpxSprintApi concretely (enforced
+by the architecture-boundary test). This Service's only id-bearing tool,
+`get_sprint`, takes a `sprint_id` that is always a numeric value already
+validated by tools_sprints.py -- no dedicated Resolver is needed here,
+mirroring Views/Categories/Wiki Pages (list_sprints takes no sprint id at
+all; `list_backlog_buckets`/`get_backlog_bucket` are a separate domain
+served by `BacklogBucketService`, not this Service). A SEPARATE
+`SprintResolver` (`app/resolvers/sprint_resolver.py`) does exist for the
+work-package write path, where `update_work_package`/`bulk_update_work_packages`
+accept a sprint by NAME, not id -- `OpenProjectClient` injects
+`self._sprint_resolver.resolve_id` into `WorkPackageService`, which is a
+different, semantic-reference resolution this Service itself never performs.
+
+Sprints shares the "project" read scope with Projects/News/Documents/
+Categories/Views/Grids -- no dedicated OPENPROJECT_ENABLE_SPRINT_* flag
+exists, so access.ensure_read_enabled here uses scope="project" throughout.
+
+Unlike Views, Sprints DOES need a dedicated Policy module (sprint_policy.py):
+the allowlist check has two branches (embedded-object vs. link), not one.
+
+Two list methods, not one: `list()` hits the global `sprints` endpoint (no
+project filter at all); `list_for_project()` hits the project-scoped
+`projects/{id}/sprints` endpoint via a resolved project id, but STILL filters
+client-side afterward -- a sprint shared into a project via Backlogs sharing
+can be *defined* by a different, possibly disallowed project. Because
+`SprintSummary`'s project-ish fields are named
+`defining_workspace_id`/`defining_workspace` (not `project_id`),
+`project_scoped_list.py`'s `record_in_project` is not needed here: neither
+list method filters rows by project client-side (list_for_project scopes via
+the request URL).
+
+NotFoundError rewrap (three distinct "Backlogs module" messages) happens
+here, not in the adapter -- mirrors the existing ProjectService
+NotFoundError-rewrap precedent.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+from ...config import Settings
+from ...models import SprintDetail, SprintListResult
+from ..errors import NotFoundError
+from ..pagination import clamp_limit, scan_records_and_paginate
+from ..policies import access, hidden_fields
+from ..policies.sprint_policy import ensure_sprint_workspace_allowed, sprint_payload_allowed
+from ..ports.project_ref import ProjectRefResolver
+from ..ports.project_resolution import ProjectResolutionContext
+from ..ports.sprint_api import SprintApi, SprintRecord
+
+
+class SprintService:
+    def __init__(
+        self,
+        *,
+        api: SprintApi,
+        settings: Settings,
+        project_id_to_identifier: Mapping[int, str],
+        resolve_project_ref: ProjectRefResolver,
+    ) -> None:
+        self._api = api
+        self._settings = settings
+        self._project_id_to_identifier = project_id_to_identifier
+        self._resolve_project_ref = resolve_project_ref
+
+    def _stamp(self, value: Any) -> Any:
+        return hidden_fields.apply_hidden_fields("sprint", value, settings=self._settings)
+
+    def _allowed(self, record: SprintRecord) -> bool:
+        return sprint_payload_allowed(
+            defining_workspace_payload=record.defining_workspace_payload,
+            defining_workspace_link=record.defining_workspace_link,
+            settings=self._settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+        )
+
+    def _item_allowed(self, record: SprintRecord, *, search: str | None) -> bool:
+        if not self._allowed(record):
+            return False
+        if search is None:
+            return True
+        return search.casefold() in (record.summary.name or "").casefold()
+
+    def _to_result(
+        self, raw_items: list[SprintRecord], *, truncated: bool, offset: int, limit: int
+    ) -> SprintListResult:
+        results = [self._stamp(record.summary) for record in raw_items]
+        total = len(results)
+        return SprintListResult(
+            offset=offset,
+            limit=limit,
+            total=total,
+            count=total,
+            next_offset=offset + 1 if truncated else None,
+            truncated=truncated,
+            results=results,
+        )
+
+    async def list(
+        self,
+        *,
+        search: str | None = None,
+        offset: int = 1,
+        limit: int | None = None,
+    ) -> SprintListResult:
+        access.ensure_read_enabled("project", settings=self._settings)
+        effective_limit = clamp_limit(
+            limit,
+            default_page_size=self._settings.default_page_size,
+            max_page_size=self._settings.max_page_size,
+            max_results=self._settings.max_results,
+        )
+        try:
+            # Scan server pages rather than a single fetch capped at
+            # settings.max_results, which would silently hide any sprint
+            # beyond that cap once the endpoint's real result count exceeds it.
+            raw_items, truncated = await scan_records_and_paginate(
+                lambda o, ps: self._api.list_all(offset=o, page_size=ps),
+                item_allowed=lambda record: self._item_allowed(record, search=search),
+                server_page_size=self._settings.max_page_size,
+                offset=offset,
+                limit=effective_limit,
+                key=lambda r: r.summary.id,
+            )
+        except NotFoundError as exc:
+            raise NotFoundError(
+                "OpenProject sprints require the Backlogs module and OpenProject 17.3 or newer."
+            ) from exc
+        return self._to_result(raw_items, truncated=truncated, offset=offset, limit=effective_limit)
+
+    async def list_for_project(
+        self,
+        project: str,
+        *,
+        search: str | None = None,
+        offset: int = 1,
+        limit: int | None = None,
+        context: ProjectResolutionContext | None = None,
+    ) -> SprintListResult:
+        access.ensure_read_enabled("project", settings=self._settings)
+        effective_limit = clamp_limit(
+            limit,
+            default_page_size=self._settings.default_page_size,
+            max_page_size=self._settings.max_page_size,
+            max_results=self._settings.max_results,
+        )
+        project_payload = await self._resolve_project_ref(project, write=False, context=context)
+        project_id = int(project_payload["id"])
+        try:
+            # Even though this is project-scoped, results are still filtered
+            # client-side (a sprint shared into this project can be *defined*
+            # by a different, possibly disallowed project), so a full scan of
+            # server pages is required -- a single bounded fetch would
+            # silently hide any sprint beyond that cap.
+            raw_items, truncated = await scan_records_and_paginate(
+                lambda o, ps: self._api.list_for_project(project_id, offset=o, page_size=ps),
+                item_allowed=lambda record: self._item_allowed(record, search=search),
+                server_page_size=self._settings.max_page_size,
+                offset=offset,
+                limit=effective_limit,
+                key=lambda r: r.summary.id,
+            )
+        except NotFoundError as exc:
+            raise NotFoundError(
+                "OpenProject project sprints require the Backlogs module and OpenProject 17.3 or newer."
+            ) from exc
+        return self._to_result(raw_items, truncated=truncated, offset=offset, limit=effective_limit)
+
+    async def get(self, sprint_id: int) -> SprintDetail:
+        access.ensure_read_enabled("project", settings=self._settings)
+        try:
+            record = await self._api.get(sprint_id)
+        except NotFoundError as exc:
+            raise NotFoundError(
+                "OpenProject sprint not found, or the Backlogs module / sprint API is unavailable."
+            ) from exc
+        ensure_sprint_workspace_allowed(
+            defining_workspace_payload=record.defining_workspace_payload,
+            defining_workspace_link=record.defining_workspace_link,
+            settings=self._settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+        )
+        return self._stamp(record.detail)

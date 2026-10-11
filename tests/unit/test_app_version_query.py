@@ -1,0 +1,244 @@
+from __future__ import annotations
+
+import dataclasses
+
+import pytest
+from _client_test_helpers import make_settings
+
+from openproject_ce_mcp_server.app.ports.version_api import VersionPage, VersionRecord
+from openproject_ce_mcp_server.app.resolvers.version_query import fetch_version_page
+from openproject_ce_mcp_server.models import VersionSummary
+
+
+def _summary(version_id: int, name: str) -> VersionSummary:
+    return VersionSummary(
+        id=version_id,
+        name=name,
+        status="open",
+        sharing=None,
+        start_date=None,
+        end_date=None,
+        defining_project="Demo",
+        description=None,
+    )
+
+
+class _FakeVersionApi:
+    """No I/O -- an in-memory VersionApi double."""
+
+    def __init__(self, records: list[VersionRecord], *, server_total: int | None = None) -> None:
+        self._records = records
+        self._server_total = server_total
+        self.list_for_project_calls: list[tuple[int, int, int]] = []
+        self.list_global_calls: list[tuple[int, int]] = []
+
+    async def list_for_project(
+        self, project_id: int, *, offset: int, page_size: int, text_limit: int | None = None
+    ) -> VersionPage:
+        self.list_for_project_calls.append((project_id, offset, page_size))
+        server_total = self._server_total if self._server_total is not None else len(self._records)
+        return VersionPage(records=self._records, server_total=server_total)
+
+    async def list_global(self, *, offset: int, page_size: int, text_limit: int | None = None) -> VersionPage:
+        self.list_global_calls.append((offset, page_size))
+        return VersionPage(records=self._records, server_total=None)
+
+    async def get(self, version_id: int, *, text_limit: int | None = None): ...
+    async def create_form(self, payload): ...
+    async def update_form(self, version_id, payload): ...
+    async def commit_create(self, payload): ...
+    async def commit_update(self, version_id, payload): ...
+    async def delete(self, version_id: int) -> None: ...
+
+
+async def _resolve_project_ref(project_ref: str, *, write: bool = False, context=None) -> dict:
+    return {"id": 6, "identifier": "demo", "name": "Demo"}
+
+
+@pytest.mark.asyncio
+async def test_project_scoped_without_search_walks_and_slices_client_side() -> None:
+    """`projects/{id}/versions` is genuinely UnpaginatedCollection
+    server-side (verified against OpenProject's own API implementation --
+    VersionCollectionRepresenter subclasses UnpaginatedCollection, via
+    VersionsByProjectAPI) -- offset/pageSize params
+    are silently ignored and every element is always returned regardless.
+    Trusting the server's own total/pagination for this endpoint (as if it
+    were genuinely paginated) would either under- or over-report
+    truncation/next_offset against the real, always-complete result set, so
+    the project-scoped-without-search branch must walk (a no-op single
+    request here, since the fake already returns everything) and slice
+    client-side, same as the project-scoped-with-search branch."""
+    records = [
+        VersionRecord(summary=_summary(i, f"v{i}.0"), defining_project_link=None, lookup_name=f"v{i}.0")
+        for i in range(1, 26)
+    ]
+    api = _FakeVersionApi(records, server_total=25)
+
+    results, total, next_offset, truncated = await fetch_version_page(
+        api=api,
+        resolve_project_ref=_resolve_project_ref,
+        settings=make_settings(),
+        project_id_to_identifier={},
+        project="demo",
+        search=None,
+        offset=2,
+        limit=10,
+        context=None,
+    )
+
+    # the server ignores offset/page_size entirely and always returns every
+    # element -- fetch_version_page must slice offset=2/limit=10 out of the
+    # full 25-element result set client-side, not trust a server-reported
+    # page/total for this endpoint.
+    assert total == 25
+    assert next_offset == 3
+    assert truncated is True
+    assert [r.id for r in results] == list(range(11, 21))
+    assert not hasattr(results[0], "_hidden_keys")  # unmasked -- masking is VersionService's job
+
+
+@pytest.mark.asyncio
+async def test_project_scoped_with_search_overfetches_and_filters_in_memory() -> None:
+    records = [
+        VersionRecord(summary=_summary(1, "Sprint 1"), defining_project_link=None, lookup_name="Sprint 1"),
+        VersionRecord(summary=_summary(2, "Release 2"), defining_project_link=None, lookup_name="Release 2"),
+    ]
+    api = _FakeVersionApi(records)
+    settings = make_settings()
+
+    results, total, next_offset, truncated = await fetch_version_page(
+        api=api,
+        resolve_project_ref=_resolve_project_ref,
+        settings=settings,
+        project_id_to_identifier={},
+        project="demo",
+        search="release",
+        offset=1,
+        limit=10,
+        context=None,
+    )
+
+    # over-fetch walks every server page (max_page_size as page_size), not the
+    # caller's limit
+    assert api.list_for_project_calls == [(6, 1, settings.max_page_size)]
+    assert total == 1
+    assert next_offset is None
+    assert truncated is False
+    assert [r.id for r in results] == [2]
+
+
+@pytest.mark.asyncio
+async def test_global_branch_filters_by_allowlist_before_search_and_pagination() -> None:
+    allowed = VersionRecord(
+        summary=_summary(1, "Allowed"), defining_project_link={"href": "/api/v3/projects/6"}, lookup_name="Allowed"
+    )
+    disallowed = VersionRecord(
+        summary=_summary(2, "Blocked"), defining_project_link={"href": "/api/v3/projects/9"}, lookup_name="Blocked"
+    )
+    api = _FakeVersionApi([allowed, disallowed])
+    settings = dataclasses.replace(make_settings(), read_projects=("demo",))
+
+    results, total, next_offset, truncated = await fetch_version_page(
+        api=api,
+        resolve_project_ref=_resolve_project_ref,
+        settings=settings,
+        project_id_to_identifier={6: "demo"},
+        project=None,
+        search=None,
+        offset=1,
+        limit=10,
+        context=None,
+    )
+
+    assert [r.id for r in results] == [1]
+    assert total == 1
+
+
+@pytest.mark.asyncio
+async def test_project_scoped_branch_passes_write_false_to_resolve_project_ref() -> None:
+    """fetch_version_page's project-scoped branch (no search) resolves the
+    project via resolve_project_ref -- must ask for a READ-checked
+    (write=False) resolution, not a write-checked one. Same gap class this
+    project's lessons log records recurring across Membership/Documents/
+    Views/News list() paths (all fixed piecemeal), found missing here for
+    Version's list path specifically during the 18th domain's step-6
+    self-audit -- Version's list routing lives in this separate
+    resolvers/version_query.py module rather than going through
+    project_scoped_list.resolve_project_filter_id (which is itself
+    correctly pinned), so it never inherited that shared coverage.
+    """
+    calls: list[bool] = []
+
+    async def resolve_project_ref_tracking_write(project_ref: str, *, write: bool = False, context=None) -> dict:
+        calls.append(write)
+        return await _resolve_project_ref(project_ref, write=write, context=context)
+
+    records = [VersionRecord(summary=_summary(1, "v1.0"), defining_project_link=None, lookup_name="v1.0")]
+    api = _FakeVersionApi(records, server_total=1)
+
+    await fetch_version_page(
+        api=api,
+        resolve_project_ref=resolve_project_ref_tracking_write,
+        settings=make_settings(),
+        project_id_to_identifier={},
+        project="demo",
+        search=None,
+        offset=1,
+        limit=10,
+        context=None,
+    )
+
+    assert calls == [False]
+
+
+@pytest.mark.asyncio
+async def test_project_scoped_with_search_branch_passes_write_false_to_resolve_project_ref() -> None:
+    """Same seam-pin coverage as the branch above, for the OTHER project-scoped
+    call site (line 70 of version_query.py, the search-given/over-fetch
+    branch) -- a distinct code path with its own resolve_project_ref call
+    that could independently regress to write=True without the branch above
+    catching it.
+    """
+    calls: list[bool] = []
+
+    async def resolve_project_ref_tracking_write(project_ref: str, *, write: bool = False, context=None) -> dict:
+        calls.append(write)
+        return await _resolve_project_ref(project_ref, write=write, context=context)
+
+    records = [VersionRecord(summary=_summary(1, "Release 1"), defining_project_link=None, lookup_name="Release 1")]
+    api = _FakeVersionApi(records)
+
+    await fetch_version_page(
+        api=api,
+        resolve_project_ref=resolve_project_ref_tracking_write,
+        settings=make_settings(),
+        project_id_to_identifier={},
+        project="demo",
+        search="release",
+        offset=1,
+        limit=10,
+        context=None,
+    )
+
+    assert calls == [False]
+
+
+@pytest.mark.asyncio
+async def test_read_gate_enforced_even_without_project() -> None:
+    from openproject_ce_mcp_server.app.errors import PermissionDeniedError
+
+    api = _FakeVersionApi([])
+    settings = dataclasses.replace(make_settings(), enable_version_read=False)
+
+    with pytest.raises(PermissionDeniedError, match="OPENPROJECT_ENABLE_VERSION_READ"):
+        await fetch_version_page(
+            api=api,
+            resolve_project_ref=_resolve_project_ref,
+            settings=settings,
+            project_id_to_identifier={},
+            project=None,
+            search=None,
+            offset=1,
+            limit=10,
+            context=None,
+        )

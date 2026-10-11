@@ -1,0 +1,179 @@
+"""Work-package-reference resolver.
+
+Mirrors `ProjectResolver`'s shape (`app/resolvers/project_resolver.py`):
+constructor takes `api` + `settings`, depends only on the `WorkPackageLookupApi`
+Port (never raw HTTP), exposes `resolve_id`-style methods. Shared by every
+domain that needs work-package-reference resolution (Attachments, Time
+Entries, Reminders, Watchers, Emoji Reactions, Relations, Notifications,
+Activities, File Links, and Work Packages itself), so each can resolve a
+numeric id, a project-prefixed identifier, or check project-allowlist
+membership for a work-package href without duplicating that logic.
+
+`project_link_allowed()` accepts an optional `WorkPackageAllowedContext`
+cache parameter so callers can thread a shared cache through instead of
+building their own per-call cache.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Iterable, Mapping
+
+from ...config import Settings
+from ...context_gather import gather_in_current_context
+from ..errors import NotFoundError
+from ..policies import scope as scope_policy
+from ..ports.work_package_lookup_api import WorkPackageLookupApi
+from ..ports.work_package_resolution import WorkPackageAllowedContext
+
+# Bounds concurrent allowlist-check HTTP requests across relations,
+# notifications, reminders, and work-package hierarchy filtering.
+# A named constant, not tuned to match WorkPackageService's separate batch-read
+# semaphore (also 10) -- these limit different traffic. Ten is reasonable
+# because a single top-level call's candidate set is itself bounded (a server
+# page of ~50-100 hrefs, or a hierarchy capped at 50 children + 20 ancestors):
+# it caps burst pressure while still resolving those bounded sets in a small
+# number of waves, not a general-purpose server-wide throttle.
+_ALLOWLIST_BULK_CONCURRENCY = 10
+
+
+class WorkPackageResolver:
+    def __init__(
+        self, *, api: WorkPackageLookupApi, settings: Settings, project_id_to_identifier: Mapping[int, str]
+    ) -> None:
+        self._api = api
+        self._settings = settings
+        self._project_id_to_identifier = project_id_to_identifier
+        # Instance-scoped so it genuinely bounds combined allowlist traffic
+        # across all call sites, not just one call's own fan-out (same
+        # reasoning as WorkPackageService's `_batch_read_semaphore`, but a
+        # deliberately SEPARATE instance -- see that class's own comment for
+        # the deadlock this independence avoids: a task holding a batch-read
+        # permit while its own nested hierarchy-allowlist check waits on the
+        # same semaphore would never release it).
+        self._allowlist_semaphore = asyncio.Semaphore(_ALLOWLIST_BULK_CONCURRENCY)
+
+    async def resolve_id(self, work_package_ref: int | str, *, write: bool = False) -> int:
+        """Resolve a work-package reference to its canonical numeric id.
+
+        Needed where the numeric id itself is required (e.g. a relation filter or a
+        client-side equality check) rather than a request path. A numeric reference
+        does not short-circuit: it always triggers a fetch of the work
+        package too, so its project can be validated against the allowlist before
+        its ``id`` is read back. A project-prefixed identifier is resolved the same
+        way, but additionally only works on OpenProject 17.5+, or 17.4 with its
+        feature flag (and requires the exact, case-sensitive project identifier).
+
+        ``write=True`` checks the WRITE allowlist instead of the read one --
+        needed wherever the resolved work package is a REPARENT/relation
+        TARGET being written into, not just read (e.g. a caller with write
+        access to work package A must not be able to attach it under a work
+        package B they can only read).
+        """
+        reference = str(work_package_ref).strip()
+        try:
+            payload = await self._api.get(reference)
+        except NotFoundError as exc:
+            if reference.isdigit():
+                raise
+            # A project-prefixed reference only resolves on OpenProject 17.5+, or
+            # 17.4 with its feature flag, and requires the exact, case-sensitive
+            # project identifier. Give a hint instead of a bare "not found" so a
+            # too-old instance or a case/prefix mismatch is distinguishable from
+            # a genuinely missing work package.
+            raise NotFoundError(
+                f"Work package '{reference}' was not found. Semantic references like 'PROJ-123' "
+                "require OpenProject 17.5+ (17.4 with its feature flag) and the exact project identifier "
+                "(case-sensitive); on older instances use the numeric work-package id."
+            ) from exc
+        project_link = payload.get("_links", {}).get("project")
+        if write:
+            scope_policy.ensure_project_write_link_allowed(
+                project_link, settings=self._settings, project_id_to_identifier=self._project_id_to_identifier
+            )
+        else:
+            scope_policy.ensure_project_link_allowed(
+                project_link, settings=self._settings, project_id_to_identifier=self._project_id_to_identifier
+            )
+        return int(payload["id"])
+
+    async def project_link_allowed(self, href: str, *, context: WorkPackageAllowedContext | None = None) -> bool:
+        """True if the work package at ``href`` sits in a project the caller may read.
+
+        When ``context`` is given, a cache hit short-circuits the fetch; a
+        cache miss fetches and stores the result before returning it. When
+        ``context is None``, behaves exactly like the original uncached
+        method -- always fetches fresh.
+        """
+        if context is not None:
+            cached = context.get(href)
+            if cached is not None:
+                return cached
+            allowed = await self._project_link_allowed_uncached(href)
+            context.set(href, allowed)
+            return allowed
+        return await self._project_link_allowed_uncached(href)
+
+    async def project_links_allowed(
+        self, hrefs: Iterable[str], *, context: WorkPackageAllowedContext
+    ) -> dict[str, bool | Exception]:
+        """Resolve a batch of hrefs concurrently.
+
+        Deduplicates in insertion order (`dict.fromkeys`, not `set` -- keeps
+        scheduling and exception-ordering deterministic for tests). Cache hits
+        short-circuit with no I/O; cache misses are fetched concurrently under
+        `self._allowlist_semaphore`. Only successful `bool` outcomes are
+        written into `context`; a failed href's outcome is a captured regular
+        `Exception` (never `BaseException`/`CancelledError`, which propagate
+        normally) and is NOT cached, so a retry fetches fresh rather than
+        replaying a stale failure.
+
+        The caller decides which (if any) of the returned exceptions actually
+        matter -- e.g. a relation whose `to` side would never be checked once
+        its `from` side was already denied under sequential, short-circuiting
+        evaluation must not have a `to`-side transport error abort the whole
+        list. Callers must consume this result in original per-item order and
+        re-raise only the first exception that sequential, short-circuiting
+        evaluation would actually have reached; see the call sites for how
+        each applies this.
+        """
+        unique_hrefs = list(dict.fromkeys(hrefs))
+        outcomes: dict[str, bool | Exception] = {}
+        misses = []
+        for href in unique_hrefs:
+            cached = context.get(href)
+            if cached is not None:
+                outcomes[href] = cached
+            else:
+                misses.append(href)
+
+        async def _resolve_one(href: str) -> None:
+            async with self._allowlist_semaphore:
+                try:
+                    allowed = await self._project_link_allowed_uncached(href)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 -- captured as a deferred outcome, see docstring
+                    outcomes[href] = exc
+                    return
+            context.set(href, allowed)
+            outcomes[href] = allowed
+
+        if misses:
+            await gather_in_current_context(*(_resolve_one(href) for href in misses))
+        return outcomes
+
+    async def _project_link_allowed_uncached(self, href: str) -> bool:
+        try:
+            work_package = await self._api.get_by_href(href)
+        except NotFoundError:
+            return False
+        # Do NOT swallow server/transport errors as "not allowed" — a transient
+        # 5xx must not silently drop a relation the caller is entitled to see.
+        return scope_policy.payload_allowed(
+            lambda: scope_policy.ensure_project_link_allowed(
+                work_package.get("_links", {}).get("project"),
+                settings=self._settings,
+                project_id_to_identifier=self._project_id_to_identifier,
+            )
+        )

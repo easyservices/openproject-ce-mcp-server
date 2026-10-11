@@ -1,0 +1,680 @@
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from openproject_ce_mcp_server.config import ConfigError, Settings
+
+# A real absolute path in native format for whichever OS runs the tests
+# (e.g. /tmp/uploads on Linux/macOS, C:\Users\...\Temp\uploads on Windows) —
+# Path.is_absolute() only recognizes drive-letter/UNC paths as absolute on
+# Windows, so a hardcoded POSIX literal like "/tmp/uploads" fails there.
+ABSOLUTE_ATTACHMENT_ROOT = str(Path(tempfile.gettempdir()) / "uploads")
+
+
+def test_settings_from_env_loads_and_normalizes_values() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com/",
+            "OPENPROJECT_API_TOKEN": "token-value",
+            "OPENPROJECT_READ_PROJECTS": "mcp-test, openproject-ce-mcp-server",
+            "OPENPROJECT_WRITE_PROJECTS": "mcp-test",
+            "OPENPROJECT_ENABLE_MEMBERSHIP_READ": "false",
+            "OPENPROJECT_ENABLE_MEMBERSHIP_WRITE": "false",
+            "OPENPROJECT_HIDE_PROJECT_FIELDS": "description,status_explanation",
+            "OPENPROJECT_HIDE_PRINCIPAL_FIELDS": "*mail,login",
+            "OPENPROJECT_HIDE_WORK_PACKAGE_FIELDS": "description",
+            "OPENPROJECT_HIDE_ACTIVITY_FIELDS": "comment",
+            "OPENPROJECT_HIDE_WATCHER_FIELDS": "login",
+            "OPENPROJECT_HIDE_CUSTOM_FIELDS": "budget, internal_notes",
+            "OPENPROJECT_ENABLE_PROJECT_WRITE": "true",
+            "OPENPROJECT_TIMEOUT": "15",
+            "OPENPROJECT_VERIFY_SSL": "false",
+            "OPENPROJECT_DEFAULT_PAGE_SIZE": "10",
+            "OPENPROJECT_MAX_PAGE_SIZE": "20",
+            "OPENPROJECT_MAX_RESULTS": "30",
+            "OPENPROJECT_LOG_LEVEL": "info",
+        }
+    )
+
+    assert settings.base_url == "https://op.example.com"
+    assert settings.api_base_url == "https://op.example.com/api/v3"
+    assert settings.read_projects == ("mcp-test", "openproject-ce-mcp-server")
+    assert settings.write_projects == ("mcp-test",)
+    assert settings.enable_project_read is True
+    assert settings.enable_membership_read is False
+    assert settings.hide_project_fields == ("description", "status_explanation")
+    assert settings.hidden_fields["principal"] == ("*mail", "login")
+    assert settings.hide_work_package_fields == ("description",)
+    assert settings.hide_activity_fields == ("comment",)
+    assert settings.hidden_fields["watcher"] == ("login",)
+    assert settings.hide_custom_fields == ("budget", "internal_notes")
+    assert settings.enable_project_write is True
+    assert settings.verify_ssl is False
+    assert settings.timeout == 15
+    assert settings.default_page_size == 10
+    assert settings.max_page_size == 20
+    assert settings.max_results == 30
+    assert settings.log_level == "INFO"
+    assert settings.budget_comparison_enabled is False
+
+
+def test_budget_comparison_requires_database_settings_only_when_enabled() -> None:
+    base = {"OPENPROJECT_BASE_URL": "https://op.example.com", "OPENPROJECT_API_TOKEN": "token"}
+    disabled = Settings.from_env(base)
+    assert disabled.db_port == 5432
+    assert disabled.db_host == ""
+
+    with pytest.raises(ConfigError, match="OPENPROJECT_DB_HOST"):
+        Settings.from_env({**base, "OPENPROJECT_BUDGET_COMPARISON_ENABLED": "true"})
+
+    enabled = Settings.from_env(
+        {
+            **base,
+            "OPENPROJECT_BUDGET_COMPARISON_ENABLED": "true",
+            "OPENPROJECT_DB_TYPE": "postgresql",
+            "OPENPROJECT_DB_HOST": "db.internal",
+            "OPENPROJECT_DB_PORT": "5433",
+            "OPENPROJECT_DB_NAME": "openproject",
+            "OPENPROJECT_DB_USER": "op_ro",
+            "OPENPROJECT_DB_PASSWORD": "secret",
+            "OPENPROJECT_DB_SSLMODE": "verify-full",
+        }
+    )
+    assert enabled.budget_comparison_enabled is True
+    assert enabled.db_host == "db.internal"
+    assert enabled.db_port == 5433
+    assert enabled.db_sslmode == "verify-full"
+
+
+def test_budget_comparison_rejects_unsupported_database_type() -> None:
+    with pytest.raises(ConfigError, match="OPENPROJECT_DB_TYPE"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "https://op.example.com",
+                "OPENPROJECT_API_TOKEN": "token",
+                "OPENPROJECT_BUDGET_COMPARISON_ENABLED": "true",
+                "OPENPROJECT_DB_TYPE": "mysql",
+                "OPENPROJECT_DB_HOST": "db.internal",
+                "OPENPROJECT_DB_NAME": "openproject",
+                "OPENPROJECT_DB_USER": "op_ro",
+                "OPENPROJECT_DB_PASSWORD": "secret",
+            }
+        )
+
+
+def test_settings_from_env_loads_priority_notification_file_link_emoji_reaction_hidden_fields() -> None:
+    # Regression test for four real hidden-field-masking gaps found during the
+    # Statuses/Priorities/Types migration: "priority"/"notification"/
+    # "emoji_reaction" had no HIDE_FIELD_ENV_BY_ENTITY entry at all, and
+    # "file_link" had an entry but was never exercised end-to-end through the
+    # real env-var path by any existing test (every test_hidden_fields.py test
+    # constructs Settings directly with hidden_fields={...} pre-populated,
+    # bypassing HIDE_FIELD_ENV_BY_ENTITY entirely). This test goes through
+    # Settings.from_env with the real env var names, the only way to actually
+    # prove OPENPROJECT_HIDE_<X>_FIELDS works for a user.
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com/",
+            "OPENPROJECT_API_TOKEN": "token-value",
+            "OPENPROJECT_HIDE_PRIORITY_FIELDS": "color",
+            "OPENPROJECT_HIDE_NOTIFICATION_FIELDS": "project_name",
+            "OPENPROJECT_HIDE_FILE_LINK_FIELDS": "storage_name",
+            "OPENPROJECT_HIDE_EMOJI_REACTION_FIELDS": "users",
+            "OPENPROJECT_HIDE_POST_FIELDS": "subject",
+        }
+    )
+
+    assert settings.hidden_fields["priority"] == ("color",)
+    assert settings.hidden_fields["notification"] == ("project_name",)
+    assert settings.hidden_fields["file_link"] == ("storage_name",)
+    assert settings.hidden_fields["emoji_reaction"] == ("users",)
+    assert settings.hidden_fields["post"] == ("subject",)
+
+
+def test_settings_from_env_rejects_invalid_relationships() -> None:
+    with pytest.raises(ConfigError, match="must not exceed"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "https://op.example.com",
+                "OPENPROJECT_API_TOKEN": "token-value",
+                "OPENPROJECT_DEFAULT_PAGE_SIZE": "60",
+                "OPENPROJECT_MAX_PAGE_SIZE": "50",
+                "OPENPROJECT_MAX_RESULTS": "100",
+            }
+        )
+
+
+def test_settings_from_env_accepts_wildcard_project_scopes() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+            "OPENPROJECT_READ_PROJECTS": "*",
+            "OPENPROJECT_WRITE_PROJECTS": "*",
+        }
+    )
+
+    assert settings.read_projects == ("*",)
+    assert settings.write_projects == ("*",)
+
+
+def test_settings_from_env_per_scope_read_flag_disables_independently_of_default() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+            "OPENPROJECT_ENABLE_MEMBERSHIP_READ": "false",
+            "OPENPROJECT_ENABLE_MEMBERSHIP_WRITE": "false",
+        }
+    )
+
+    assert settings.read_enabled("project") is True
+    assert settings.read_enabled("membership") is False
+
+
+def test_settings_from_env_scoped_read_flags_disable_chains_independently() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+            "OPENPROJECT_ENABLE_PROJECT_READ": "false",
+            "OPENPROJECT_ENABLE_PROJECT_WRITE": "false",
+            "OPENPROJECT_ENABLE_WORK_PACKAGE_READ": "false",
+            "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE": "false",
+        }
+    )
+
+    assert settings.read_enabled("project") is False
+    assert settings.read_enabled("work_package") is False
+    assert settings.read_enabled("membership") is True  # not disabled
+
+
+def test_settings_from_env_scoped_write_flag_disables_one_scope_independently() -> None:
+    # project-scoped writes default to enabled; a scoped flag opts one chain
+    # out without affecting others
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+            "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE": "false",
+        }
+    )
+
+    assert settings.write_enabled("work_package") is False
+    assert settings.write_enabled("project") is True
+    assert settings.write_enabled("membership") is True
+
+
+def test_settings_from_env_project_scoped_write_defaults_to_enabled() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+        }
+    )
+
+    assert settings.write_enabled("project") is True
+    assert settings.write_enabled("work_package") is True
+    assert settings.write_enabled("membership") is True
+    assert settings.write_enabled("version") is True
+    assert settings.write_enabled("board") is True
+
+
+def test_settings_from_env_personal_and_admin_write_default_to_disabled() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+        }
+    )
+
+    assert settings.write_enabled("personal") is False
+    assert settings.write_enabled("admin") is False
+
+
+def test_read_defaults_core_five_true_personal_extended_admin_false() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+        }
+    )
+
+    assert settings.read_enabled("project") is True
+    assert settings.read_enabled("work_package") is True
+    assert settings.read_enabled("membership") is True
+    assert settings.read_enabled("version") is True
+    assert settings.read_enabled("board") is True
+    assert settings.read_enabled("personal") is False
+    assert settings.enable_metadata_tools is False
+    assert settings.read_enabled("admin") is False
+
+
+def test_read_flags_all_explicitly_false() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+            "OPENPROJECT_ENABLE_PROJECT_READ": "false",
+            "OPENPROJECT_ENABLE_PROJECT_WRITE": "false",
+            "OPENPROJECT_ENABLE_WORK_PACKAGE_READ": "false",
+            "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE": "false",
+            "OPENPROJECT_ENABLE_MEMBERSHIP_READ": "false",
+            "OPENPROJECT_ENABLE_MEMBERSHIP_WRITE": "false",
+            "OPENPROJECT_ENABLE_VERSION_READ": "false",
+            "OPENPROJECT_ENABLE_VERSION_WRITE": "false",
+            "OPENPROJECT_ENABLE_BOARD_READ": "false",
+            "OPENPROJECT_ENABLE_BOARD_WRITE": "false",
+        }
+    )
+
+    assert settings.read_enabled("project") is False
+    assert settings.read_enabled("work_package") is False
+    assert settings.read_enabled("membership") is False
+    assert settings.read_enabled("version") is False
+    assert settings.read_enabled("board") is False
+    assert settings.read_enabled("personal") is False
+    assert settings.enable_metadata_tools is False
+    assert settings.read_enabled("admin") is False
+
+
+@pytest.mark.parametrize(
+    ("write_var", "read_var"),
+    [
+        ("OPENPROJECT_ENABLE_PROJECT_WRITE", "OPENPROJECT_ENABLE_PROJECT_READ"),
+        ("OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE", "OPENPROJECT_ENABLE_WORK_PACKAGE_READ"),
+        ("OPENPROJECT_ENABLE_MEMBERSHIP_WRITE", "OPENPROJECT_ENABLE_MEMBERSHIP_READ"),
+        ("OPENPROJECT_ENABLE_VERSION_WRITE", "OPENPROJECT_ENABLE_VERSION_READ"),
+        ("OPENPROJECT_ENABLE_BOARD_WRITE", "OPENPROJECT_ENABLE_BOARD_READ"),
+        ("OPENPROJECT_ENABLE_PERSONAL_WRITE", "OPENPROJECT_ENABLE_PERSONAL_READ"),
+        ("OPENPROJECT_ENABLE_ADMIN_WRITE", "OPENPROJECT_ENABLE_ADMIN_READ"),
+    ],
+)
+def test_write_flag_without_matching_read_rejected(write_var: str, read_var: str) -> None:
+    # Covers the review-flagged scenario explicitly: a manually-set READ=false
+    # combined with the new implicit WRITE=true (project-scoped) default must
+    # still fail loudly via Settings.from_env, exactly like an explicit
+    # WRITE=true typed alongside READ=false.
+    with pytest.raises(ConfigError, match="requires"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "https://op.example.com",
+                "OPENPROJECT_API_TOKEN": "token-value",
+                read_var: "false",
+                write_var: "true",
+            }
+        )
+
+
+def test_write_flag_with_read_enabled_accepted() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+            "OPENPROJECT_ENABLE_PERSONAL_READ": "true",
+            "OPENPROJECT_ENABLE_PROJECT_WRITE": "true",
+            "OPENPROJECT_ENABLE_PERSONAL_WRITE": "true",
+        }
+    )
+
+    assert settings.write_enabled("project") is True
+    assert settings.write_enabled("personal") is True
+
+
+def test_read_enabled_rejects_unknown_scope() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+        }
+    )
+
+    with pytest.raises(ConfigError, match="Unknown read scope"):
+        settings.read_enabled("bogus")
+
+
+def test_write_enabled_rejects_unknown_scope() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+        }
+    )
+
+    with pytest.raises(ConfigError, match="Unknown write scope"):
+        settings.write_enabled("bogus")
+
+
+def test_write_enabled_treats_admin_as_a_normal_scope() -> None:
+    # "admin" is a normal scope like any other (unlike the old special-cased
+    # design where client.py checked settings.enable_admin_write directly) —
+    # write_enabled("admin")/read_enabled("admin") work like every other
+    # scope, and the write flag requires its own read flag exactly the same
+    # way as the other 6 pairs.
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+            "OPENPROJECT_ENABLE_ADMIN_READ": "true",
+            "OPENPROJECT_ENABLE_ADMIN_WRITE": "true",
+        }
+    )
+
+    assert settings.read_enabled("admin") is True
+    assert settings.write_enabled("admin") is True
+
+
+def test_settings_from_env_rejects_max_page_size_exceeding_max_results() -> None:
+    with pytest.raises(ConfigError, match="must not exceed"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "https://op.example.com",
+                "OPENPROJECT_API_TOKEN": "token-value",
+                "OPENPROJECT_DEFAULT_PAGE_SIZE": "10",
+                "OPENPROJECT_MAX_PAGE_SIZE": "60",
+                "OPENPROJECT_MAX_RESULTS": "50",
+            }
+        )
+
+
+def test_settings_from_env_rejects_invalid_base_url_scheme() -> None:
+    with pytest.raises(ConfigError, match="http or https"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "ftp://op.example.com",
+                "OPENPROJECT_API_TOKEN": "token-value",
+            }
+        )
+
+
+def test_settings_from_env_rejects_base_url_without_hostname() -> None:
+    with pytest.raises(ConfigError, match="hostname"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "https://",
+                "OPENPROJECT_API_TOKEN": "token-value",
+            }
+        )
+
+
+def test_settings_from_env_rejects_base_url_with_query_string() -> None:
+    with pytest.raises(ConfigError, match="query parameters"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "https://op.example.com?foo=bar",
+                "OPENPROJECT_API_TOKEN": "token-value",
+            }
+        )
+
+
+def test_settings_from_env_rejects_invalid_bool_value() -> None:
+    with pytest.raises(ConfigError, match="boolean"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "https://op.example.com",
+                "OPENPROJECT_API_TOKEN": "token-value",
+                "OPENPROJECT_ENABLE_PERSONAL_WRITE": "ja",
+            }
+        )
+
+
+def test_settings_from_env_rejects_invalid_log_level() -> None:
+    with pytest.raises(ConfigError, match="CRITICAL"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "https://op.example.com",
+                "OPENPROJECT_API_TOKEN": "token-value",
+                "OPENPROJECT_LOG_LEVEL": "VERBOSE",
+            }
+        )
+
+
+def test_settings_from_env_accepts_debug_log_level() -> None:
+    # DEBUG is a real Python logging level and is part of MCPServer's accepted
+    # log_level Literal, so this validator's allowed set must include it.
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+            "OPENPROJECT_LOG_LEVEL": "debug",
+        }
+    )
+    assert settings.log_level == "DEBUG"
+
+
+def test_settings_from_env_defaults_log_format_to_text() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+        }
+    )
+    assert settings.log_format == "text"
+
+
+def test_settings_from_env_accepts_json_log_format_case_insensitively() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+            "OPENPROJECT_LOG_FORMAT": "JSON",
+        }
+    )
+    assert settings.log_format == "json"
+
+
+def test_settings_from_env_rejects_invalid_log_format() -> None:
+    with pytest.raises(ConfigError, match="OPENPROJECT_LOG_FORMAT"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "https://op.example.com",
+                "OPENPROJECT_API_TOKEN": "token-value",
+                "OPENPROJECT_LOG_FORMAT": "xml",
+            }
+        )
+
+
+def test_http_remote_base_url_warns(caplog) -> None:
+    with caplog.at_level("WARNING"):
+        settings = Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "http://op.example.com",
+                "OPENPROJECT_API_TOKEN": "token-value",
+            }
+        )
+    assert settings.base_url == "http://op.example.com"
+    assert any("unencrypted" in record.message for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://[::1]:8080",
+        "https://op.example.com",
+    ],
+)
+def test_local_or_https_base_url_does_not_warn(base_url, caplog) -> None:
+    with caplog.at_level("WARNING"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": base_url,
+                "OPENPROJECT_API_TOKEN": "token-value",
+            }
+        )
+    assert not any("unencrypted" in record.message for record in caplog.records)
+
+
+def test_max_retries_exceeds_limit() -> None:
+    with pytest.raises(ConfigError, match="OPENPROJECT_MAX_RETRIES must not exceed 10"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "https://op.example.com",
+                "OPENPROJECT_API_TOKEN": "token-value",
+                "OPENPROJECT_MAX_RETRIES": "11",
+            }
+        )
+
+
+def test_retry_max_delay_less_than_base_delay() -> None:
+    with pytest.raises(ConfigError, match="OPENPROJECT_RETRY_MAX_DELAY must be >= OPENPROJECT_RETRY_BASE_DELAY"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "https://op.example.com",
+                "OPENPROJECT_API_TOKEN": "token-value",
+                "OPENPROJECT_RETRY_BASE_DELAY": "10.0",
+                "OPENPROJECT_RETRY_MAX_DELAY": "5.0",
+            }
+        )
+
+
+def test_retry_settings_valid_defaults() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+        }
+    )
+    assert settings.max_retries == 3
+    assert settings.retry_base_delay == 1.0
+    assert settings.retry_max_delay == 60.0
+
+
+def test_relative_attachment_root_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="absolute"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "https://op.example.com",
+                "OPENPROJECT_API_TOKEN": "token-value",
+                "OPENPROJECT_ATTACHMENT_ROOT": "uploads",
+            }
+        )
+
+
+def test_absolute_attachment_root_is_accepted() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+            "OPENPROJECT_ATTACHMENT_ROOT": ABSOLUTE_ATTACHMENT_ROOT,
+        }
+    )
+    assert settings.attachment_root == ABSOLUTE_ATTACHMENT_ROOT
+
+
+def test_tilde_attachment_root_is_accepted() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+            "OPENPROJECT_ATTACHMENT_ROOT": "~/uploads",
+        }
+    )
+    assert settings.attachment_root == "~/uploads"
+
+
+def test_empty_attachment_root_is_accepted_at_config_time() -> None:
+    # The config layer only validates format when a value IS given — the actual
+    # "uploads disabled" enforcement happens later, in
+    # app/services/attachment_service.py (runtime path check) and tools.py
+    # (registration gate), not here.
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+        }
+    )
+    assert settings.attachment_root == ""
+
+
+# ── legacy env-var names (removed) ──────────────────────────────────────────
+
+
+def test_legacy_env_var_names_have_no_effect_on_settings() -> None:
+    # Removed names are unrecognized env vars like any other, silently ignored by
+    # Settings.from_env with no warning and no special-cased adoption.
+    env = {
+        "OPENPROJECT_BASE_URL": "https://op.example.com",
+        "OPENPROJECT_API_TOKEN": "token-value",
+        "OPENPROJECT_ALLOWED_PROJECTS_READ": "DEMO",
+        "OPENPROJECT_ALLOWED_PROJECTS_WRITE": "DEMO",
+        "OPENPROJECT_ENABLE_PERSONAL_READ": "true",
+        "OPENPROJECT_PERSONAL_WRITE": "true",
+        "OPENPROJECT_TOOLS": "projects,work-packages",
+        "OPENPROJECT_ENABLE_METADATA_TOOLS": "true",
+        "OPENPROJECT_AUTO_CONFIRM_WRITE": "true",
+        "OPENPROJECT_AUTO_CONFIRM_DELETE": "true",
+    }
+    settings = Settings.from_env(env)
+    assert settings.read_projects == ()
+    assert settings.write_projects == ()
+    assert settings.write_enabled("personal") is False
+    assert settings.read_enabled("extended") is False
+
+
+def test_core_five_legacy_names_now_take_effect() -> None:
+    # The 5 individual booleans are current, not legacy.
+    env = {
+        "OPENPROJECT_BASE_URL": "https://op.example.com",
+        "OPENPROJECT_API_TOKEN": "token-value",
+        "OPENPROJECT_ENABLE_PROJECT_READ": "false",
+        "OPENPROJECT_ENABLE_PROJECT_WRITE": "false",
+        "OPENPROJECT_ENABLE_WORK_PACKAGE_READ": "false",
+        "OPENPROJECT_ENABLE_WORK_PACKAGE_WRITE": "false",
+        "OPENPROJECT_ENABLE_MEMBERSHIP_READ": "false",
+        "OPENPROJECT_ENABLE_MEMBERSHIP_WRITE": "false",
+        "OPENPROJECT_ENABLE_VERSION_READ": "false",
+        "OPENPROJECT_ENABLE_VERSION_WRITE": "false",
+        "OPENPROJECT_ENABLE_BOARD_READ": "false",
+        "OPENPROJECT_ENABLE_BOARD_WRITE": "false",
+    }
+    settings = Settings.from_env(env)
+    assert settings.read_enabled("project") is False
+    assert settings.read_enabled("work_package") is False
+    assert settings.read_enabled("membership") is False
+    assert settings.read_enabled("version") is False
+    assert settings.read_enabled("board") is False
+
+
+def test_attachment_content_max_bytes_defaults_to_5_mib() -> None:
+    settings = Settings.from_env(
+        {"OPENPROJECT_BASE_URL": "https://op.example.com", "OPENPROJECT_API_TOKEN": "token-value"}
+    )
+    assert settings.attachment_content_max_bytes == 5 * 1024 * 1024
+
+
+def test_attachment_content_max_bytes_is_configurable() -> None:
+    settings = Settings.from_env(
+        {
+            "OPENPROJECT_BASE_URL": "https://op.example.com",
+            "OPENPROJECT_API_TOKEN": "token-value",
+            "OPENPROJECT_ATTACHMENT_CONTENT_MAX_BYTES": "1048576",
+        }
+    )
+    assert settings.attachment_content_max_bytes == 1_048_576
+
+
+def test_attachment_content_max_bytes_exceeds_ceiling() -> None:
+    with pytest.raises(ConfigError, match="OPENPROJECT_ATTACHMENT_CONTENT_MAX_BYTES must not exceed 26214400"):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "https://op.example.com",
+                "OPENPROJECT_API_TOKEN": "token-value",
+                "OPENPROJECT_ATTACHMENT_CONTENT_MAX_BYTES": str(25 * 1024 * 1024 + 1),
+            }
+        )
+
+
+def test_attachment_content_max_bytes_rejects_zero() -> None:
+    with pytest.raises(ConfigError):
+        Settings.from_env(
+            {
+                "OPENPROJECT_BASE_URL": "https://op.example.com",
+                "OPENPROJECT_API_TOKEN": "token-value",
+                "OPENPROJECT_ATTACHMENT_CONTENT_MAX_BYTES": "0",
+            }
+        )

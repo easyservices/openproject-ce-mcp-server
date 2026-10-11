@@ -1,0 +1,340 @@
+"""Application Service for the Users domain.
+
+Depends on the UserApi Protocol, never HttpxUserApi concretely (enforced by
+the architecture-boundary test). No `ProjectRefResolver`: Users have no
+project concept at all, following `RoleService`'s/`ActionCapabilityService`'s
+zero-Resolver template. No dedicated policy file: nothing here needs
+client-side project-link filtering.
+
+`list()` needs BOTH `pagination.paginate_server` (no-search branch) and
+`pagination.paginate_client` (search branch, over-fetch-then-filter) --
+unlike Roles, which only ever needed the former since it has no search
+parameter.
+
+`lock()`/`unlock()` are non-CRUD write actions. Modeled on
+`ProjectService.set_favorite` (the closest existing precedent: a no-form,
+no-prior-GET, preview/confirm/commit toggle) via a small shared
+`_finalize_action` helper local to this Service -- lock/unlock share an
+identical shape with EACH OTHER (not with create/update/delete), so a
+dedicated 2-call-site helper here follows the same "2+ write actions
+sharing the same shape" threshold `_write_outcome.py`'s module docstring
+already applies project-wide, without forcing lock/unlock onto the
+form-based `_finalize_write` shape they don't fit.
+
+`delete()`/`lock()`/`unlock()` all check `access.ensure_write_enabled("admin", ...)`
+UNCONDITIONALLY (not gated inside the confirm branch): none of them have a
+prior GET to piggyback the check on (unlike e.g. `MembershipService.delete()`,
+which checks only inside `if confirm:` because it already does a prior GET
+for the allowlist check). `delete()` is wired via `_finalize_write`'s
+`gate_before_preview=True` (OPM-2705), same as Group and Storage; lock/unlock
+keep their own `_finalize_action` (a genuinely different, form-less shape).
+
+`create()`/`update()`/lock/unlock's `_finalize_action` all call
+`hidden_fields.ensure_field_writable("user", <field>, ...)` for every field
+they write, matching every other full-CRUD Service (News/Board/Document/
+Membership/Project/Version).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ...config import Settings
+from ...models import UserDetail, UserListResult, UserWriteResult, WriteResultState
+from ..pagination import effective_limit as _effective_limit
+from ..pagination import paginate_server, scan_records_and_paginate
+from ..policies import access, hidden_fields
+from ..ports.user_api import UserApi
+from ._write_outcome import _finalize_write, _WriteOutcome
+
+
+class UserService:
+    def __init__(self, *, api: UserApi, settings: Settings) -> None:
+        self._api = api
+        self._settings = settings
+
+    def _stamp(self, value: Any) -> Any:
+        return hidden_fields.apply_hidden_fields("user", value, settings=self._settings)
+
+    async def list_users(
+        self, *, search: str | None = None, offset: int = 1, limit: int | None = None
+    ) -> UserListResult:
+        access.ensure_read_enabled("admin", settings=self._settings)
+        effective_limit = _effective_limit(limit, settings=self._settings)
+
+        if search is not None:
+            search_key = search.casefold()
+
+            def _record_matches(record: Any) -> bool:
+                return (
+                    search_key in (record.summary.name or "").casefold()
+                    or search_key in (record.summary.login or "").casefold()
+                    or search_key in (record.summary.email or "").casefold()
+                )
+
+            # No server-side name/login/email filter exists for /users, so
+            # scan every server page (Users is genuinely
+            # OffsetPaginatedCollection server-side, verified against
+            # OpenProject's own API implementation) instead of trusting the
+            # server's pre-filter total.
+            raw_items, truncated = await scan_records_and_paginate(
+                lambda o, ps: self._api.list_users(offset=o, page_size=ps),
+                item_allowed=_record_matches,
+                server_page_size=self._settings.max_page_size,
+                offset=offset,
+                limit=effective_limit,
+                key=lambda r: r.summary.id,
+            )
+            results = [self._stamp(record.summary) for record in raw_items]
+            total = len(results)
+            return UserListResult(
+                offset=offset,
+                limit=effective_limit,
+                total=total,
+                count=total,
+                next_offset=offset + 1 if truncated else None,
+                truncated=truncated,
+                results=results,
+            )
+
+        records, total = await self._api.list_users(offset=offset, page_size=effective_limit)
+        results = [self._stamp(record.summary) for record in records]
+        next_offset, truncated = paginate_server(offset=offset, limit=effective_limit, total=total)
+        return UserListResult(
+            offset=offset,
+            limit=effective_limit,
+            total=total,
+            count=len(results),
+            next_offset=next_offset,
+            truncated=truncated,
+            results=results,
+        )
+
+    async def get_user(self, user_ref: str) -> UserDetail:
+        access.ensure_read_enabled("admin", settings=self._settings)
+        record = await self._api.get_user(user_ref)
+        return self._stamp(record.to_detail())
+
+    async def create(
+        self,
+        *,
+        login: str,
+        email: str,
+        firstname: str,
+        lastname: str,
+        password: str | None = None,
+        admin: bool = False,
+        status: str = "active",
+        language: str | None = None,
+        confirm: bool = False,
+    ) -> UserWriteResult:
+        hidden_fields.ensure_field_writable("user", "login", settings=self._settings)
+        hidden_fields.ensure_field_writable("user", "email", settings=self._settings)
+        hidden_fields.ensure_field_writable("user", "firstname", settings=self._settings)
+        hidden_fields.ensure_field_writable("user", "lastname", settings=self._settings)
+        hidden_fields.ensure_field_writable("user", "admin", settings=self._settings)
+        hidden_fields.ensure_field_writable("user", "status", settings=self._settings)
+        payload: dict[str, Any] = {
+            "login": login,
+            "email": email,
+            "firstName": firstname,
+            "lastName": lastname,
+            "admin": admin,
+            "status": status,
+        }
+        if password is not None:
+            payload["password"] = password
+        if language is not None:
+            hidden_fields.ensure_field_writable("user", "language", settings=self._settings)
+            payload["language"] = language
+        form = await self._api.create_form(payload)
+
+        async def _commit(p: dict[str, Any]) -> UserDetail:
+            commit_payload = p
+            if password is not None:
+                # OpenProject's users/form response never echoes `password`
+                # back (a security precaution, not a validation gap) --
+                # committing form.payload verbatim would silently drop it, so
+                # it's restored from the caller's own value before the write.
+                commit_payload = {**commit_payload, "password": password}
+            return await self._api.commit_create(commit_payload)
+
+        outcome = await _finalize_write(
+            confirm=confirm,
+            payload=form.payload,
+            validation_errors=form.validation_errors,
+            identity={"user_id": None},
+            ensure_write_enabled=lambda: access.ensure_write_enabled("admin", settings=self._settings),
+            commit=_commit,
+            committed_identity=lambda d: {"user_id": d.id},
+            rejected_message="OpenProject rejected the proposed user changes. Fix the validation errors before confirming.",
+            preview_message="OpenProject validated the user. Ask for confirmation, then call again with confirm=true to create it.",
+            success_message="User created successfully.",
+        )
+        return self._to_write_result("create", outcome)
+
+    async def update(
+        self,
+        *,
+        user_id: int,
+        login: str | None = None,
+        email: str | None = None,
+        firstname: str | None = None,
+        lastname: str | None = None,
+        admin: bool | None = None,
+        language: str | None = None,
+        confirm: bool = False,
+    ) -> UserWriteResult:
+        payload: dict[str, Any] = {}
+        if login is not None:
+            hidden_fields.ensure_field_writable("user", "login", settings=self._settings)
+            payload["login"] = login
+        if email is not None:
+            hidden_fields.ensure_field_writable("user", "email", settings=self._settings)
+            payload["email"] = email
+        if firstname is not None:
+            hidden_fields.ensure_field_writable("user", "firstname", settings=self._settings)
+            payload["firstName"] = firstname
+        if lastname is not None:
+            hidden_fields.ensure_field_writable("user", "lastname", settings=self._settings)
+            payload["lastName"] = lastname
+        if admin is not None:
+            hidden_fields.ensure_field_writable("user", "admin", settings=self._settings)
+            payload["admin"] = admin
+        if language is not None:
+            hidden_fields.ensure_field_writable("user", "language", settings=self._settings)
+            payload["language"] = language
+        form = await self._api.update_form(user_id, payload)
+        outcome = await _finalize_write(
+            confirm=confirm,
+            payload=form.payload,
+            validation_errors=form.validation_errors,
+            identity={"user_id": user_id},
+            ensure_write_enabled=lambda: access.ensure_write_enabled("admin", settings=self._settings),
+            commit=lambda p: self._api.commit_update(user_id, p),
+            committed_identity=lambda d: {"user_id": d.id},
+            rejected_message="OpenProject rejected the proposed user changes. Fix the validation errors before confirming.",
+            preview_message="OpenProject validated the user change. Ask for confirmation, then call again with confirm=true to write it.",
+            success_message="User updated successfully.",
+        )
+        return self._to_write_result("update", outcome)
+
+    async def delete(self, user_id: int, *, confirm: bool = False) -> UserWriteResult:
+        # No detail fetched on either branch -- delete's commit callable
+        # returns None, matching the pre-existing result=None shape.
+        payload = {"id": user_id}
+
+        async def _commit(p: dict[str, Any]) -> None:
+            await self._api.commit_delete(user_id)
+
+        outcome = await _finalize_write(
+            confirm=confirm,
+            payload=payload,
+            validation_errors={},
+            identity={"user_id": user_id},
+            ensure_write_enabled=lambda: access.ensure_write_enabled("admin", settings=self._settings),
+            commit=_commit,
+            committed_identity=lambda d: {"user_id": user_id},
+            rejected_message="",
+            preview_message="OpenProject is ready to delete the user. Ask for confirmation, then call again with confirm=true.",
+            success_message="User deleted successfully.",
+            gate_before_preview=True,
+        )
+        return self._to_write_result("delete", outcome)
+
+    async def lock(self, user_id: int, *, confirm: bool = False) -> UserWriteResult:
+        return await self._finalize_action(
+            action="lock",
+            user_id=user_id,
+            confirm=confirm,
+            preview_message="OpenProject is ready to lock the user. Ask for confirmation, then call again with confirm=true.",
+            success_message="User locked successfully.",
+            commit=self._api.commit_lock,
+        )
+
+    async def unlock(self, user_id: int, *, confirm: bool = False) -> UserWriteResult:
+        return await self._finalize_action(
+            action="unlock",
+            user_id=user_id,
+            confirm=confirm,
+            preview_message="OpenProject is ready to unlock the user. Ask for confirmation, then call again with confirm=true.",
+            success_message="User unlocked successfully.",
+            commit=self._api.commit_unlock,
+        )
+
+    async def _finalize_action(
+        self,
+        *,
+        action: str,
+        user_id: int,
+        confirm: bool,
+        preview_message: str,
+        success_message: str,
+        commit: Any,
+    ) -> UserWriteResult:
+        # Shared shape for lock/unlock only: no form, no validation-errors
+        # branch, no prior GET -- checked unconditionally for the same reason
+        # as delete() above. Not `_write_outcome.py`'s `_finalize_write`
+        # (that shape assumes a form/validation-errors branch neither action
+        # has); modeled instead on `ProjectService.set_favorite`'s no-form
+        # toggle shape.
+        access.ensure_write_enabled("admin", settings=self._settings)
+        hidden_fields.ensure_field_writable("user", "locked", settings=self._settings)
+        payload = {"id": user_id}
+        if not confirm:
+            return self._write_result(
+                action=action,
+                state="preview",
+                ready=True,
+                message=preview_message,
+                user_id=user_id,
+                payload=payload,
+                validation_errors={},
+                result=None,
+            )
+        detail = await commit(user_id)
+        return self._write_result(
+            action=action,
+            state="confirmed",
+            ready=True,
+            message=success_message,
+            user_id=detail.id,
+            payload=payload,
+            validation_errors={},
+            result=detail,
+        )
+
+    def _write_result(
+        self,
+        *,
+        action: str,
+        state: WriteResultState,
+        ready: bool,
+        message: str,
+        user_id: int | None,
+        payload: dict[str, Any],
+        validation_errors: dict[str, str],
+        result: UserDetail | None,
+    ) -> UserWriteResult:
+        return UserWriteResult(
+            action=action,
+            state=state,
+            ready=ready,
+            message=message,
+            user_id=user_id,
+            payload=payload,
+            validation_errors=validation_errors,
+            result=self._stamp(result) if result is not None else None,
+        )
+
+    def _to_write_result(self, action: str, outcome: _WriteOutcome[UserDetail | None]) -> UserWriteResult:
+        return UserWriteResult(
+            action=action,
+            state=outcome.state,
+            ready=outcome.ready,
+            message=outcome.message,
+            payload=outcome.payload,
+            validation_errors=outcome.validation_errors,
+            result=self._stamp(outcome.detail) if outcome.detail is not None else None,
+            **outcome.identity,
+        )

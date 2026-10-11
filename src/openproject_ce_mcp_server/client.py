@@ -1,0 +1,1610 @@
+from __future__ import annotations
+
+import base64
+import json
+import logging
+from dataclasses import replace
+from fnmatch import fnmatchcase
+from typing import Any
+
+import httpx
+
+from . import __version__
+from .app.adapters.httpx_action_capability_api import HttpxActionCapabilityApi
+from .app.adapters.httpx_activity_api import HttpxActivityApi
+from .app.adapters.httpx_attachment_api import HttpxAttachmentApi
+from .app.adapters.httpx_backlog_bucket_api import HttpxBacklogBucketApi
+from .app.adapters.httpx_board_api import HttpxBoardApi
+from .app.adapters.httpx_category_api import HttpxCategoryApi
+from .app.adapters.httpx_cost_api import HttpxCostApi
+from .app.adapters.httpx_current_user_api import HttpxCurrentUserApi
+from .app.adapters.httpx_document_api import HttpxDocumentApi
+from .app.adapters.httpx_emoji_reaction_api import HttpxEmojiReactionApi
+from .app.adapters.httpx_extended_metadata_api import HttpxExtendedMetadataApi
+from .app.adapters.httpx_file_link_api import HttpxFileLinkApi
+from .app.adapters.httpx_github_gitlab_link_api import HttpxGithubGitlabLinkApi
+from .app.adapters.httpx_grid_api import HttpxGridApi
+from .app.adapters.httpx_group_api import HttpxGroupApi
+from .app.adapters.httpx_instance_configuration_api import HttpxInstanceConfigurationApi
+from .app.adapters.httpx_job_status_api import HttpxJobStatusApi
+from .app.adapters.httpx_meeting_agenda_item_api import HttpxMeetingAgendaItemApi
+from .app.adapters.httpx_meeting_api import HttpxMeetingApi
+from .app.adapters.httpx_meeting_outcome_api import HttpxMeetingOutcomeApi
+from .app.adapters.httpx_meeting_section_api import HttpxMeetingSectionApi
+from .app.adapters.httpx_membership_api import HttpxMembershipApi
+from .app.adapters.httpx_news_api import HttpxNewsApi
+from .app.adapters.httpx_notification_api import HttpxNotificationApi
+from .app.adapters.httpx_post_api import HttpxPostApi
+from .app.adapters.httpx_principal_api import HttpxPrincipalApi
+from .app.adapters.httpx_project_api import HttpxProjectApi
+from .app.adapters.httpx_project_api import normalize_option_value as _normalize_option_value
+from .app.adapters.httpx_project_api import normalize_project as _normalize_project
+from .app.adapters.httpx_project_storage_api import HttpxProjectStorageApi
+from .app.adapters.httpx_query_execution_api import HttpxQueryExecutionApi
+from .app.adapters.httpx_query_metadata_api import HttpxQueryMetadataApi
+from .app.adapters.httpx_recurring_meeting_api import HttpxRecurringMeetingApi
+from .app.adapters.httpx_relation_api import HttpxRelationApi
+from .app.adapters.httpx_reminder_api import HttpxReminderApi
+from .app.adapters.httpx_role_api import HttpxRoleApi
+from .app.adapters.httpx_sprint_api import HttpxSprintApi
+from .app.adapters.httpx_status_priority_type_api import HttpxStatusPriorityTypeApi
+from .app.adapters.httpx_storage_api import HttpxStorageApi
+from .app.adapters.httpx_time_entry_api import HttpxTimeEntryApi
+from .app.adapters.httpx_user_api import HttpxUserApi
+from .app.adapters.httpx_user_non_working_time_api import HttpxUserNonWorkingTimeApi
+from .app.adapters.httpx_user_preferences_api import HttpxUserPreferencesApi
+from .app.adapters.httpx_user_working_hours_api import HttpxUserWorkingHoursApi
+from .app.adapters.httpx_version_api import HttpxVersionApi
+from .app.adapters.httpx_view_api import HttpxViewApi
+from .app.adapters.httpx_watcher_api import HttpxWatcherApi
+from .app.adapters.httpx_wiki_page_api import HttpxWikiPageApi
+from .app.adapters.httpx_wiki_page_link_api import HttpxWikiPageLinkApi
+from .app.adapters.httpx_work_package_api import HttpxWorkPackageApi
+from .app.adapters.httpx_work_package_lookup_api import HttpxWorkPackageLookupApi
+from .app.adapters.httpx_work_package_picker_api import HttpxWorkPackagePickerApi
+from .app.caches import SingletonCache
+
+# AuthenticationError/PermissionDeniedError/its three OPM-2708 subclasses
+# (CapabilityDisabledError/ProjectScopeDeniedError/OpenProjectPermissionDeniedError)
+# /ConflictError/RateLimitedError: not referenced directly in this module, but
+# re-exported deliberately -- existing callers/tests import them from here
+# (e.g. `from openproject_ce_mcp_server.client import PermissionDeniedError`, used by
+# tests/integration/test_work_packages.py among others) and must keep working.
+from .app.errors import (
+    AuthenticationError,  # noqa: F401
+    CapabilityDisabledError,  # noqa: F401
+    ConflictError,  # noqa: F401
+    InvalidInputError,  # noqa: F401
+    NotFoundError,  # noqa: F401
+    OpenProjectError,  # noqa: F401
+    OpenProjectPermissionDeniedError,  # noqa: F401
+    OpenProjectServerError,
+    PermissionDeniedError,  # noqa: F401
+    ProjectLinkPrefixError,  # noqa: F401
+    ProjectScopeDeniedError,  # noqa: F401
+    RateLimitedError,  # noqa: F401
+    TransportError,
+)
+from .app.origin import api_prefix_from_url, origin_from_url
+from .app.pagination import (
+    paginate_client as _paginate_client,  # noqa: F401 -- re-exported, test_versions_and_sprints.py imports it directly
+)
+from .app.pagination import (
+    paginate_server as _paginate_server,  # noqa: F401 -- re-exported, test_versions_and_sprints.py imports it directly
+)
+from .app.policies import access as _access_policy
+from .app.policies import hidden_fields as _hidden_fields_policy
+from .app.ports.action_capability_api import ActionCapabilityApi
+from .app.ports.activity_api import ActivityApi
+from .app.ports.attachment_api import AttachmentApi
+from .app.ports.backlog_bucket_api import BacklogBucketApi
+from .app.ports.board_api import BoardApi
+from .app.ports.category_api import CategoryApi
+from .app.ports.cost_api import CostApi
+from .app.ports.current_user_api import CurrentUserApi, CurrentUserRecord
+from .app.ports.document_api import DocumentApi
+from .app.ports.emoji_reaction_api import EmojiReactionApi
+from .app.ports.extended_metadata_api import ExtendedMetadataApi
+from .app.ports.file_link_api import FileLinkApi
+from .app.ports.github_gitlab_link_api import GithubGitlabLinkApi
+from .app.ports.grid_api import GridApi
+from .app.ports.group_api import GroupApi
+from .app.ports.instance_configuration_api import InstanceConfigurationApi, InstanceConfigurationRecord
+from .app.ports.job_status_api import JobStatusApi
+from .app.ports.meeting_agenda_item_api import MeetingAgendaItemApi
+from .app.ports.meeting_api import MeetingApi
+from .app.ports.meeting_outcome_api import MeetingOutcomeApi
+from .app.ports.meeting_section_api import MeetingSectionApi
+from .app.ports.membership_api import MembershipApi
+from .app.ports.news_api import NewsApi
+from .app.ports.notification_api import NotificationApi
+from .app.ports.post_api import PostApi
+from .app.ports.principal_api import PrincipalApi
+from .app.ports.project_api import ProjectApi
+from .app.ports.project_resolution import ProjectResolutionContext
+from .app.ports.project_storage_api import ProjectStorageApi
+from .app.ports.query_execution_api import QueryExecutionApi
+from .app.ports.query_metadata_api import QueryMetadataApi
+from .app.ports.recurring_meeting_api import RecurringMeetingApi
+from .app.ports.relation_api import RelationApi
+from .app.ports.reminder_api import ReminderApi
+from .app.ports.role_api import RoleApi
+from .app.ports.sprint_api import SprintApi
+from .app.ports.status_priority_type_api import PriorityRecord, StatusPriorityTypeApi, StatusRecord
+from .app.ports.storage_api import StorageApi
+from .app.ports.time_entry_api import TimeEntryApi
+from .app.ports.user_api import UserApi
+from .app.ports.user_non_working_time_api import UserNonWorkingTimeApi
+from .app.ports.user_preferences_api import UserPreferencesApi
+from .app.ports.user_working_hours_api import UserWorkingHoursApi
+from .app.ports.version_api import VersionApi
+from .app.ports.view_api import ViewApi
+from .app.ports.watcher_api import WatcherApi
+from .app.ports.wiki_page_api import WikiPageApi
+from .app.ports.wiki_page_link_api import WikiPageLinkApi
+from .app.ports.work_package_api import WorkPackageApi
+from .app.ports.work_package_lookup_api import WorkPackageLookupApi
+from .app.ports.work_package_picker_api import WorkPackagePickerApi
+from .app.resolvers.assignee_resolver import AssigneeResolver
+from .app.resolvers.current_user_resolver import CurrentUserResolver
+from .app.resolvers.principal_resolver import PrincipalResolver
+from .app.resolvers.project_resolver import ProjectResolver
+from .app.resolvers.sprint_resolver import SprintResolver
+from .app.resolvers.status_priority_type_resolver import StatusPriorityTypeResolver
+from .app.resolvers.type_resolver import TypeResolver
+from .app.resolvers.version_resolver import VersionResolver
+from .app.resolvers.work_package_resolver import WorkPackageResolver
+from .app.services.action_capability_service import ActionCapabilityService
+from .app.services.activity_service import ActivityService
+from .app.services.attachment_service import AttachmentService
+from .app.services.backlog_bucket_service import BacklogBucketService
+from .app.services.board_service import BoardService
+from .app.services.category_service import CategoryService
+from .app.services.cost_service import CostService
+from .app.services.current_user_service import CurrentUserService
+from .app.services.document_service import DocumentService
+from .app.services.emoji_reaction_service import EmojiReactionService
+from .app.services.extended_metadata_service import ExtendedMetadataService
+from .app.services.file_link_service import FileLinkService
+from .app.services.github_gitlab_link_service import GithubGitlabLinkService
+from .app.services.grid_service import GridService
+from .app.services.group_service import GroupService
+from .app.services.instance_configuration_service import InstanceConfigurationService
+from .app.services.job_status_service import JobStatusService
+from .app.services.meeting_agenda_item_service import MeetingAgendaItemService
+from .app.services.meeting_outcome_service import MeetingOutcomeService
+from .app.services.meeting_section_service import MeetingSectionService
+from .app.services.meeting_service import MeetingService
+from .app.services.membership_service import MembershipService
+from .app.services.news_service import NewsService
+from .app.services.notification_service import NotificationService
+from .app.services.post_service import PostService
+from .app.services.principal_service import PrincipalService
+from .app.services.project_directory_service import ProjectDirectoryService
+from .app.services.project_service import CLEAR_PARENT as _PROJECT_CLEAR_PARENT
+from .app.services.project_service import ProjectAdminService, ProjectService
+from .app.services.project_storage_service import ProjectStorageService
+from .app.services.query_execution_service import QueryExecutionService
+from .app.services.query_metadata_service import QueryMetadataService
+from .app.services.recurring_meeting_service import RecurringMeetingService
+from .app.services.relation_service import RelationService
+from .app.services.reminder_service import ReminderService
+from .app.services.role_service import RoleService
+from .app.services.sprint_service import SprintService
+from .app.services.status_priority_type_service import StatusPriorityTypeService
+from .app.services.storage_service import StorageService
+from .app.services.time_entry_service import TimeEntryService
+from .app.services.user_non_working_time_service import UserNonWorkingTimeService
+from .app.services.user_preferences_service import UserPreferencesService
+from .app.services.user_service import UserService
+from .app.services.user_working_hours_service import UserWorkingHoursService
+from .app.services.version_service import VersionService
+from .app.services.view_service import ViewService
+from .app.services.watcher_service import WatcherService
+from .app.services.wiki_page_link_service import WikiPageLinkService
+from .app.services.wiki_page_service import WikiPageService
+from .app.services.work_package_picker_service import WorkPackagePickerService
+
+# CLEAR/CLEAR_VERSION/CLEAR_PARENT are canonically defined in
+# app/services/work_package_service.py (this domain's write-path migration
+# moved them there) and re-exported here unchanged -- object identity is
+# preserved by Python's normal import semantics, so tools_work_packages.py's
+# existing `from .client import CLEAR, CLEAR_PARENT, CLEAR_VERSION` keeps
+# working without any change. `CLEAR` is also still used internally below
+# (Projects' write path, a DIFFERENT, unrelated sentinel from the same-named
+# CLEAR_PARENT here -- Projects' own is aliased to _PROJECT_CLEAR_PARENT
+# above, never conflated with this one). `_narrow_cleared` is NOT re-exported
+# -- it was client.py-internal only, never imported by the tool layer, and
+# the Service now has its own copy.
+from .app.services.work_package_service import CLEAR, CLEAR_PARENT, CLEAR_VERSION, WorkPackageService  # noqa: F401
+from .app.transport.errors import raise_for_status as _map_status_to_error
+from .app.transport.httpx_transport import HttpxTransport
+from .app.transport.learning_transport import LearningTransport
+from .config import Settings
+from .hal import normalize_links
+from .models import (
+    FavoriteWriteResult,
+    OptionValue,
+    ProjectAccessSummary,
+    ProjectWorkPackageContext,
+    ProjectWriteResult,
+    WorkPackageFieldSchema,
+)
+
+LOGGER = logging.getLogger(__name__)
+QueryParamValue = str | int | float | bool | None
+
+
+def _client_headers(settings: Settings, api_token: str | None = None) -> dict[str, str]:
+    headers = {
+        "Accept": "application/hal+json, application/json",
+        "User-Agent": f"openproject-ce-mcp-server/{__version__}",
+    }
+    token = api_token or settings.api_token
+    if token:
+        encoded = base64.b64encode(f"apikey:{token}".encode()).decode()
+        headers["Authorization"] = f"Basic {encoded}"
+    return headers
+
+
+# Text caps below trim formattable fields (descriptions, comments) *before* they
+# are serialized back to the MCP client. They exist to protect the AGENT'S CONTEXT
+# WINDOW — not to save memory or bandwidth: the full text has already been fetched
+# from OpenProject and lives in this process; trimming only bounds how much lands
+# in the model's limited read context. Single-item reads (get_work_package,
+# get_work_package_activities) return their full text because one item is cheap;
+# only list/search results are capped, because many rows at full length flood the
+# context. That list-preview cap is configurable via OPENPROJECT_TEXT_LIMIT
+# (settings.text_limit, default 500) — see normalize_work_package_summary.
+FORMATTABLE_LIMIT = 1_200
+SUBJECT_LIMIT = 255
+
+# Array truncation limits for work package hierarchy and activity details
+WORK_PACKAGE_CHILDREN_LIMIT = 50
+WORK_PACKAGE_ANCESTORS_LIMIT = 20
+ACTIVITY_DETAILS_LIMIT = 20
+BATCH_READ_MAX_IDS = 100
+
+
+class OpenProjectClient:
+    """Small OpenProject API client with optional guarded write support."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        api_token: str | None = None,
+    ) -> None:
+        self.settings = settings
+        self._api_specification: dict[str, Any] | None = None
+        # Generic OpenAPI operations are derived once per client alongside
+        # the already cached specification. The tuple stores both the browse
+        # view and its operationId index for constant-time dispatch.
+        self._generic_api_operation_index: tuple[list[dict[str, Any]], dict[str, dict[str, Any]]] | None = None
+        self._origin = origin_from_url(settings.base_url)
+        self._api_prefix = api_prefix_from_url(settings.base_url)
+        # Process-lifetime caches for read-only, process-global API responses
+        # (see app/caches.py) -- each is shared by every real consumer of
+        # that value (Service and, where one exists, Resolver alike).
+        self._current_user_cache: SingletonCache[CurrentUserRecord] = SingletonCache()
+        self._statuses_cache: SingletonCache[list[StatusRecord]] = SingletonCache()
+        self._priorities_cache: SingletonCache[list[PriorityRecord]] = SingletonCache()
+        self._instance_configuration_cache: SingletonCache[InstanceConfigurationRecord] = SingletonCache()
+
+        # Three successive review rounds each found a real bug in a prior
+        # version of this block trying to patch specific caller-supplied
+        # transport orderings in place with `isinstance` checks -- there is
+        # no bounded set of "the orderings a caller might use", so patching
+        # detected orderings one at a time cannot converge (a wrong-position
+        # CountingTransport still counts, just at the wrong place, so
+        # "is one present anywhere" is not sufficient -- its POSITION
+        # matters). Normalizing instead: unconditionally strip every
+        # existing CountingTransport layer out of whatever chain the caller
+        # supplied (its position is never trusted), then add back exactly
+        # one at the one position (inside the innermost RetryTransport if
+        # the caller supplied one, otherwise innermost overall) that is
+        # actually guaranteed to count every real retry attempt correctly.
+        # See transport_chain.py's own docstring for the specific orderings
+        # this replaced.
+        from .counting_transport import CountingTransport
+        from .retry_transport import RetryTransport
+        from .transport_chain import find_innermost_in_chain, remove_from_chain
+
+        # A caller who explicitly passed their own `transport` gets exactly
+        # what they asked for -- opting into a custom transport already
+        # means opting out of httpx's own verify=/trust_env-based proxy
+        # resolution, same as it always has (an explicit `transport=`
+        # bypasses those regardless of anything this class does). This
+        # branch exists ONLY for that explicit-caller-transport case.
+        if transport is not None:
+            base_transport = remove_from_chain(transport, CountingTransport)
+            existing_retry = find_innermost_in_chain(base_transport, RetryTransport)
+            if existing_retry is not None:
+                # A caller-supplied RetryTransport anywhere in the chain
+                # already defines the retry policy -- OPENPROJECT_MAX_RETRIES
+                # is not applied on top of it (this codebase never had a way
+                # to combine two different retry policies meaningfully, and
+                # layering ours outside theirs would multiply real network
+                # attempts). The INNERMOST one specifically (find_innermost_
+                # in_chain, not find_in_chain) -- a chain can validly nest
+                # more than one RetryTransport, and CountingTransport must
+                # sit inside the one actually closest to the real network to
+                # count every real attempt, not just the outer layer's own.
+                existing_retry.wrapped_transport = CountingTransport(existing_retry.wrapped_transport)
+            else:
+                base_transport = CountingTransport(base_transport)
+                if settings.max_retries > 0:
+                    base_transport = RetryTransport(
+                        wrapped_transport=base_transport,
+                        max_retries=settings.max_retries,
+                        base_delay=settings.retry_base_delay,
+                        max_delay=settings.retry_max_delay,
+                    )
+            self._http = httpx.AsyncClient(
+                base_url=f"{settings.api_base_url.rstrip('/')}/",
+                headers=_client_headers(settings, api_token),
+                timeout=httpx.Timeout(settings.timeout),
+                verify=settings.verify_ssl,
+                follow_redirects=True,
+                transport=base_transport,
+            )
+        else:
+            # No caller-supplied transport -- CountingTransport still must be
+            # installed unconditionally (OPM-2709), but NEVER by passing an
+            # explicit `transport=`/`mounts=` to httpx.AsyncClient's own
+            # constructor here: either one, tried in earlier versions of
+            # this code, silently broke httpx's own environment-variable-
+            # based proxy resolution (`allow_env_proxies = trust_env and
+            # transport is None` in AsyncClient.__init__ -- a single
+            # `mounts={"all://": ...}` also loses because a real, more
+            # specific env-proxy mount like "https://" is matched over the
+            # wildcard "all://" pattern, silently routing every proxied
+            # request around our transport entirely and back to
+            # undercounting). Constructing AsyncClient with NEITHER
+            # `transport=` nor `mounts=` lets it build its OWN verify_ssl-
+            # and env-proxy-configured transport(s) exactly as it always
+            # has, then wrapping `self._http._transport` and every value in
+            # `self._http._mounts` IN PLACE afterward reaches every real
+            # request path (the base transport for unproxied schemes, and
+            # each scheme-specific proxy transport) without ever
+            # influencing which one httpx picks for a given URL.
+            self._http = httpx.AsyncClient(
+                base_url=f"{settings.api_base_url.rstrip('/')}/",
+                headers=_client_headers(settings, api_token),
+                timeout=httpx.Timeout(settings.timeout),
+                verify=settings.verify_ssl,
+                follow_redirects=True,
+            )
+
+            def _wrap(t: httpx.AsyncBaseTransport) -> httpx.AsyncBaseTransport:
+                wrapped: httpx.AsyncBaseTransport = CountingTransport(t)
+                if settings.max_retries > 0:
+                    wrapped = RetryTransport(
+                        wrapped_transport=wrapped,
+                        max_retries=settings.max_retries,
+                        base_delay=settings.retry_base_delay,
+                        max_delay=settings.retry_max_delay,
+                    )
+                return wrapped
+
+            self._http._transport = _wrap(self._http._transport)  # noqa: SLF001
+            self._http._mounts = {  # noqa: SLF001
+                pattern: (_wrap(mount_transport) if mount_transport is not None else None)
+                for pattern, mount_transport in self._http._mounts.items()  # noqa: SLF001
+            }
+
+        # Every HttpxTransport wraps the SAME httpx.AsyncClient constructed
+        # above (one connection pool). The directory looks projects up on a
+        # transport of its own, so a lookup is not learned from again; every
+        # adapter gets the one learning transport, so no response reaches a
+        # scope policy before the directory has seen it.
+        self._project_directory = ProjectDirectoryService(
+            api=HttpxProjectApi(HttpxTransport(self._http), base_url=settings.base_url, api_prefix=self._api_prefix),
+            settings=settings,
+        )
+        self._project_id_to_identifier = self._project_directory.positives
+        self._transport = LearningTransport(HttpxTransport(self._http), learn=self._project_directory.learn)
+        self._project_api: ProjectApi = HttpxProjectApi(
+            self._transport, base_url=settings.base_url, api_prefix=self._api_prefix
+        )
+        self._project_resolver = ProjectResolver(
+            api=self._project_api, settings=settings, project_id_to_identifier=self._project_id_to_identifier
+        )
+        self._project_service = ProjectService(
+            api=self._project_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolver=self._project_resolver,
+            base_url=settings.base_url,
+            api_prefix=self._api_prefix,
+        )
+        self._project_admin_service = ProjectAdminService(
+            api=self._project_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolver=self._project_resolver,
+            base_url=settings.base_url,
+        )
+
+        self._version_api: VersionApi = HttpxVersionApi(self._transport)
+        self._version_service = VersionService(
+            api=self._version_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_project_ref=self._get_project_payload,
+            api_prefix=self._api_prefix,
+        )
+        # self._project_id_to_identifier is the directory's live dict, updated in
+        # place as projects are learned; a copy here would freeze it at startup.
+        self._version_resolver = VersionResolver(
+            api=self._version_api,
+            resolve_project_ref=self._get_project_payload,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+        )
+
+        self._role_api: RoleApi = HttpxRoleApi(self._transport)
+        self._role_service = RoleService(api=self._role_api, settings=settings)
+
+        self._instance_configuration_api: InstanceConfigurationApi = HttpxInstanceConfigurationApi(self._transport)
+        self._instance_configuration_service = InstanceConfigurationService(
+            api=self._instance_configuration_api, settings=settings, cache=self._instance_configuration_cache
+        )
+
+        self._current_user_api: CurrentUserApi = HttpxCurrentUserApi(self._transport)
+        self._current_user_service = CurrentUserService(
+            api=self._current_user_api, settings=settings, cache=self._current_user_cache
+        )
+        self._current_user_resolver = CurrentUserResolver(
+            api=self._current_user_api, settings=settings, cache=self._current_user_cache
+        )
+
+        self._principal_api: PrincipalApi = HttpxPrincipalApi(self._transport)
+        self._principal_service = PrincipalService(api=self._principal_api, settings=settings)
+        self._principal_resolver = PrincipalResolver(
+            api=self._principal_api, current_user=self._current_user_resolver, settings=settings
+        )
+        self._assignee_resolver = AssigneeResolver(current_user=self._current_user_resolver)
+
+        self._user_api: UserApi = HttpxUserApi(self._transport, base_url=settings.base_url)
+        self._user_service = UserService(api=self._user_api, settings=settings)
+
+        self._user_preferences_api: UserPreferencesApi = HttpxUserPreferencesApi(self._transport)
+        self._user_preferences_service = UserPreferencesService(api=self._user_preferences_api, settings=settings)
+
+        self._group_api: GroupApi = HttpxGroupApi(self._transport)
+        self._group_service = GroupService(api=self._group_api, settings=settings, api_prefix=self._api_prefix)
+
+        self._storage_api: StorageApi = HttpxStorageApi(self._transport)
+        self._storage_service = StorageService(api=self._storage_api, settings=settings)
+
+        self._project_storage_api: ProjectStorageApi = HttpxProjectStorageApi(self._transport)
+        self._project_storage_service = ProjectStorageService(
+            api=self._project_storage_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_project_ref=self._get_project_payload,
+        )
+
+        self._membership_api: MembershipApi = HttpxMembershipApi(
+            self._transport, base_url=settings.base_url, api_prefix=self._api_prefix
+        )
+        self._membership_service = MembershipService(
+            api=self._membership_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_project_ref=self._get_project_payload,
+            resolve_principal_ref=self._resolve_principal_id,
+            role_api=self._role_api,
+            api_prefix=self._api_prefix,
+        )
+
+        self._news_api: NewsApi = HttpxNewsApi(self._transport)
+        self._news_service = NewsService(
+            api=self._news_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_project_ref=self._get_project_payload,
+        )
+
+        self._document_api: DocumentApi = HttpxDocumentApi(self._transport)
+        self._document_service = DocumentService(
+            api=self._document_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_project_ref=self._get_project_payload,
+        )
+
+        self._wiki_page_api: WikiPageApi = HttpxWikiPageApi(self._transport)
+        self._wiki_page_service = WikiPageService(
+            api=self._wiki_page_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+        )
+
+        self._post_api: PostApi = HttpxPostApi(self._transport)
+        self._post_service = PostService(
+            api=self._post_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+        )
+
+        self._category_api: CategoryApi = HttpxCategoryApi(self._transport)
+        self._category_service = CategoryService(
+            api=self._category_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_project_ref=self._get_project_payload,
+        )
+
+        self._view_api: ViewApi = HttpxViewApi(self._transport)
+        self._view_service = ViewService(
+            api=self._view_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_project_ref=self._get_project_payload,
+        )
+
+        self._sprint_api: SprintApi = HttpxSprintApi(self._transport)
+        self._sprint_service = SprintService(
+            api=self._sprint_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_project_ref=self._get_project_payload,
+        )
+        self._sprint_resolver = SprintResolver(
+            api=self._sprint_api,
+            resolve_project_ref=self._get_project_payload,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+        )
+
+        self._backlog_bucket_api: BacklogBucketApi = HttpxBacklogBucketApi(self._transport)
+        self._backlog_bucket_service = BacklogBucketService(
+            api=self._backlog_bucket_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_project_ref=self._get_project_payload,
+        )
+
+        self._grid_api: GridApi = HttpxGridApi(self._transport)
+        self._grid_service = GridService(
+            api=self._grid_api,
+            project_lookup=self._project_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+        )
+
+        self._board_api: BoardApi = HttpxBoardApi(self._transport)
+        self._board_service = BoardService(
+            api=self._board_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_project_ref=self._get_project_payload,
+            api_prefix=self._api_prefix,
+            origin=self._origin,
+        )
+
+        self._action_capability_api: ActionCapabilityApi = HttpxActionCapabilityApi(
+            self._transport, base_url=settings.base_url
+        )
+        self._action_capability_service = ActionCapabilityService(
+            api=self._action_capability_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_project_ref=self._get_project_payload,
+        )
+
+        self._status_priority_type_api: StatusPriorityTypeApi = HttpxStatusPriorityTypeApi(self._transport)
+        self._status_priority_type_service = StatusPriorityTypeService(
+            api=self._status_priority_type_api,
+            settings=settings,
+            resolve_project_ref=self._get_project_payload,
+            statuses_cache=self._statuses_cache,
+            priorities_cache=self._priorities_cache,
+        )
+        self._status_priority_type_resolver = StatusPriorityTypeResolver(
+            api=self._status_priority_type_api,
+            statuses_cache=self._statuses_cache,
+            priorities_cache=self._priorities_cache,
+        )
+        self._type_resolver = TypeResolver(
+            api=self._status_priority_type_api, resolve_project_ref=self._get_project_payload
+        )
+
+        self._query_metadata_api: QueryMetadataApi = HttpxQueryMetadataApi(
+            self._transport, base_url=settings.base_url, origin=self._origin
+        )
+        self._query_metadata_service = QueryMetadataService(
+            api=self._query_metadata_api,
+            settings=settings,
+            resolve_project_ref=self._get_project_payload,
+        )
+
+        self._job_status_api: JobStatusApi = HttpxJobStatusApi(self._transport)
+        self._job_status_service = JobStatusService(
+            api=self._job_status_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+        )
+
+        self._extended_metadata_api: ExtendedMetadataApi = HttpxExtendedMetadataApi(self._transport)
+        self._extended_metadata_service = ExtendedMetadataService(api=self._extended_metadata_api, settings=settings)
+
+        # Narrow reference-resolution seam (WorkPackageIdResolver/
+        # WorkPackageProjectAllowedCheck) that several other app/ domains
+        # depend on. Kept exactly as-is below -- see that block's own
+        # comment for why.
+        self._work_package_lookup_api: WorkPackageLookupApi = HttpxWorkPackageLookupApi(
+            self._transport, base_url=settings.base_url, api_prefix=self._api_prefix
+        )
+        self._work_package_resolver = WorkPackageResolver(
+            api=self._work_package_lookup_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+        )
+
+        # Domain API port/adapter for Work Packages -- covers both the READ
+        # slice (list/search/get/batch/list_my_open) and the write slice
+        # (create/update/delete/bulk_*/add_comment/create_subtask). A
+        # separate, parallel port/adapter from work_package_lookup_api above
+        # -- see app/ports/work_package_api.py's module docstring for why
+        # this does NOT wrap/replace WorkPackageLookupApi, and why
+        # WorkPackageResolver above stays bound to work_package_lookup_api,
+        # the seam every work-package-reference-dependent domain uses.
+        self._work_package_api: WorkPackageApi = HttpxWorkPackageApi(
+            self._transport, base_url=settings.base_url, api_prefix=self._api_prefix
+        )
+        # Constructed here so WorkPackageService can depend on it directly
+        # for add_comment()'s reuse of the Activities normalizer, instead of
+        # duplicating that logic onto WorkPackageApi.
+        self._activity_api: ActivityApi = HttpxActivityApi(self._transport)
+        self._work_package_service = WorkPackageService(
+            api=self._work_package_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            readable_projects=self._project_directory,
+            resolve_project_ref=self._get_project_payload,
+            resolve_type_id=self._type_resolver.resolve_id,
+            resolve_version_id=self._resolve_version_id,
+            resolve_status_id=self._status_priority_type_resolver.resolve_status_id,
+            resolve_priority_id=self._status_priority_type_resolver.resolve_priority_id,
+            resolve_principal_id=self._resolve_principal_id,
+            resolve_assignee_id=self._assignee_resolver.resolve_id,
+            resolve_sprint_id=self._sprint_resolver.resolve_id,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+            status_api=self._status_priority_type_api,
+            activity_api=self._activity_api,
+            current_user=self._current_user_resolver,
+            work_package_project_allowed=self._work_package_resolver.project_link_allowed,
+            work_package_project_allowed_bulk=self._work_package_resolver.project_links_allowed,
+            api_prefix=self._api_prefix,
+        )
+
+        self._file_link_api: FileLinkApi = HttpxFileLinkApi(self._transport)
+        self._file_link_service = FileLinkService(
+            api=self._file_link_api,
+            work_package_lookup_api=self._work_package_lookup_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+        )
+
+        self._watcher_api: WatcherApi = HttpxWatcherApi(self._transport, api_prefix=self._api_prefix)
+        self._watcher_service = WatcherService(
+            api=self._watcher_api,
+            settings=settings,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+        )
+
+        self._emoji_reaction_api: EmojiReactionApi = HttpxEmojiReactionApi(self._transport)
+        self._emoji_reaction_service = EmojiReactionService(
+            api=self._emoji_reaction_api,
+            work_package_lookup_api=self._work_package_lookup_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+        )
+
+        self._work_package_picker_api: WorkPackagePickerApi = HttpxWorkPackagePickerApi(self._transport)
+        self._work_package_picker_service = WorkPackagePickerService(
+            api=self._work_package_picker_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+            resolve_project_ref=self._get_project_payload,
+        )
+
+        self._wiki_page_link_api: WikiPageLinkApi = HttpxWikiPageLinkApi(self._transport)
+        self._wiki_page_link_service = WikiPageLinkService(
+            api=self._wiki_page_link_api,
+            settings=settings,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+            current_user=self._current_user_resolver,
+        )
+
+        self._user_non_working_time_api: UserNonWorkingTimeApi = HttpxUserNonWorkingTimeApi(self._transport)
+        self._user_non_working_time_service = UserNonWorkingTimeService(
+            api=self._user_non_working_time_api, settings=settings
+        )
+
+        self._user_working_hours_api: UserWorkingHoursApi = HttpxUserWorkingHoursApi(self._transport)
+        self._user_working_hours_service = UserWorkingHoursService(api=self._user_working_hours_api, settings=settings)
+
+        # Depends on self._work_package_api (constructed above) directly, to
+        # normalize each raw embedded query result via its to_record() --
+        # matching WorkPackageService's own precedent of depending on
+        # self._activity_api directly rather than duplicating that domain's
+        # normalization logic.
+        self._query_execution_api: QueryExecutionApi = HttpxQueryExecutionApi(self._transport)
+        self._query_execution_service = QueryExecutionService(
+            api=self._query_execution_api,
+            work_package_api=self._work_package_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+        )
+
+        self._reminder_api: ReminderApi = HttpxReminderApi(self._transport)
+        self._reminder_service = ReminderService(
+            api=self._reminder_api,
+            work_package_lookup_api=self._work_package_lookup_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+            work_package_project_allowed=self._work_package_resolver.project_link_allowed,
+            work_package_project_allowed_bulk=self._work_package_resolver.project_links_allowed,
+        )
+
+        self._notification_api: NotificationApi = HttpxNotificationApi(self._transport)
+        self._notification_service = NotificationService(
+            api=self._notification_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            work_package_project_allowed=self._work_package_resolver.project_link_allowed,
+            work_package_project_allowed_bulk=self._work_package_resolver.project_links_allowed,
+        )
+
+        self._relation_api: RelationApi = HttpxRelationApi(self._transport)
+        self._relation_service = RelationService(
+            api=self._relation_api,
+            work_package_lookup_api=self._work_package_lookup_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+            work_package_project_allowed=self._work_package_resolver.project_link_allowed,
+            work_package_project_allowed_bulk=self._work_package_resolver.project_links_allowed,
+            api_prefix=self._api_prefix,
+        )
+
+        self._time_entry_api: TimeEntryApi = HttpxTimeEntryApi(
+            self._transport, base_url=settings.base_url, api_prefix=self._api_prefix
+        )
+        self._time_entry_service = TimeEntryService(
+            api=self._time_entry_api,
+            project_api=self._project_api,
+            user_api=self._user_api,
+            work_package_lookup_api=self._work_package_lookup_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+            resolve_project_ref=self._get_project_payload,
+            resolve_project_id=self._resolve_project_id,
+            resolve_principal_id=self._resolve_principal_id,
+            get_current_user=self._current_user_resolver,
+            api_prefix=self._api_prefix,
+        )
+
+        self._cost_api: CostApi = HttpxCostApi(self._transport)
+        self._cost_service = CostService(
+            api=self._cost_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+        )
+
+        self._github_gitlab_link_api: GithubGitlabLinkApi = HttpxGithubGitlabLinkApi(
+            self._transport, text_limit=settings.text_limit
+        )
+        self._github_gitlab_link_service = GithubGitlabLinkService(
+            api=self._github_gitlab_link_api,
+            settings=settings,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+        )
+
+        self._activity_service = ActivityService(
+            api=self._activity_api,
+            settings=settings,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+        )
+
+        self._attachment_api: AttachmentApi = HttpxAttachmentApi(
+            self._transport, base_url=settings.base_url, origin=self._origin
+        )
+        self._attachment_service = AttachmentService(
+            api=self._attachment_api,
+            work_package_lookup_api=self._work_package_lookup_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+        )
+
+        # Meetings (5 sub-resources). Meeting is constructed first --
+        # the other four sub-resources have no project of their own and
+        # depend on MeetingApi as a cross-domain Port to resolve their
+        # allowlist check through a parent Meeting (the precedent already
+        # established by WorkPackageService->ActivityApi/
+        # FileLinkService->WorkPackageLookupApi).
+        self._meeting_api: MeetingApi = HttpxMeetingApi(self._transport)
+        self._meeting_service = MeetingService(
+            api=self._meeting_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_project_ref=self._get_project_payload,
+            resolve_project_id=self._resolve_project_id,
+            resolve_principal_id=self._resolve_principal_id,
+            api_prefix=self._api_prefix,
+        )
+
+        self._meeting_agenda_item_api: MeetingAgendaItemApi = HttpxMeetingAgendaItemApi(
+            self._transport, text_limit=settings.text_limit
+        )
+        self._meeting_agenda_item_service = MeetingAgendaItemService(
+            api=self._meeting_agenda_item_api,
+            meeting_api=self._meeting_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+            api_prefix=self._api_prefix,
+        )
+
+        self._meeting_section_api: MeetingSectionApi = HttpxMeetingSectionApi(self._transport)
+        self._meeting_section_service = MeetingSectionService(
+            api=self._meeting_section_api,
+            meeting_api=self._meeting_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            api_prefix=self._api_prefix,
+        )
+
+        self._meeting_outcome_api: MeetingOutcomeApi = HttpxMeetingOutcomeApi(
+            self._transport, text_limit=settings.text_limit
+        )
+        self._meeting_outcome_service = MeetingOutcomeService(
+            api=self._meeting_outcome_api,
+            meeting_agenda_item_api=self._meeting_agenda_item_api,
+            meeting_api=self._meeting_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_work_package_id=self._work_package_resolver.resolve_id,
+            api_prefix=self._api_prefix,
+        )
+
+        self._recurring_meeting_api: RecurringMeetingApi = HttpxRecurringMeetingApi(self._transport)
+        self._recurring_meeting_service = RecurringMeetingService(
+            api=self._recurring_meeting_api,
+            settings=settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+            resolve_project_ref=self._get_project_payload,
+            api_prefix=self._api_prefix,
+        )
+
+    async def initialize(self) -> None:
+        await self._project_directory.refresh()
+
+    async def aclose(self) -> None:
+        await self._http.aclose()
+
+    async def get_api_specification(self) -> dict[str, Any]:
+        if self._api_specification is not None:
+            return self._api_specification
+        response = await self._http.get("spec.json")
+        self._raise_for_status(response)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise OpenProjectServerError("OpenProject returned an invalid API specification.") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("paths"), dict):
+            raise OpenProjectServerError("OpenProject returned an unsupported API specification format.")
+        self._api_specification = payload
+        return payload
+
+    async def get_authenticated_user_id(self) -> str:
+        """Return the OpenProject account ID used by this client credential."""
+        return str((await self._current_user_api.get_current_user()).summary.id)
+
+    async def call_api_operation(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: httpx.QueryParams
+        | list[tuple[str, QueryParamValue]]
+        | tuple[tuple[str, QueryParamValue], ...]
+        | None = None,
+        json_body: Any = None,
+        multipart: list[tuple[str, tuple[str | None, str | bytes, str]]] | None = None,
+        content_type: str | None = None,
+        max_response_bytes: int = 2 * 1024 * 1024,
+    ) -> dict[str, Any]:
+        """Execute a validated OpenAPI operation with bounded output."""
+        api_path = "" if path == "/api/v3" else path.removeprefix("/api/v3/")
+        try:
+            request_options: dict[str, Any] = {"params": params, "follow_redirects": False}
+            if multipart:
+                request_options["files"] = multipart
+            elif json_body is not None and content_type and content_type != "application/json":
+                request_options["content"] = json.dumps(json_body).encode()
+                request_options["headers"] = {"Content-Type": content_type}
+            elif json_body is not None:
+                request_options["json"] = json_body
+            async with self._http.stream(method, api_path, **request_options) as response:
+                chunks: list[bytes] = []
+                received = 0
+                async for chunk in response.aiter_bytes():
+                    received += len(chunk)
+                    if received > max_response_bytes:
+                        raise OpenProjectServerError(
+                            "OpenProject response exceeded the configured size limit.",
+                            upstream_status=response.status_code,
+                        )
+                    chunks.append(chunk)
+                content = b"".join(chunks)
+                if response.status_code >= 400:
+                    try:
+                        payload = json.loads(content) if content else {}
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        payload = {}
+                    _map_status_to_error(response.status_code, payload, response.headers.get("retry-after"))
+                content_type = response.headers.get("content-type", "")
+                if not content:
+                    body: Any = None
+                elif "json" in content_type:
+                    try:
+                        body = json.loads(content)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        body = content.decode("utf-8", errors="replace")
+                elif content_type.startswith(("text/", "application/xml", "application/xhtml+xml")):
+                    body = content.decode("utf-8", errors="replace")
+                else:
+                    body = {"encoding": "base64", "data": base64.b64encode(content).decode("ascii")}
+                return {"status_code": response.status_code, "content_type": content_type, "body": body}
+        except httpx.TimeoutException as exc:
+            raise TransportError("OpenProject request timed out.") from exc
+        except httpx.HTTPError as exc:
+            raise TransportError("Could not reach OpenProject.") from exc
+
+    # ── Service namespace properties ───────────────────────────────────────────
+    #
+    # Read-only views onto the same Service instances constructed in __init__ --
+    # a named alias, not a second implementation. All call sites have migrated
+    # to the namespaced form (e.g. `client.project.list(...)`); the flat
+    # delegation methods this comment used to describe (e.g. a former
+    # `client.list_projects(...)`) have been deleted except for a
+    # small number of remaining flat methods still called directly (see their
+    # own docstrings/callers) or composed into a handful of multi-Service
+    # convenience methods below (e.g. `get_my_project_access`,
+    # `get_project_work_package_context`). Object identity with the private
+    # `self._<domain>_service` attribute is enforced by
+    # `test_client_service_namespaces_are_complete_and_identity_preserving` in
+    # tests/test_architecture_boundaries.py, which also fails if a future Service
+    # is added without a matching property here.
+
+    @property
+    def action_capability(self) -> ActionCapabilityService:
+        """Same object as `self._action_capability_service` -- a named view, not a second implementation."""
+        return self._action_capability_service
+
+    @property
+    def activity(self) -> ActivityService:
+        """Same object as `self._activity_service` -- a named view, not a second implementation."""
+        return self._activity_service
+
+    @property
+    def attachment(self) -> AttachmentService:
+        """Same object as `self._attachment_service` -- a named view, not a second implementation."""
+        return self._attachment_service
+
+    @property
+    def backlog_bucket(self) -> BacklogBucketService:
+        """Same object as `self._backlog_bucket_service` -- a named view, not a second implementation."""
+        return self._backlog_bucket_service
+
+    @property
+    def board(self) -> BoardService:
+        """Same object as `self._board_service` -- a named view, not a second implementation."""
+        return self._board_service
+
+    @property
+    def category(self) -> CategoryService:
+        """Same object as `self._category_service` -- a named view, not a second implementation."""
+        return self._category_service
+
+    @property
+    def cost(self) -> CostService:
+        """Same object as `self._cost_service` -- a named view, not a second implementation."""
+        return self._cost_service
+
+    @property
+    def current_user(self) -> CurrentUserService:
+        """Same object as `self._current_user_service` -- a named view, not a second implementation."""
+        return self._current_user_service
+
+    @property
+    def document(self) -> DocumentService:
+        """Same object as `self._document_service` -- a named view, not a second implementation."""
+        return self._document_service
+
+    @property
+    def work_package_picker(self) -> WorkPackagePickerService:
+        """Same object as `self._work_package_picker_service` -- a named view, not a second implementation."""
+        return self._work_package_picker_service
+
+    @property
+    def emoji_reaction(self) -> EmojiReactionService:
+        """Same object as `self._emoji_reaction_service` -- a named view, not a second implementation."""
+        return self._emoji_reaction_service
+
+    @property
+    def extended_metadata(self) -> ExtendedMetadataService:
+        """Same object as `self._extended_metadata_service` -- a named view, not a second implementation."""
+        return self._extended_metadata_service
+
+    @property
+    def file_link(self) -> FileLinkService:
+        """Same object as `self._file_link_service` -- a named view, not a second implementation."""
+        return self._file_link_service
+
+    @property
+    def github_gitlab_link(self) -> GithubGitlabLinkService:
+        """Same object as `self._github_gitlab_link_service` -- a named view, not a second implementation."""
+        return self._github_gitlab_link_service
+
+    @property
+    def grid(self) -> GridService:
+        """Same object as `self._grid_service` -- a named view, not a second implementation."""
+        return self._grid_service
+
+    @property
+    def group(self) -> GroupService:
+        """Same object as `self._group_service` -- a named view, not a second implementation."""
+        return self._group_service
+
+    @property
+    def instance_configuration(self) -> InstanceConfigurationService:
+        """Same object as `self._instance_configuration_service` -- a named view, not a second implementation."""
+        return self._instance_configuration_service
+
+    @property
+    def job_status(self) -> JobStatusService:
+        """Same object as `self._job_status_service` -- a named view, not a second implementation."""
+        return self._job_status_service
+
+    @property
+    def meeting(self) -> MeetingService:
+        """Same object as `self._meeting_service` -- a named view, not a second implementation."""
+        return self._meeting_service
+
+    @property
+    def meeting_agenda_item(self) -> MeetingAgendaItemService:
+        """Same object as `self._meeting_agenda_item_service` -- a named view, not a second implementation."""
+        return self._meeting_agenda_item_service
+
+    @property
+    def meeting_outcome(self) -> MeetingOutcomeService:
+        """Same object as `self._meeting_outcome_service` -- a named view, not a second implementation."""
+        return self._meeting_outcome_service
+
+    @property
+    def meeting_section(self) -> MeetingSectionService:
+        """Same object as `self._meeting_section_service` -- a named view, not a second implementation."""
+        return self._meeting_section_service
+
+    @property
+    def membership(self) -> MembershipService:
+        """Same object as `self._membership_service` -- a named view, not a second implementation."""
+        return self._membership_service
+
+    @property
+    def news(self) -> NewsService:
+        """Same object as `self._news_service` -- a named view, not a second implementation."""
+        return self._news_service
+
+    @property
+    def notification(self) -> NotificationService:
+        """Same object as `self._notification_service` -- a named view, not a second implementation."""
+        return self._notification_service
+
+    @property
+    def post(self) -> PostService:
+        """Same object as `self._post_service` -- a named view, not a second
+        implementation. Named after OpenProject's "Post" (forum message) domain,
+        not the HTTP POST method -- see PostService for its actual operations.
+        """
+        return self._post_service
+
+    @property
+    def principal(self) -> PrincipalService:
+        """Same object as `self._principal_service` -- a named view, not a second implementation."""
+        return self._principal_service
+
+    @property
+    def project(self) -> ProjectService:
+        """Same object as `self._project_service` -- a named view, not a second implementation."""
+        return self._project_service
+
+    @property
+    def project_admin(self) -> ProjectAdminService:
+        """Same object as `self._project_admin_service` -- a named view, not a second implementation."""
+        return self._project_admin_service
+
+    @property
+    def project_storage(self) -> ProjectStorageService:
+        """Same object as `self._project_storage_service` -- a named view, not a second implementation."""
+        return self._project_storage_service
+
+    @property
+    def query_execution(self) -> QueryExecutionService:
+        """Same object as `self._query_execution_service` -- a named view, not a second implementation."""
+        return self._query_execution_service
+
+    @property
+    def query_metadata(self) -> QueryMetadataService:
+        """Same object as `self._query_metadata_service` -- a named view, not a second implementation."""
+        return self._query_metadata_service
+
+    @property
+    def recurring_meeting(self) -> RecurringMeetingService:
+        """Same object as `self._recurring_meeting_service` -- a named view, not a second implementation."""
+        return self._recurring_meeting_service
+
+    @property
+    def relation(self) -> RelationService:
+        """Same object as `self._relation_service` -- a named view, not a second implementation."""
+        return self._relation_service
+
+    @property
+    def reminder(self) -> ReminderService:
+        """Same object as `self._reminder_service` -- a named view, not a second implementation."""
+        return self._reminder_service
+
+    @property
+    def role(self) -> RoleService:
+        """Same object as `self._role_service` -- a named view, not a second implementation."""
+        return self._role_service
+
+    @property
+    def sprint(self) -> SprintService:
+        """Same object as `self._sprint_service` -- a named view, not a second implementation."""
+        return self._sprint_service
+
+    @property
+    def status_priority_type(self) -> StatusPriorityTypeService:
+        """Same object as `self._status_priority_type_service` -- a named view, not a second implementation."""
+        return self._status_priority_type_service
+
+    @property
+    def storage(self) -> StorageService:
+        """Same object as `self._storage_service` -- a named view, not a second implementation."""
+        return self._storage_service
+
+    @property
+    def time_entry(self) -> TimeEntryService:
+        """Same object as `self._time_entry_service` -- a named view, not a second implementation."""
+        return self._time_entry_service
+
+    @property
+    def user(self) -> UserService:
+        """Same object as `self._user_service` -- a named view, not a second implementation."""
+        return self._user_service
+
+    @property
+    def user_non_working_time(self) -> UserNonWorkingTimeService:
+        """Same object as `self._user_non_working_time_service` -- a named view, not a second implementation."""
+        return self._user_non_working_time_service
+
+    @property
+    def user_preferences(self) -> UserPreferencesService:
+        """Same object as `self._user_preferences_service` -- a named view, not a second implementation."""
+        return self._user_preferences_service
+
+    @property
+    def user_working_hours(self) -> UserWorkingHoursService:
+        """Same object as `self._user_working_hours_service` -- a named view, not a second implementation."""
+        return self._user_working_hours_service
+
+    @property
+    def version(self) -> VersionService:
+        """Same object as `self._version_service` -- a named view, not a second implementation."""
+        return self._version_service
+
+    @property
+    def view(self) -> ViewService:
+        """Same object as `self._view_service` -- a named view, not a second implementation."""
+        return self._view_service
+
+    @property
+    def watcher(self) -> WatcherService:
+        """Same object as `self._watcher_service` -- a named view, not a second implementation."""
+        return self._watcher_service
+
+    @property
+    def wiki_page(self) -> WikiPageService:
+        """Same object as `self._wiki_page_service` -- a named view, not a second implementation."""
+        return self._wiki_page_service
+
+    @property
+    def wiki_page_link(self) -> WikiPageLinkService:
+        """Same object as `self._wiki_page_link_service` -- a named view, not a second implementation."""
+        return self._wiki_page_link_service
+
+    @property
+    def work_package(self) -> WorkPackageService:
+        """Same object as `self._work_package_service` -- a named view, not a second implementation."""
+        return self._work_package_service
+
+    async def create_project(
+        self,
+        *,
+        name: str,
+        identifier: str,
+        description: str | None = None,
+        public: bool | None = None,
+        active: bool | None = None,
+        status: str | None = None,
+        status_explanation: str | None = None,
+        parent: str | object | None = None,
+        confirm: bool = False,
+    ) -> ProjectWriteResult:
+        return await self._project_service.create(
+            name=name,
+            identifier=identifier,
+            description=description,
+            public=public,
+            active=active,
+            status=status,
+            status_explanation=status_explanation,
+            parent=_PROJECT_CLEAR_PARENT if parent is CLEAR else parent,
+            confirm=confirm,
+        )
+
+    async def update_project(
+        self,
+        *,
+        project_ref: str,
+        name: str | None = None,
+        identifier: str | None = None,
+        description: str | None = None,
+        public: bool | None = None,
+        active: bool | None = None,
+        status: str | None = None,
+        status_explanation: str | None = None,
+        parent: str | object | None = None,
+        confirm: bool = False,
+    ) -> ProjectWriteResult:
+        return await self._project_service.update(
+            project_ref=project_ref,
+            name=name,
+            identifier=identifier,
+            description=description,
+            public=public,
+            active=active,
+            status=status,
+            status_explanation=status_explanation,
+            parent=_PROJECT_CLEAR_PARENT if parent is CLEAR else parent,
+            confirm=confirm,
+        )
+
+    async def get_my_project_access(self, project_ref: str) -> ProjectAccessSummary:
+        self._ensure_read_enabled("project")
+        self._ensure_read_enabled("membership")
+        self._ensure_read_enabled("principal")
+        current_user = await self.current_user.get_current_user()
+        project_payload = await self._resolve_project_ref(project_ref, write=False)
+        project_summary = _hidden_fields_policy.apply_hidden_fields(
+            "project",
+            _normalize_project(project_payload, text_limit=self.settings.text_limit),
+            settings=self.settings,
+        )
+        memberships = await self.membership.list_for_project(project_ref)
+        my_membership = next((item for item in memberships.results if item.principal_id == current_user.id), None)
+        project_links = sorted(project_payload.get("_links", {}).keys())
+        inferred_is_project_admin = any(
+            name.casefold() == "project admin" for name in (my_membership.role_names if my_membership else [])
+        )
+        inferred_can_edit_project = (
+            "update" in project_links or "updateImmediately" in project_links or inferred_is_project_admin
+        )
+        inferred_can_manage_memberships = bool(
+            my_membership
+            and (my_membership.can_update or my_membership.can_update_immediately or inferred_is_project_admin)
+        )
+        return self._apply_hidden_fields(
+            "project_access",
+            ProjectAccessSummary(
+                project_id=project_summary.id,
+                project_name=project_summary.name,
+                project_identifier=project_summary.identifier,
+                current_user_id=current_user.id,
+                current_user_name=current_user.name,
+                membership=my_membership,
+                inferred_is_project_admin=inferred_is_project_admin,
+                inferred_can_edit_project=inferred_can_edit_project,
+                inferred_can_manage_memberships=inferred_can_manage_memberships,
+                inference_basis="Derived from project HATEOAS links and the current user's project membership roles.",
+            ),
+        )
+
+    async def get_project_work_package_context(
+        self,
+        *,
+        project: str,
+        type: str | None = None,
+    ) -> ProjectWorkPackageContext:
+        self._ensure_read_enabled("project")
+        self._ensure_read_enabled("work_package")
+        self._ensure_read_enabled("version")
+        project_payload = await self._resolve_project_ref(project, write=False)
+        project_id = int(project_payload["id"])
+        types_payload = await self._get(f"projects/{project_id}/types")
+        available_types = [
+            _normalize_option_value(item) for item in types_payload.get("_embedded", {}).get("elements", [])
+        ]
+
+        selected_type_id: int | None = None
+        selected_type_name: str | None = None
+        fields: list[WorkPackageFieldSchema] = []
+        custom_fields: list[WorkPackageFieldSchema] = []
+        available_statuses: list[OptionValue] = [
+            _normalize_option_value(item)
+            for item in (await self._get("statuses")).get("_embedded", {}).get("elements", [])
+        ]
+        available_priorities: list[OptionValue] = [
+            _normalize_option_value(item)
+            for item in (await self._get("priorities")).get("_embedded", {}).get("elements", [])
+        ]
+        available_categories: list[OptionValue] = [
+            _normalize_option_value(item)
+            for item in (await self._get(f"projects/{project_id}/categories")).get("_embedded", {}).get("elements", [])
+        ]
+        available_project_phases: list[OptionValue] = []
+        versions = await self.version.list(project=str(project_id), offset=1, limit=self.settings.max_results)
+
+        if type is not None:
+            selected_type_id = int(await self._type_resolver.resolve_id(type, project=str(project_id)))
+            selected_type_name = next((item.title for item in available_types if item.id == selected_type_id), type)
+            form = await self._post(
+                f"projects/{project_id}/work_packages/form",
+                json_body={"_links": {"type": {"href": self._api_href(f"types/{selected_type_id}")}}},
+            )
+            schema = form.get("_embedded", {}).get("schema", {})
+            fields = [
+                self._normalize_field_schema(key, entry)
+                for key, entry in schema.items()
+                if isinstance(entry, dict) and entry.get("writable") is True
+            ]
+            custom_fields = [
+                field
+                for field in fields
+                if field.key.startswith("customField") and not self._custom_field_hidden(field.name, field.key)
+            ]
+            fields = [
+                field
+                for field in fields
+                if not (field.key.startswith("customField") and self._custom_field_hidden(field.name, field.key))
+            ]
+            status_field = next((field for field in fields if field.key == "status"), None)
+            priority_field = next((field for field in fields if field.key == "priority"), None)
+            category_field = next((field for field in fields if field.key == "category"), None)
+            project_phase_field = next((field for field in fields if field.key == "projectPhase"), None)
+            if status_field and status_field.allowed_values:
+                available_statuses = status_field.allowed_values
+            if priority_field and priority_field.allowed_values:
+                available_priorities = priority_field.allowed_values
+            if category_field:
+                available_categories = category_field.allowed_values
+            if project_phase_field:
+                available_project_phases = project_phase_field.allowed_values
+            # These four fields' allowed_values were just hoisted into the
+            # available_* lists above — clear them here so the same option
+            # enumeration isn't serialized twice in one response.
+            hoisted_keys = {"status", "priority", "category", "projectPhase"}
+            fields = [
+                replace(field, allowed_values=[]) if field.key in hoisted_keys and field.allowed_values else field
+                for field in fields
+            ]
+
+        return ProjectWorkPackageContext(
+            project_id=project_id,
+            project_name=_trim_text(project_payload.get("name"), limit=SUBJECT_LIMIT) or f"Project {project_id}",
+            project_identifier=project_payload.get("identifier"),
+            selected_type_id=selected_type_id,
+            selected_type_name=selected_type_name,
+            available_types=available_types,
+            available_statuses=available_statuses,
+            available_priorities=available_priorities,
+            available_categories=available_categories,
+            available_project_phases=available_project_phases,
+            available_versions=versions.results,
+            fields=fields,
+            custom_fields=custom_fields,
+        )
+
+    async def _set_project_favorite(self, project: str, *, favorite: bool, confirm: bool) -> FavoriteWriteResult:
+        return await self._project_service.set_favorite(project, favorite=favorite, confirm=confirm)
+
+    async def add_project_favorite(self, *, project: str, confirm: bool = False) -> FavoriteWriteResult:
+        return await self._set_project_favorite(project, favorite=True, confirm=confirm)
+
+    async def remove_project_favorite(self, *, project: str, confirm: bool = False) -> FavoriteWriteResult:
+        return await self._set_project_favorite(project, favorite=False, confirm=confirm)
+
+    # --- Statuses ---
+
+    # --- Relations (update + global list) ---
+
+    async def _get(self, path: str, *, params: dict[str, str] | None = None) -> dict[str, Any]:
+        return await self._request_json("GET", path, params=params)
+
+    async def _post(
+        self,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return await self._request_json("POST", path, params=params, json_body=json_body)
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        content: bytes | str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        response = await self._request(
+            method, path, params=params, json_body=json_body, content=content, headers=headers
+        )
+        return _parse_response_json(response)
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        files: dict[str, tuple[str | None, str | bytes, str]] | None = None,
+        content: bytes | str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        try:
+            response = await self._http.request(
+                method, path, params=params, json=json_body, files=files, content=content, headers=headers
+            )
+        except httpx.TimeoutException as exc:
+            raise TransportError("OpenProject request timed out.") from exc
+        except httpx.HTTPError as exc:
+            raise TransportError("Could not reach OpenProject.") from exc
+
+        self._raise_for_status(response)
+        return response
+
+    def _raise_for_status(self, response: httpx.Response) -> None:
+        if response.status_code < 400:
+            return
+        payload: dict[str, Any] = {}
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        _map_status_to_error(response.status_code, payload, response.headers.get("retry-after"))
+
+    def _normalize_field_schema(self, key: str, payload: dict[str, Any]) -> WorkPackageFieldSchema:
+        allowed_values = payload.get("_embedded", {}).get("allowedValues", [])
+        normalized_allowed_values = [_normalize_option_value(item) for item in allowed_values if isinstance(item, dict)]
+        return WorkPackageFieldSchema(
+            key=key,
+            name=_trim_text(payload.get("name"), limit=SUBJECT_LIMIT) or key,
+            type=_trim_text(payload.get("type"), limit=SUBJECT_LIMIT),
+            required=bool(payload.get("required")),
+            writable=bool(payload.get("writable")),
+            has_default=bool(payload.get("hasDefault")),
+            # Templated-subject hint (17.3+); present only when a type configures
+            # a subject template, otherwise absent.
+            placeholder=_trim_text(payload.get("placeholder"), limit=SUBJECT_LIMIT),
+            location=_trim_text(payload.get("location"), limit=SUBJECT_LIMIT),
+            allowed_values=normalized_allowed_values,
+        )
+
+    async def _get_project_payload(
+        self,
+        project_ref: str,
+        *,
+        write: bool = False,
+        context: ProjectResolutionContext | None = None,
+    ) -> dict[str, Any]:
+        if context is not None:
+            return await context.resolve(project_ref, write=write)
+        return await self._resolve_project_ref(project_ref, write=write)
+
+    async def _resolve_project_ref(self, project_ref: str, *, write: bool = False) -> dict[str, Any]:
+        """Resolve a project by numeric id, exact identifier, or (as a fallback) display name.
+
+        Delegates to the layered ProjectResolver (app/resolvers/project_resolver.py),
+        which is a verbatim behavioral port of this method's former inline
+        implementation. Kept as a stable internal facade -- every other domain's
+        client.py code (list_project_memberships, get_my_project_access, ...) still
+        calls this method (or _get_project_payload, which calls it) directly and
+        expects the identical raw-payload contract; only the body changed.
+        """
+        return await self._project_resolver.resolve(project_ref, write=write)
+
+    def _ensure_read_enabled(self, scope: str) -> None:
+        _access_policy.ensure_read_enabled(scope, settings=self.settings)
+
+    def _normalize_hide_token(self, value: str) -> str:
+        return _hidden_fields_policy.normalize_hide_token(value)
+
+    def _custom_field_hidden(self, field_name: str, key: str) -> bool:
+        patterns = tuple(self.settings.hide_custom_fields)
+        if not patterns:
+            return False
+        candidates = {
+            self._normalize_hide_token(field_name),
+            self._normalize_hide_token(key),
+        }
+        return any(
+            fnmatchcase(candidate, self._normalize_hide_token(pattern))
+            for pattern in patterns
+            for candidate in candidates
+        )
+
+    def _apply_hidden_fields(self, entity: str, value: Any) -> Any:
+        """Tag a result dataclass with the field names hidden for its entity.
+
+        The names are stamped as a private ``_hidden_keys`` attribute (not a
+        dataclass field, so it never appears in the schema/output). The
+        serialization seam (presentation._to_payload) reads it and drops those
+        keys entirely from the response — hidden fields cost neither their key
+        name nor a null value. Stamping is possible because the response
+        dataclasses are not frozen.
+        """
+        return _hidden_fields_policy.apply_hidden_fields(entity, value, settings=self.settings)
+
+    def _api_href(self, relative_path: str) -> str:
+        return f"/{self._api_prefix.lstrip('/')}{relative_path.lstrip('/')}"
+
+    async def _resolve_project_id(self, project_ref: str, *, write: bool = False) -> str:
+        return await self._project_resolver.resolve_id(project_ref, write=write)
+
+    async def _resolve_principal_id(self, principal_ref: str) -> str:
+        return await self._principal_resolver.resolve_id(principal_ref)
+
+    async def _resolve_version_id(
+        self, version_ref: str, *, project: str | None = None, context: ProjectResolutionContext | None = None
+    ) -> str:
+        return await self._version_resolver.resolve_id(version_ref, project=project, context=context)
+
+
+def _trim_text(value: Any, *, limit: int) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(str(value).split())
+    if not text:
+        return None
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _parse_response_json(response: httpx.Response) -> dict[str, Any]:
+    try:
+        return normalize_links(response.json())
+    except ValueError as exc:
+        raise OpenProjectServerError(
+            "OpenProject returned invalid JSON.", upstream_status=response.status_code
+        ) from exc

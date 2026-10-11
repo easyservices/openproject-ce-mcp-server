@@ -1,0 +1,574 @@
+from __future__ import annotations
+
+import dataclasses
+
+import pytest
+from _client_test_helpers import make_settings
+
+from openproject_ce_mcp_server.app.errors import InvalidInputError, PermissionDeniedError
+from openproject_ce_mcp_server.app.ports.group_api import GroupRecord
+from openproject_ce_mcp_server.app.services.group_service import GroupService
+from openproject_ce_mcp_server.models import GroupDetail, GroupSummary
+from openproject_ce_mcp_server.presentation import _to_payload
+
+BASE_URL = "https://op.example.com"
+API_PREFIX = "/api/v3/"
+
+
+def _summary(group_id: int = 3, *, name: str = "Backend", member_count: int = 2) -> GroupSummary:
+    return GroupSummary(
+        id=group_id,
+        name=name,
+        member_count=member_count,
+        created_at="2026-01-01T00:00:00Z",
+        updated_at="2026-06-01T00:00:00Z",
+        can_update=True,
+        can_delete=True,
+    )
+
+
+def _detail(group_id: int = 3, **kwargs: object) -> GroupDetail:
+    summary = _summary(group_id, **kwargs)  # type: ignore[arg-type]
+    return GroupDetail(
+        id=summary.id,
+        name=summary.name,
+        member_count=summary.member_count,
+        members=["Ada Lovelace", "Bob Builder"],
+        created_at=summary.created_at,
+        updated_at=summary.updated_at,
+        can_update=summary.can_update,
+        can_delete=summary.can_delete,
+    )
+
+
+def _record(**kwargs: object) -> GroupRecord:
+    detail = _detail(**kwargs)  # type: ignore[arg-type]
+    return GroupRecord(summary=_summary(**kwargs), to_detail=lambda: detail)  # type: ignore[arg-type]
+
+
+class _FakeGroupApi:
+    def __init__(self, records: list[GroupRecord] | None = None, *, member_ids: set[int] | None = None) -> None:
+        self._records = {r.summary.id: r for r in (records or [_record()])}
+        self._member_ids = member_ids if member_ids is not None else {1, 2}
+        self.list_groups_calls: list[tuple[int, int]] = []
+        self.get_group_calls: list[int] = []
+        self.get_member_ids_calls: list[int] = []
+        self.commit_create_calls: list[dict] = []
+        self.commit_update_calls: list[tuple[int, dict]] = []
+        self.commit_delete_calls: list[int] = []
+
+    async def list_groups(self, *, offset: int, page_size: int) -> tuple[list[GroupRecord], int]:
+        self.list_groups_calls.append((offset, page_size))
+        # A single-page fake is sufficient for most of these Service-level
+        # tests -- scan_records_and_paginate's own multi-page scanning
+        # behavior is covered by test_app_pagination.py and
+        # _PagedFakeGroupApi below.
+        if offset > 1:
+            return [], len(self._records)
+        records = list(self._records.values())
+        return records, len(records)
+
+    async def get_group(self, group_id: int) -> GroupRecord:
+        self.get_group_calls.append(group_id)
+        record = self._records.get(group_id)
+        if record is None:
+            raise AssertionError(f"no fake record for group_id {group_id}")
+        return record
+
+    async def get_member_ids(self, group_id: int) -> set[int]:
+        self.get_member_ids_calls.append(group_id)
+        return set(self._member_ids)
+
+    async def commit_create(self, payload: dict) -> GroupSummary:
+        self.commit_create_calls.append(payload)
+        return _summary(group_id=42)
+
+    async def commit_update(self, group_id: int, payload: dict) -> GroupSummary:
+        self.commit_update_calls.append((group_id, payload))
+        return _summary(group_id=group_id)
+
+    async def commit_delete(self, group_id: int) -> None:
+        self.commit_delete_calls.append(group_id)
+
+
+def _admin_settings(**overrides: object):
+    # admin read/write both default False (config.py) -- unlike most other
+    # scopes, so every positive-path test needs enable_admin_read=True
+    # explicitly, not just make_settings()'s permissive project scope.
+    return dataclasses.replace(make_settings(), enable_admin_read=True, **overrides)
+
+
+def _admin_write_settings(**overrides: object):
+    return _admin_settings(enable_admin_write=True, **overrides)
+
+
+def _service(api: _FakeGroupApi | None = None, *, settings=None) -> GroupService:
+    return GroupService(api=api or _FakeGroupApi(), settings=settings or _admin_settings(), api_prefix=API_PREFIX)
+
+
+# --- list_groups ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_groups_returns_stamped_summaries() -> None:
+    api = _FakeGroupApi()
+    service = _service(api)
+
+    result = await service.list_groups()
+
+    assert result.count == 1
+    assert result.results[0].id == 3
+    assert result.results[0].name == "Backend"
+    assert api.list_groups_calls == [(1, make_settings().default_page_size)]
+
+
+@pytest.mark.asyncio
+async def test_list_groups_checks_read_enabled() -> None:
+    settings = dataclasses.replace(make_settings(), enable_admin_read=False)
+    api = _FakeGroupApi()
+    service = _service(api, settings=settings)
+
+    with pytest.raises(PermissionDeniedError):
+        await service.list_groups()
+
+    assert api.list_groups_calls == []
+
+
+@pytest.mark.asyncio
+async def test_list_groups_applies_hidden_field_masking() -> None:
+    settings = _admin_settings(hidden_fields={"group": ("member_count",)})
+    api = _FakeGroupApi()
+    service = _service(api, settings=settings)
+
+    result = await service.list_groups()
+    group = result.results[0]
+
+    assert group._hidden_keys == frozenset({"member_count"})
+    serialized = _to_payload(group)
+    assert "member_count" not in serialized
+    assert serialized["id"] == 3
+
+
+@pytest.mark.asyncio
+async def test_list_groups_hidden_by_group_scope_not_membership_or_user_scope() -> None:
+    """Regression test for the entity="group" vs a same-named neighbor
+    hide-field bug class, a pattern that has recurred across
+    Role/Document/News/Actions & Capabilities.
+    """
+    settings_membership_hidden = _admin_settings(hidden_fields={"membership": ("name",)})
+    result_membership_hidden = await _service(settings=settings_membership_hidden).list_groups()
+    assert getattr(result_membership_hidden.results[0], "_hidden_keys", frozenset()) == frozenset()
+
+    settings_user_hidden = _admin_settings(hidden_fields={"user": ("name",)})
+    result_user_hidden = await _service(settings=settings_user_hidden).list_groups()
+    assert getattr(result_user_hidden.results[0], "_hidden_keys", frozenset()) == frozenset()
+
+    settings_group_hidden = _admin_settings(hidden_fields={"group": ("name",)})
+    result_group_hidden = await _service(settings=settings_group_hidden).list_groups()
+    assert getattr(result_group_hidden.results[0], "_hidden_keys", frozenset()) == {"name"}
+
+
+@pytest.mark.asyncio
+async def test_list_groups_search_overfetches_and_filters_then_paginates() -> None:
+    records = [
+        _record(group_id=1, name="Backend"),
+        _record(group_id=2, name="Frontend"),
+        _record(group_id=3, name="Backend Ops"),
+    ]
+    api = _FakeGroupApi(records)
+    service = _service(api)
+
+    result = await service.list_groups(search="back", limit=1, offset=2)
+
+    # 2 survivors match "back" (Backend, Backend Ops); page 2 with limit=1 is the 2nd survivor.
+    # total is a lower bound (len(results) on this page), not an exact count
+    # of the full search-filtered collection -- this reflects a deliberate
+    # total-contract change.
+    assert result.total == 1
+    assert result.count == 1
+    assert result.results[0].name == "Backend Ops"
+    assert api.list_groups_calls == [(1, make_settings().max_page_size)]
+
+
+@pytest.mark.asyncio
+async def test_list_groups_search_matches_name_case_insensitively() -> None:
+    records = [_record(group_id=1, name="BACKEND")]
+    api = _FakeGroupApi(records)
+    service = _service(api)
+
+    result = await service.list_groups(search="backend")
+
+    assert result.count == 1
+
+
+class _PagedFakeGroupApi:
+    """Unlike _FakeGroupApi (single-page, offset-blind), this simulates a
+    real multi-page server for exact-limit/truncation regression tests."""
+
+    def __init__(self, pages: dict[int, list[GroupRecord]]) -> None:
+        self._pages = pages
+        self.offsets_requested: list[int] = []
+
+    async def list_groups(self, *, offset: int, page_size: int) -> tuple[list[GroupRecord], int]:
+        self.offsets_requested.append(offset)
+        records = self._pages.get(offset, [])
+        return records, len(records)
+
+    async def get_group(self, group_id: int) -> GroupRecord:
+        raise NotImplementedError
+
+    async def get_member_ids(self, group_id: int) -> set[int]:
+        raise NotImplementedError
+
+    async def commit_create(self, payload: dict) -> GroupSummary:
+        raise NotImplementedError
+
+    async def commit_update(self, group_id: int, payload: dict) -> GroupSummary:
+        raise NotImplementedError
+
+    async def commit_delete(self, group_id: int) -> None:
+        raise NotImplementedError
+
+
+@pytest.mark.asyncio
+async def test_list_groups_search_not_truncated_when_exactly_limit_matches_exist() -> None:
+    """Regression: a naive scan implementation can set
+    truncated=True as soon as `limit` matches are collected, without
+    checking whether a matching group actually exists beyond that window."""
+    api = _PagedFakeGroupApi({1: [_record(group_id=1, name="Backend")]})
+    service = _service(api)
+
+    result = await service.list_groups(search="back", limit=1)
+
+    assert api.offsets_requested == [1], f"expected only one (short) page, got {api.offsets_requested}"
+    assert [g.id for g in result.results] == [1]
+    assert result.truncated is False
+    assert result.next_offset is None
+
+
+# --- get_group -------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_group_returns_stamped_detail() -> None:
+    api = _FakeGroupApi()
+    service = _service(api)
+
+    detail = await service.get_group(3)
+
+    assert detail.id == 3
+    assert detail.name == "Backend"
+    assert api.get_group_calls == [3]
+
+
+@pytest.mark.asyncio
+async def test_get_group_checks_read_enabled() -> None:
+    settings = dataclasses.replace(make_settings(), enable_admin_read=False)
+    api = _FakeGroupApi()
+    service = _service(api, settings=settings)
+
+    with pytest.raises(PermissionDeniedError):
+        await service.get_group(3)
+
+    assert api.get_group_calls == []
+
+
+# --- create ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_returns_preview_without_committing() -> None:
+    # Preview still requires admin write enabled: create_group's
+    # write-enablement check runs unconditionally, before the confirm
+    # branch, verbatim port of client.py's own behavior.
+    api = _FakeGroupApi()
+    service = _service(api, settings=_admin_write_settings())
+
+    result = await service.create(name="Backend")
+
+    assert result.state == "preview"
+    assert result.result is None
+    assert api.commit_create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_commits_when_confirmed_and_admin_write_enabled() -> None:
+    api = _FakeGroupApi()
+    service = _service(api, settings=_admin_write_settings())
+
+    result = await service.create(name="Backend", confirm=True)
+
+    assert result.state == "confirmed"
+    assert result.group_id == 42
+    assert api.commit_create_calls == [{"name": "Backend"}]
+    assert result.payload == {"name": "Backend", "user_ids": []}
+
+
+@pytest.mark.asyncio
+async def test_create_builds_member_links_when_user_ids_given() -> None:
+    api = _FakeGroupApi()
+    service = _service(api, settings=_admin_write_settings())
+
+    result = await service.create(name="Backend", user_ids=[5, 6], confirm=True)
+
+    assert result.state == "confirmed"
+    assert api.commit_create_calls == [
+        {"name": "Backend", "_links": {"members": [{"href": "/api/v3/users/5"}, {"href": "/api/v3/users/6"}]}}
+    ]
+    assert result.payload == {"name": "Backend", "user_ids": [5, 6]}
+
+
+@pytest.mark.asyncio
+async def test_create_confirm_denied_without_admin_write_enabled() -> None:
+    api = _FakeGroupApi()
+    service = _service(api)  # admin_write defaults False
+
+    with pytest.raises(PermissionDeniedError):
+        await service.create(name="Backend", confirm=True)
+
+    assert api.commit_create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_preview_also_denied_without_admin_write_enabled() -> None:
+    # Verbatim port of client.py's unconditional _ensure_write_enabled check
+    # -- even a pure preview (confirm=False) is rejected.
+    api = _FakeGroupApi()
+    service = _service(api)
+
+    with pytest.raises(PermissionDeniedError):
+        await service.create(name="Backend", confirm=False)
+
+    assert api.commit_create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_denies_admin_write_before_checking_a_hidden_field() -> None:
+    """Regression (Codex review round 7): the admin-write gate must run
+    BEFORE any hidden-field check -- a prior version of create() called
+    hidden_fields.ensure_field_writable first, so a caller without
+    ADMIN_WRITE enabled AND with "name" hidden got InvalidInputError
+    ([VALIDATION_FAILED]) instead of the correct PermissionDeniedError
+    ([CAPABILITY_DISABLED]). This exact combination (admin_write disabled +
+    a hidden field) is what the other two denial tests above don't cover on
+    their own -- test_create_confirm_denied_without_admin_write_enabled has
+    no hidden field, so it can't distinguish which check ran first. update()
+    already has this ordering (see its own pre-check comment)."""
+    settings = dataclasses.replace(make_settings(), hidden_fields={"group": ("name",)})  # admin_write defaults False
+    api = _FakeGroupApi()
+    service = _service(api, settings=settings)
+
+    with pytest.raises(PermissionDeniedError):
+        await service.create(name="Backend", confirm=True)
+
+    assert api.commit_create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_when_name_field_is_hidden() -> None:
+    settings = dataclasses.replace(_admin_write_settings(), hidden_fields={"group": ("name",)})
+    api = _FakeGroupApi()
+    service = _service(api, settings=settings)
+
+    with pytest.raises(InvalidInputError, match="hidden by"):
+        await service.create(name="Backend", confirm=True)
+
+    assert api.commit_create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_when_members_field_is_hidden() -> None:
+    settings = dataclasses.replace(_admin_write_settings(), hidden_fields={"group": ("members",)})
+    api = _FakeGroupApi()
+    service = _service(api, settings=settings)
+
+    with pytest.raises(InvalidInputError, match="hidden by"):
+        await service.create(name="Backend", user_ids=[5], confirm=True)
+
+    assert api.commit_create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_does_not_check_members_hidden_when_no_user_ids_given() -> None:
+    settings = dataclasses.replace(_admin_write_settings(), hidden_fields={"group": ("members",)})
+    api = _FakeGroupApi()
+    service = _service(api, settings=settings)
+
+    result = await service.create(name="Backend", confirm=True)
+
+    assert result.state == "confirmed"
+
+
+# --- update ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_commits_when_confirmed() -> None:
+    api = _FakeGroupApi()
+    service = _service(api, settings=_admin_write_settings())
+
+    result = await service.update(3, name="Backend Team", confirm=True)
+
+    assert result.state == "confirmed"
+    assert result.group_id == 3
+    assert api.commit_update_calls == [(3, {"name": "Backend Team"})]
+    assert api.get_member_ids_calls == []
+
+
+@pytest.mark.asyncio
+async def test_update_confirm_denied_without_admin_write_enabled() -> None:
+    api = _FakeGroupApi()
+    service = _service(api)
+
+    with pytest.raises(PermissionDeniedError):
+        await service.update(3, name="Backend Team", confirm=True)
+
+    assert api.commit_update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_update_preview_also_denied_without_admin_write_enabled() -> None:
+    # Same unconditional-check tradeoff as create(): update() has a prior GET
+    # for the member diff but the write-enablement check still runs before
+    # it and before the confirm branch, so even a preview is rejected.
+    api = _FakeGroupApi()
+    service = _service(api)
+
+    with pytest.raises(PermissionDeniedError):
+        await service.update(3, add_user_ids=[7], confirm=False)
+
+    assert api.get_member_ids_calls == []
+    assert api.commit_update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_update_member_diff_adds_and_removes_against_current_members() -> None:
+    api = _FakeGroupApi(member_ids={1, 2, 3})
+    service = _service(api, settings=_admin_write_settings())
+
+    result = await service.update(3, add_user_ids=[4], remove_user_ids=[2], confirm=True)
+
+    assert result.state == "confirmed"
+    assert api.get_member_ids_calls == [3]
+    assert api.commit_update_calls == [
+        (
+            3,
+            {
+                "_links": {
+                    "members": [
+                        {"href": "/api/v3/users/1"},
+                        {"href": "/api/v3/users/3"},
+                        {"href": "/api/v3/users/4"},
+                    ]
+                }
+            },
+        )
+    ]
+    assert result.payload == {"add_user_ids": [4], "remove_user_ids": [2]}
+
+
+@pytest.mark.asyncio
+async def test_update_member_diff_preview_reflects_current_members_without_committing() -> None:
+    # The GET-and-diff happens even on the preview branch (outside `if not
+    # confirm`), so the preview accurately reflects the resulting
+    # membership -- verbatim port of client.py's update_group.
+    api = _FakeGroupApi(member_ids={1, 2})
+    service = _service(api, settings=_admin_write_settings())
+
+    result = await service.update(3, add_user_ids=[9], confirm=False)
+
+    assert result.state == "preview"
+    assert api.get_member_ids_calls == [3]
+    assert api.commit_update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_when_name_field_is_hidden() -> None:
+    settings = dataclasses.replace(_admin_write_settings(), hidden_fields={"group": ("name",)})
+    api = _FakeGroupApi()
+    service = _service(api, settings=settings)
+
+    with pytest.raises(InvalidInputError, match="hidden by"):
+        await service.update(3, name="Backend Team", confirm=True)
+
+    assert api.commit_update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_when_members_field_is_hidden() -> None:
+    settings = dataclasses.replace(_admin_write_settings(), hidden_fields={"group": ("members",)})
+    api = _FakeGroupApi()
+    service = _service(api, settings=settings)
+
+    with pytest.raises(InvalidInputError, match="hidden by"):
+        await service.update(3, add_user_ids=[5], confirm=True)
+
+    assert api.commit_update_calls == []
+
+
+@pytest.mark.asyncio
+async def test_update_does_not_check_fields_the_caller_did_not_set() -> None:
+    # A field hidden in config but NOT part of this update call must not
+    # block it -- only fields actually present in the call are checked.
+    settings = dataclasses.replace(_admin_write_settings(), hidden_fields={"group": ("members",)})
+    api = _FakeGroupApi()
+    service = _service(api, settings=settings)
+
+    result = await service.update(3, name="Backend Team", confirm=True)
+
+    assert result.state == "confirmed"
+    assert api.commit_update_calls == [(3, {"name": "Backend Team"})]
+
+
+# --- delete ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_denies_target_outside_admin_write_and_never_calls_commit() -> None:
+    api = _FakeGroupApi()
+    service = _service(api)  # admin_write defaults False
+
+    with pytest.raises(PermissionDeniedError):
+        await service.delete(3, confirm=True)
+
+    assert api.commit_delete_calls == []
+
+
+@pytest.mark.asyncio
+async def test_delete_preview_also_denied_without_admin_write_enabled() -> None:
+    # Same unconditional-check tradeoff as create()/update(): delete() has no
+    # prior GET, but the write-enablement check still runs before the confirm
+    # branch, so even a preview is rejected (OPM-2705: this case was missing
+    # before the delete() migration onto _finalize_write's gate_before_preview).
+    api = _FakeGroupApi()
+    service = _service(api)
+
+    with pytest.raises(PermissionDeniedError):
+        await service.delete(3, confirm=False)
+
+    assert api.commit_delete_calls == []
+
+
+@pytest.mark.asyncio
+async def test_delete_preview_does_not_call_commit() -> None:
+    api = _FakeGroupApi()
+    service = _service(api, settings=_admin_write_settings())
+
+    result = await service.delete(3, confirm=False)
+
+    assert result.state == "preview"
+    assert result.result is None
+    assert api.commit_delete_calls == []
+
+
+@pytest.mark.asyncio
+async def test_delete_commits_when_confirmed_with_no_result() -> None:
+    api = _FakeGroupApi()
+    service = _service(api, settings=_admin_write_settings())
+
+    result = await service.delete(3, confirm=True)
+
+    assert result.state == "confirmed"
+    assert result.group_id == 3
+    assert result.result is None
+    assert api.commit_delete_calls == [3]

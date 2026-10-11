@@ -1,0 +1,73 @@
+"""HTTP-backed FileLinkApi adapter.
+
+No `httpx` import (depends on the `Transport` Protocol only, matching every
+other adapter). `trim_text`/`id_from_href`/`link_title`/`SUBJECT_LIMIT` come
+from `app/adapters/_text.py`, used by `normalize_file_link` for `trim_text`
+(title truncation), `id_from_href` (storage id from the storage link's
+href), and `link_title` (storage name from the storage link's title) -- no
+formattable-text extraction, no delimit_user_content: file link titles are
+plain filenames, not user-content-marked rich text.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ...models import FileLinkSummary
+from ..ports.file_link_api import FileLinkRecord
+from ..transport.protocol import Transport
+from ._text import SUBJECT_LIMIT
+from ._text import id_from_href as _id_from_href
+from ._text import link_title as _link_title
+from ._text import trim_text as _trim_text
+
+
+def normalize_file_link(payload: dict[str, Any]) -> FileLinkSummary:
+    """Pure HAL->model translation (ADR: 'lives in the Domain API adapter').
+
+    Excludes hidden-field masking -- that is a Service-layer concern applied
+    after this returns (same pattern as every other normalize_*).
+    """
+    file_link_id = int(payload["id"])
+    links = payload.get("_links", {})
+    storage_link = links.get("storage")
+    storage_id = _id_from_href(storage_link.get("href")) if isinstance(storage_link, dict) else None
+    storage_name = _link_title(storage_link)
+    return FileLinkSummary(
+        id=file_link_id,
+        # FileLinkRepresenter has no top-level `title` property, only `originData.name`.
+        title=_trim_text(payload.get("originData", {}).get("name"), limit=SUBJECT_LIMIT) or f"File link {file_link_id}",
+        storage_id=storage_id,
+        storage_name=storage_name,
+        created_at=payload.get("createdAt"),
+        updated_at=payload.get("updatedAt"),
+    )
+
+
+class HttpxFileLinkApi:
+    def __init__(self, transport: Transport) -> None:
+        self._transport = transport
+
+    def _record(self, payload: dict[str, Any]) -> FileLinkRecord:
+        return FileLinkRecord(
+            summary=normalize_file_link(payload),
+            container_link=payload.get("_links", {}).get("container"),
+        )
+
+    async def list_for_work_package(
+        self, work_package_id: int, *, offset: int, page_size: int
+    ) -> tuple[list[FileLinkRecord], int]:
+        payload = await self._transport.get_json(
+            f"work_packages/{work_package_id}/file_links",
+            params={"offset": str(offset), "pageSize": str(page_size)},
+        )
+        elements = payload.get("_embedded", {}).get("elements", [])
+        records = [self._record(item) for item in elements if isinstance(item, dict)]
+        total = int(payload.get("total", len(records)))
+        return records, total
+
+    async def get(self, file_link_id: int) -> FileLinkRecord:
+        return self._record(await self._transport.get_json(f"file_links/{file_link_id}"))
+
+    async def delete(self, file_link_id: int) -> None:
+        await self._transport.delete(f"file_links/{file_link_id}")

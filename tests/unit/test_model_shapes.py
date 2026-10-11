@@ -1,0 +1,842 @@
+"""Snapshot/shape tests for the ListResult base-class consolidation and the
+ConfirmationHeader (WriteResult family) consolidation.
+
+Guards against the two failure modes a base-class migration could silently
+introduce: (1) field order / serialization drift on any of the 36
+`*ListResult` classes or 24 confirm-gated write-result classes, and (2) loss
+of concrete element/result typing, which a naive `Generic[T]` base (rejected
+during planning) would have caused -- verified here by literally
+reproducing that rejected shape and showing it degrades the MCP output
+schema, then showing our actual non-generic bases do not.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import types
+import typing
+from dataclasses import fields as dataclass_fields
+from typing import Any
+
+import pytest
+from mcp.server.mcpserver import MCPServer
+
+from openproject_ce_mcp_server import models
+from openproject_ce_mcp_server.presentation import _to_payload
+
+# Captured from `main` before the ListResult base-class migration landed (via
+# `dataclasses.fields()` on every *ListResult class) -- the source of truth
+# this test protects. Do not "fix" this fixture to match a future change
+# without confirming the new field order is actually intended.
+EXPECTED_FIELD_ORDER: dict[str, list[str]] = {
+    "ActionListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "ActivityListResult": ["count", "results"],
+    "AttachmentListResult": [
+        "offset",
+        "limit",
+        "total",
+        "count",
+        "next_offset",
+        "truncated",
+        "results",
+        "total_size_bytes",
+        "images",
+    ],
+    "BacklogBucketListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "BoardListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "CapabilityListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "CategoryListResult": ["count", "results"],
+    "CostEntryListResult": ["count", "results"],
+    "DocumentListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "EmojiReactionListResult": ["count", "results"],
+    "FileLinkListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "GithubPullRequestListResult": ["count", "results"],
+    "GitlabIssueListResult": ["count", "results"],
+    "GitlabMergeRequestListResult": ["count", "results"],
+    "GridListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "GroupListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "HelpTextListResult": ["count", "results"],
+    "MeetingAgendaItemListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "MeetingListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "MeetingOutcomeListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "MeetingSectionListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "MembershipListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "NewsListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "NonWorkingDayListResult": ["count", "results"],
+    "NotificationListResult": ["count", "total", "truncated", "next_offset", "results"],
+    "PrincipalListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "PriorityListResult": ["count", "results"],
+    "RecurringMeetingListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "RecurringMeetingOccurrenceListResult": ["recurring_meeting_id", "filter", "count", "results"],
+    "ProjectListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "ProjectPhaseDefinitionListResult": ["count", "results"],
+    "ProjectStorageListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "QueryFilterInstanceSchemaListResult": ["count", "results"],
+    "RelationListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "ReminderListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "RoleListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "SprintListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "StatusListResult": ["count", "results"],
+    "StorageListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "TimeEntryActivityListResult": ["count", "results"],
+    "TimeEntryListResult": [
+        "offset",
+        "limit",
+        "total",
+        "count",
+        "next_offset",
+        "truncated",
+        "results",
+        "total_hours",
+        "total_hours_truncated",
+    ],
+    "TypeListResult": ["count", "results"],
+    "UserListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "UserNonWorkingTimeListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "UserWorkingHoursListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "VersionListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "ViewListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "WatcherListResult": ["count", "results"],
+    "WikiPageLinkListResult": ["offset", "limit", "total", "count", "next_offset", "truncated", "results"],
+    "WikiPageListResult": ["count", "total", "results"],
+    "WorkPackageListResult": [
+        "offset",
+        "limit",
+        "total",
+        "count",
+        "next_offset",
+        "truncated",
+        "results",
+        "groups",
+        "total_sums",
+        "exact_match",
+    ],
+    "RelationCandidateListResult": ["count", "results"],
+    "WorkingDayListResult": ["count", "results"],
+}
+
+
+def _all_list_result_classes() -> dict[str, type]:
+    return {name: getattr(models, name) for name in dir(models) if name.endswith("ListResult")}
+
+
+def test_every_list_result_class_is_captured_in_the_fixture() -> None:
+    found = set(_all_list_result_classes())
+    assert found == set(EXPECTED_FIELD_ORDER), (
+        f"ListResult classes changed since the fixture was captured: "
+        f"added={found - set(EXPECTED_FIELD_ORDER)} removed={set(EXPECTED_FIELD_ORDER) - found}"
+    )
+
+
+@pytest.mark.parametrize("name", sorted(EXPECTED_FIELD_ORDER))
+def test_list_result_field_order_unchanged(name: str) -> None:
+    cls = getattr(models, name)
+    actual = [f.name for f in dataclass_fields(cls)]
+    assert actual == EXPECTED_FIELD_ORDER[name]
+
+
+def _dummy_for_type(tp: Any) -> Any:  # noqa: ANN401
+    origin = typing.get_origin(tp)
+    # `X | None` (PEP 604) has origin types.UnionType, not typing.Union --
+    # both must be checked, or an `int | None`-annotated field silently falls
+    # through to the final `return None` below instead of getting a dummy int.
+    if origin is typing.Union or origin is types.UnionType:
+        args = [a for a in typing.get_args(tp) if a is not type(None)]
+        return _dummy_for_type(args[0]) if args else None
+    if origin in (list, tuple, set, frozenset):
+        return origin()
+    if origin is dict:
+        return {}
+    if tp is int:
+        return 1
+    if tp is float:
+        return 1.0
+    if tp is bool:
+        return False
+    if tp is str:
+        return "x"
+    if dataclasses.is_dataclass(tp):
+        return _dummy_instance(tp)
+    return None
+
+
+def _dummy_instance(cls: type) -> Any:  # noqa: ANN401
+    hints = typing.get_type_hints(cls)
+    kwargs = {f.name: _dummy_for_type(hints[f.name]) for f in dataclass_fields(cls)}
+    return cls(**kwargs)
+
+
+@pytest.mark.parametrize("name", sorted(EXPECTED_FIELD_ORDER))
+def test_list_result_to_payload_drops_count_and_truncated(name: str) -> None:
+    cls = getattr(models, name)
+    instance = _dummy_instance(cls)
+    out = _to_payload(instance)
+    assert "count" not in out
+    assert "truncated" not in out
+    expected_keys = [f for f in EXPECTED_FIELD_ORDER[name] if f not in ("count", "truncated")]
+    assert list(out.keys()) == expected_keys
+
+
+# --- ConfirmationHeader (WriteResult family) ----------------------
+
+# The 21 `*WriteResult`-suffixed classes plus 3 same-shaped-but-differently-
+# named classes (ProjectCopyResult, RelationUpdateResult, NotificationMarkResult)
+# that the ConfirmationHeader consolidation classified. Discovery mirrors _all_list_result_classes()'s
+# suffix filter, widened by an explicit small set for the 3 non-suffix names
+# -- unlike *ListResult, this family doesn't share one common suffix.
+_EXTRA_CONFIRMATION_HEADER_CLASSES = frozenset({"ProjectCopyResult", "RelationUpdateResult", "NotificationMarkResult"})
+
+
+def _all_write_result_classes() -> dict[str, type]:
+    return {
+        name: getattr(models, name)
+        for name in dir(models)
+        if name.endswith("WriteResult") or name in _EXTRA_CONFIRMATION_HEADER_CLASSES
+    }
+
+
+# Captured from `main` before the ConfirmationHeader migration landed
+# (via `dataclasses.fields()` on every class below) -- the source of truth
+# this test protects. Do not "fix" this fixture to match a future change
+# without confirming the new field order is actually intended.
+# BulkWorkPackageWriteResult is included as a fixed control: the
+# consolidation deliberately leaves it unconsolidated (no `ready` field, batch-shaped), so
+# its entry must never gain a ConfirmationHeader-shaped prefix.
+EXPECTED_WRITE_RESULT_FIELD_ORDER: dict[str, list[str]] = {
+    "ActivityWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "work_package_id",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "AttachmentWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "attachment_id",
+        "work_package_id",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "ContainerAttachmentWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "attachment_id",
+        "container_type",
+        "container_id",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "BoardWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "board_id",
+        "project",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "BulkWorkPackageWriteResult": [
+        "action",
+        "confirmed",
+        "requires_confirmation",
+        "total",
+        "succeeded",
+        "failed",
+        "message",
+        "items",
+    ],
+    "DocumentWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "document_id",
+        "project",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "EmojiReactionWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "activity_id",
+        "reaction",
+        "result",
+    ],
+    "FavoriteWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "project_id",
+        "project",
+    ],
+    "FileLinkWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "file_link_id",
+        "work_package_id",
+        "validation_errors",
+        "result",
+    ],
+    "GridWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "grid_id",
+        "scope",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "GroupWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "group_id",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "MeetingAgendaItemWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "agenda_item_id",
+        "meeting_id",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "MeetingOutcomeWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "outcome_id",
+        "meeting_agenda_item_id",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "MeetingSectionWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "section_id",
+        "meeting_id",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "MeetingWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "meeting_id",
+        "project",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "MembershipWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "membership_id",
+        "project",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "NewsWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "news_id",
+        "project",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "NotificationMarkResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "notification_id",
+    ],
+    "ProjectCopyResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "source_project_id",
+        "source_project",
+        "payload",
+        "validation_errors",
+        "job_status_id",
+    ],
+    "ProjectWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "project_id",
+        "project",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "RecurringMeetingOccurrenceWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "recurring_meeting_id",
+        "start_time",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "RecurringMeetingWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "recurring_meeting_id",
+        "project",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "RelationUpdateResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "relation_id",
+        "payload",
+        "result",
+    ],
+    "RelationWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "relation_id",
+        "work_package_id",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "ReminderWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "reminder_id",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "StorageWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "storage_id",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "TimeEntryWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "time_entry_id",
+        "project",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "UserNonWorkingTimeWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "non_working_time_id",
+        "user_id",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "UserPreferencesWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "payload",
+        "result",
+    ],
+    "UserWorkingHoursWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "working_hours_id",
+        "user_id",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "UserWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "user_id",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "VersionWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "version_id",
+        "project",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "WatcherWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "work_package_id",
+        "watcher_user_id",
+        "validation_errors",
+        "result",
+    ],
+    "WikiPageLinkWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "link_id",
+        "work_package_id",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+    "WorkPackageWriteResult": [
+        "action",
+        "state",
+        "ready",
+        "message",
+        "work_package_id",
+        "project",
+        "payload",
+        "validation_errors",
+        "result",
+    ],
+}
+
+
+def test_every_write_result_class_is_captured_in_the_fixture() -> None:
+    found = set(_all_write_result_classes())
+    assert found == set(EXPECTED_WRITE_RESULT_FIELD_ORDER), (
+        f"WriteResult-family classes changed since the fixture was captured: "
+        f"added={found - set(EXPECTED_WRITE_RESULT_FIELD_ORDER)} "
+        f"removed={set(EXPECTED_WRITE_RESULT_FIELD_ORDER) - found}"
+    )
+
+
+@pytest.mark.parametrize("name", sorted(EXPECTED_WRITE_RESULT_FIELD_ORDER))
+def test_write_result_field_order_unchanged(name: str) -> None:
+    cls = getattr(models, name)
+    actual = [f.name for f in dataclass_fields(cls)]
+    assert actual == EXPECTED_WRITE_RESULT_FIELD_ORDER[name]
+
+
+def test_confirmation_header_subclasses_are_registered() -> None:
+    for name in sorted(EXPECTED_WRITE_RESULT_FIELD_ORDER):
+        if name == "BulkWorkPackageWriteResult":
+            continue
+        cls = getattr(models, name)
+        assert issubclass(cls, models.ConfirmationHeader), f"{name} should subclass ConfirmationHeader"
+    assert not issubclass(models.BulkWorkPackageWriteResult, models.ConfirmationHeader), (
+        "BulkWorkPackageWriteResult is deliberately excluded (no `ready` field, batch-shaped)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirmation_header_result_field_keeps_concrete_type_in_mcp_schema() -> None:
+    """Proves introducing ConfirmationHeader doesn't affect MCP output schema
+    generation for `result` (a scalar Optional[Concrete] field, so the right
+    template is test_project_detail_ancestors_boundary_in_mcp_schema's
+    anyOf/$ref check, not the results.items list check used for PageResult/
+    CollectionResult's `results` field).
+    """
+    mcp = MCPServer("shape-test")
+
+    @mcp.tool()
+    def project_write_probe() -> models.ProjectWriteResult:
+        return _dummy_instance(models.ProjectWriteResult)
+
+    @mcp.tool()
+    def favorite_write_probe() -> models.FavoriteWriteResult:
+        return _dummy_instance(models.FavoriteWriteResult)
+
+    tools = {t.name: t for t in await mcp.list_tools()}
+
+    write_schema = tools["project_write_probe"].output_schema
+    assert list(write_schema["properties"]) == EXPECTED_WRITE_RESULT_FIELD_ORDER["ProjectWriteResult"]
+    result_field = write_schema["properties"]["result"]
+    result_refs = [entry["$ref"] for entry in result_field.get("anyOf", []) if "$ref" in entry]
+    assert result_refs, f"expected a $ref among result's anyOf branches, got {result_field!r}"
+    result_summary_schema = write_schema["$defs"][result_refs[0].rsplit("/", 1)[-1]]
+    assert result_summary_schema["title"] == "ProjectSummary"
+
+    favorite_schema = tools["favorite_write_probe"].output_schema
+    assert list(favorite_schema["properties"]) == EXPECTED_WRITE_RESULT_FIELD_ORDER["FavoriteWriteResult"]
+
+
+_RejectedT = typing.TypeVar("_RejectedT")
+
+
+@dataclasses.dataclass
+class _RejectedGenericPageResult(typing.Generic[_RejectedT]):
+    """Module-level (not function-local) so the SDK's `eval_str=True` signature
+    evaluation can resolve it as a return-type annotation -- reproduces the
+    Generic[T]-with-results-on-the-base design rejected during ListResult base-class planning.
+    """
+
+    total: int
+    results: list[_RejectedT]
+
+
+@dataclasses.dataclass
+class _RejectedGenericProjectListResult(_RejectedGenericPageResult[models.ProjectSummary]):
+    pass
+
+
+def test_version_detail_and_news_detail_keep_their_own_class_identity() -> None:
+    # Guards against ever "simplifying" the subclass back into a bare alias
+    # (VersionDetail = VersionSummary), which would silently rename the
+    # registered get_version/get_news MCP output schema title.
+    assert models.VersionDetail.__name__ == "VersionDetail"
+    assert models.NewsDetail.__name__ == "NewsDetail"
+    assert models.VersionDetail is not models.VersionSummary
+    assert models.NewsDetail is not models.NewsSummary
+
+
+@pytest.mark.asyncio
+async def test_version_detail_and_news_detail_schema_title_matches_class_name() -> None:
+    mcp = MCPServer("shape-test")
+
+    @mcp.tool()
+    def get_version_probe() -> models.VersionDetail:
+        return _dummy_instance(models.VersionDetail)
+
+    @mcp.tool()
+    def get_news_probe() -> models.NewsDetail:
+        return _dummy_instance(models.NewsDetail)
+
+    tools = {t.name: t for t in await mcp.list_tools()}
+    assert tools["get_version_probe"].output_schema["title"] == "VersionDetail"
+    assert tools["get_news_probe"].output_schema["title"] == "NewsDetail"
+
+
+@pytest.mark.asyncio
+async def test_page_result_and_collection_result_keep_concrete_element_types() -> None:
+    """Reproduces the rejected Generic[T]-with-results-on-the-base design
+    directly, to show what it would have done to the MCP output schema, then
+    proves our actual PageResult/CollectionResult bases don't have that problem.
+    """
+    mcp = MCPServer("shape-test")
+
+    @mcp.tool()
+    def rejected_probe() -> _RejectedGenericProjectListResult:
+        return _RejectedGenericProjectListResult(total=1, results=[_dummy_instance(models.ProjectSummary)])
+
+    @mcp.tool()
+    def project_list_probe() -> models.ProjectListResult:
+        return _dummy_instance(models.ProjectListResult)
+
+    @mcp.tool()
+    def role_list_probe() -> models.RoleListResult:
+        return _dummy_instance(models.RoleListResult)
+
+    tools = {t.name: t for t in await mcp.list_tools()}
+
+    # The rejected design: `results.items` degrades to an untyped `{}`.
+    rejected_items_schema = tools["rejected_probe"].output_schema["properties"]["results"]["items"]
+    assert rejected_items_schema == {}
+
+    # Our actual Group A (PageResult) and Group B (CollectionResult) design:
+    # `results.items` stays a concrete $ref to the real summary model.
+    for tool_name, expected_ref_name in [
+        ("project_list_probe", "ProjectSummary"),
+        ("role_list_probe", "RoleSummary"),
+    ]:
+        schema = tools[tool_name].output_schema
+        items_schema = schema["properties"]["results"]["items"]
+        assert "$ref" in items_schema, f"{tool_name}: expected a concrete $ref, got {items_schema!r}"
+        ref_defs = schema.get("$defs", {})
+        ref_name = items_schema["$ref"].rsplit("/", 1)[-1]
+        assert ref_name in ref_defs
+        assert ref_defs[ref_name]["title"] == expected_ref_name
+
+
+@pytest.mark.asyncio
+async def test_project_detail_ancestors_boundary_in_mcp_schema() -> None:
+    """Verifies get_project (ProjectDetail) exposes ancestors/ancestors_truncated;
+    list_projects rows (ProjectSummary) and ProjectWriteResult.result (also
+    ProjectSummary) must NOT -- proves the Detail/Summary split actually holds
+    at the schema boundary, not just in the dataclass definitions.
+    """
+    mcp = MCPServer("shape-test")
+
+    @mcp.tool()
+    def project_detail_probe() -> models.ProjectDetail:
+        return _dummy_instance(models.ProjectDetail)
+
+    @mcp.tool()
+    def project_list_probe() -> models.ProjectListResult:
+        return _dummy_instance(models.ProjectListResult)
+
+    @mcp.tool()
+    def project_write_probe() -> models.ProjectWriteResult:
+        return _dummy_instance(models.ProjectWriteResult)
+
+    tools = {t.name: t for t in await mcp.list_tools()}
+
+    detail_schema = tools["project_detail_probe"].output_schema
+    assert "ancestors" in detail_schema["properties"]
+    assert "ancestors_truncated" in detail_schema["properties"]
+
+    list_schema = tools["project_list_probe"].output_schema
+    items_ref = list_schema["properties"]["results"]["items"]["$ref"]
+    project_summary_schema = list_schema["$defs"][items_ref.rsplit("/", 1)[-1]]
+    assert project_summary_schema["title"] == "ProjectSummary"
+    assert "ancestors" not in project_summary_schema["properties"]
+
+    write_schema = tools["project_write_probe"].output_schema
+    result_field = write_schema["properties"]["result"]
+    result_refs = [entry["$ref"] for entry in result_field.get("anyOf", []) if "$ref" in entry]
+    assert result_refs, f"expected a $ref among result's anyOf branches, got {result_field!r}"
+    result_summary_schema = write_schema["$defs"][result_refs[0].rsplit("/", 1)[-1]]
+    assert result_summary_schema["title"] == "ProjectSummary"
+    assert "ancestors" not in result_summary_schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_get_project_tolerates_ancestor_without_display_id() -> None:
+    """Regression: OpenProject's _links.ancestors entries for a project are
+    lightweight {href, title} link objects and never carry a displayId (that
+    field is a work-package-only concept) -- client.py's normalize_project_detail
+    still probes for it via a.get("displayId"), so display_id is None for every
+    project ancestor. A prior `dict[str, str]` annotation on
+    ProjectDetail.ancestors rejected that None at the MCP structured-output
+    validation boundary (a real 'Input should be a valid string' crash on any
+    project with a parent), even though client.py and its unit tests already
+    treated None as the normal shape. Exercise the real call_tool path
+    (not just output_schema shape) so a regression here fails loudly again.
+    """
+    mcp = MCPServer("shape-test")
+
+    @mcp.tool()
+    def get_project_probe() -> models.ProjectDetail:
+        return models.ProjectDetail(
+            id=9,
+            name="Sub Project",
+            identifier="sub-project",
+            active=True,
+            description=None,
+            ancestors=[
+                {"href": "/api/v3/projects/1", "title": "Root", "display_id": None},
+            ],
+        )
+
+    result = await mcp.call_tool("get_project_probe", {})
+    structured = result.structured_content
+    assert structured is not None
+    assert structured["ancestors"] == [{"href": "/api/v3/projects/1", "title": "Root", "display_id": None}]
+
+
+@pytest.mark.asyncio
+async def test_get_work_package_tolerates_ancestor_without_display_id() -> None:
+    """Regression, classic/pre-17.5 OpenProject instance: hierarchy links only
+    carry `displayId` in 17.5+ semantic mode (see the `parent_display_id`
+    comment in client.py's normalize_work_package_detail) -- on an older
+    instance, every ancestors/children entry's display_id is None, hitting the
+    exact same `dict[str, str]` structured-output rejection as the
+    get_project case above. Shipped since v0.3.0 (WorkPackageDetail.ancestors/
+    children existed before ProjectDetail.ancestors did), fixed alongside it.
+    """
+    mcp = MCPServer("shape-test")
+
+    @mcp.tool()
+    def get_work_package_probe() -> models.WorkPackageDetail:
+        return models.WorkPackageDetail(
+            id=952,
+            display_id="PROJ-952",
+            subject="Child task",
+            type=None,
+            status=None,
+            priority=None,
+            project_phase=None,
+            assignee=None,
+            responsible=None,
+            project=None,
+            version=None,
+            target_versions=[],
+            observed_in_versions=[],
+            sprint=None,
+            parent_id=1,
+            parent_display_id=None,
+            start_date=None,
+            due_date=None,
+            lock_version=None,
+            description=None,
+            ancestors=[
+                {"href": "/api/v3/work_packages/1", "title": "Root task", "display_id": None},
+            ],
+            children=[
+                {"href": "/api/v3/work_packages/2", "title": "Sub task", "display_id": None},
+            ],
+        )
+
+    result = await mcp.call_tool("get_work_package_probe", {})
+    structured = result.structured_content
+    assert structured is not None
+    assert structured["ancestors"] == [{"href": "/api/v3/work_packages/1", "title": "Root task", "display_id": None}]
+    assert structured["children"] == [{"href": "/api/v3/work_packages/2", "title": "Sub task", "display_id": None}]

@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import pytest
+
+from openproject_ce_mcp_server.app.errors import (
+    AuthenticationError,
+    ConflictError,
+    InvalidInputError,
+    NotFoundError,
+    OpenProjectServerError,
+    PermissionDeniedError,
+    RateLimitedError,
+)
+from openproject_ce_mcp_server.app.transport.errors import raise_for_status
+
+
+def test_raise_for_status_is_a_noop_below_400() -> None:
+    raise_for_status(200, {"message": "ok"})
+    raise_for_status(399, None)
+
+
+def test_raise_for_status_401_raises_authentication_error() -> None:
+    with pytest.raises(AuthenticationError):
+        raise_for_status(401, {"message": "Invalid API token"})
+
+
+def test_raise_for_status_403_with_token_message_raises_authentication_error() -> None:
+    with pytest.raises(AuthenticationError):
+        raise_for_status(403, {"message": "You need to authenticate to access this resource."})
+
+
+def test_raise_for_status_403_includes_the_original_openproject_message() -> None:
+    """GitHub #10: a bare 'permission_denied' with no server detail made a real
+    diagnosis (a project's Costs module not being enabled for a non-admin user)
+    much harder to find -- the original OpenProject message must survive."""
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        raise_for_status(403, {"message": "You are not authorized to access this resource."})
+
+    text = str(exc_info.value)
+    assert "OpenProject denied access to this resource." in text
+    assert "You are not authorized to access this resource." in text
+
+
+def test_raise_for_status_403_without_a_message_has_no_dangling_parens() -> None:
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        raise_for_status(403, {})
+
+    assert str(exc_info.value) == "OpenProject denied access to this resource."
+
+
+def test_raise_for_status_404_raises_not_found_error() -> None:
+    with pytest.raises(NotFoundError):
+        raise_for_status(404, {"message": "not found"})
+
+
+@pytest.mark.parametrize("status_code", [400, 422])
+def test_raise_for_status_4xx_raises_invalid_input_error_with_message(status_code: int) -> None:
+    with pytest.raises(InvalidInputError, match="Filters Context malformed value"):
+        raise_for_status(status_code, {"message": "Filters Context malformed value"})
+
+
+def test_raise_for_status_409_raises_conflict_error_with_message() -> None:
+    with pytest.raises(ConflictError, match="lockVersion is stale"):
+        raise_for_status(409, {"message": "lockVersion is stale"})
+
+
+def test_raise_for_status_409_without_a_message_has_a_generic_fallback() -> None:
+    with pytest.raises(ConflictError, match="OpenProject rejected the request due to a conflict."):
+        raise_for_status(409, {})
+
+
+def test_raise_for_status_429_raises_rate_limited_error() -> None:
+    with pytest.raises(RateLimitedError, match="OpenProject is rate-limiting this client."):
+        raise_for_status(429, {"message": "Too Many Requests"})
+
+
+def test_rate_limit_metadata_carries_status_retry_delay_and_classification() -> None:
+    with pytest.raises(RateLimitedError) as raised:
+        raise_for_status(429, {}, "12")
+    assert raised.value.upstream_status == 429
+    assert raised.value.retry_after == 12
+    assert raised.value.category == "upstream"
+    assert raised.value.severity == "warning"
+    assert raised.value.retryable is True
+
+
+def test_raise_for_status_5xx_raises_server_error() -> None:
+    with pytest.raises(OpenProjectServerError) as raised:
+        raise_for_status(500, {"message": "internal error"})
+    assert raised.value.upstream_status == 500
+    assert raised.value.category == "upstream"
+    assert raised.value.retryable is True
+
+
+def test_raise_for_status_5xx_preserves_retry_after_metadata() -> None:
+    with pytest.raises(OpenProjectServerError) as raised:
+        raise_for_status(503, {}, "15")
+    assert raised.value.retry_after == 15
+
+
+def test_raise_for_status_unmapped_4xx_raises_server_error_with_status_code() -> None:
+    with pytest.raises(OpenProjectServerError, match="418"):
+        raise_for_status(418, {"message": "I'm a teapot"})
+
+
+def test_raise_for_status_403_embedded_token_mention_does_not_misclassify() -> None:
+    """A 403 whose _embedded.errors[] happens to mention "token"/"authenticate"
+    in an unrelated sub-error must still raise PermissionDeniedError, not
+    AuthenticationError -- classification is based on the top-level message
+    alone, never the combined detail text that includes embedded errors."""
+    payload = {
+        "message": "You are not authorized to access this resource.",
+        "_embedded": {
+            "errors": [
+                {"message": "The request can not be handled due to invalid or missing Enterprise token."},
+            ]
+        },
+    }
+    with pytest.raises(PermissionDeniedError) as exc_info:
+        raise_for_status(403, payload)
+
+    assert "Enterprise token" in str(exc_info.value)
+
+
+def test_raise_for_status_multiple_errors_surfaces_embedded_detail_messages() -> None:
+    """A MultipleErrors HAL payload's top-level `message` alone
+    ("Multiple field constraints have been violated.") is useless -- the real
+    per-field detail lives in `_embedded.errors[]`. Without this, a caller
+    could not tell an Enterprise-gate rejection apart from any other
+    combination of simultaneous validation failures."""
+    payload = {
+        "message": "Multiple field constraints have been violated.",
+        "_embedded": {
+            "errors": [
+                {"message": "Directory (tenant) ID is invalid."},
+                {"message": "The request can not be handled due to invalid or missing Enterprise token."},
+            ]
+        },
+    }
+    with pytest.raises(InvalidInputError) as exc_info:
+        raise_for_status(422, payload)
+
+    text = str(exc_info.value)
+    assert "Multiple field constraints have been violated." in text
+    assert "Directory (tenant) ID is invalid." in text
+    assert "Enterprise token" in text
+
+
+def test_raise_for_status_single_error_payload_unaffected_by_embedded_handling() -> None:
+    """No _embedded.errors at all (the common case) must still work exactly
+    as before -- this change must not alter single-error message handling."""
+    with pytest.raises(InvalidInputError, match="^Filters Context malformed value$"):
+        raise_for_status(422, {"message": "Filters Context malformed value"})
+
+
+def test_raise_for_status_multiple_errors_with_no_message_field_falls_back_to_details() -> None:
+    payload = {
+        "_embedded": {
+            "errors": [
+                {"message": "First problem."},
+                {"message": "Second problem."},
+            ]
+        },
+    }
+    with pytest.raises(InvalidInputError) as exc_info:
+        raise_for_status(422, payload)
+
+    text = str(exc_info.value)
+    assert "First problem." in text
+    assert "Second problem." in text

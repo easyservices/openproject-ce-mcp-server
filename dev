@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cmd="${1:-}"
+shift || true
+
+usage() {
+    echo "Usage: ./dev {bootstrap|lint|test|build|ci}" >&2
+    exit 1
+}
+
+bootstrap() {
+    uv sync --dev
+}
+
+shell_scripts=(dev docker/test/up.sh docker/test/down.sh tools/api-check/fetch-sources.sh)
+required_shfmt_version="3.14.1"
+
+lint() {
+    uv run ruff check .
+    uv run ruff format --check .
+    uv run mypy
+    uvx bandit -r src/openproject_ce_mcp_server -ll
+    uvx semgrep --config auto --error src/openproject_ce_mcp_server
+    uvx pip-licenses --python .venv/bin/python3 --fail-on="GPL;LGPL;AGPL"
+    shellcheck "${shell_scripts[@]}"
+    local actual_shfmt_version
+    actual_shfmt_version="$(shfmt --version)"
+    if [ "$actual_shfmt_version" != "$required_shfmt_version" ]; then
+        echo "shfmt $required_shfmt_version required; found $actual_shfmt_version" >&2
+        exit 1
+    fi
+    shfmt -l "${shell_scripts[@]}"
+    for f in "${shell_scripts[@]}"; do
+        bash -n "$f"
+    done
+    if ! command -v actionlint >/dev/null 2>&1; then
+        echo "actionlint not found — install: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12" >&2
+        exit 1
+    fi
+    actionlint
+}
+
+test_() {
+    # Separate floors so well-covered client code cannot carry untested audit tooling.
+    uv run pytest --cov=src/openproject_ce_mcp_server --cov=tools --cov-report= --cov-fail-under=0 "$@"
+    uv run coverage report --include='*/src/openproject_ce_mcp_server/*' --fail-under=88
+    uv run coverage report --include='*/tools/*' --fail-under=85
+}
+
+build() {
+    uv build
+    uvx twine check dist/*
+    uv export --no-dev --format requirements-txt --no-hashes -o requirements.txt
+    uvx --from cyclonedx-bom cyclonedx-py requirements requirements.txt --of JSON -o sbom.json
+}
+
+case "$cmd" in
+bootstrap) bootstrap ;;
+lint) lint ;;
+test) test_ "$@" ;;
+build) build ;;
+ci)
+    lint
+    test_
+    build
+    ;;
+*) usage ;;
+esac

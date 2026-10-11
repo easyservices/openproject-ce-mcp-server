@@ -1,0 +1,154 @@
+"""Application Service for the File Links domain.
+
+Depends on the `FileLinkApi` Protocol (never `HttpxFileLinkApi` concretely --
+enforced by the architecture-boundary test), on `WorkPackageLookupApi`
+directly, and on `WorkPackageIdResolver`. Three Protocol dependencies, not
+one: `list_for_work_package`'s anchor-resolution goes through
+`WorkPackageIdResolver`, while `delete()`'s raw work-package-payload fetch goes through
+`WorkPackageLookupApi.get()` directly rather than the resolver -- `delete()`
+already has a concrete numeric work-package id (derived from the file link's
+own container link, not a caller-supplied reference to resolve) and must
+itself control the fail-closed behavior when that id is missing, which
+`WorkPackageIdResolver`'s reference-resolution semantics don't cleanly serve.
+
+No dedicated FileLinkResolver, no file_link_policy.py: `list()`'s scoping is
+entirely delegated to `WorkPackageIdResolver` (read-check on the anchor work
+package happens THERE, before the file-links sub-fetch); `delete()`'s scoping
+is a direct `scope_policy.ensure_project_write_link_allowed` call against the
+container work package's own project link.
+
+No create/update TOOL is exposed here, but this is a deliberate product
+scoping decision, not an absence-of-endpoint fact (see `FileLinkApi`'s own
+docstring for the full rationale): OpenProject's v3 API DOES
+have a real `POST /api/v3/work_packages/{id}/file_links`; create is left
+unimplemented because it needs storage-specific origin/location data
+(Nextcloud/OneDrive file identifiers) this server has no mechanism to
+source, not because no endpoint exists to call. `PATCH` genuinely does not
+exist. `delete()` is a single flat preview/commit method (same shape as
+`GridService.delete()`/`BoardService.delete()`) -- no shared
+`_write_outcome.py` state machine, since this domain has exactly one write
+action.
+
+Read/write scope reuses `"work_package"` (not a dedicated `"file_link"`
+scope).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+from ...config import Settings
+from ...models import FileLinkListResult, FileLinkSummary, FileLinkWriteResult
+from ..pagination import clamp_limit, scan_records_and_paginate
+from ..policies import access, hidden_fields
+from ..policies import scope as scope_policy
+from ..policies.scope import id_from_href
+from ..ports.file_link_api import FileLinkApi
+from ..ports.work_package_lookup_api import WorkPackageLookupApi
+from ..ports.work_package_ref import WorkPackageIdResolver
+
+
+class FileLinkService:
+    def __init__(
+        self,
+        *,
+        api: FileLinkApi,
+        work_package_lookup_api: WorkPackageLookupApi,
+        settings: Settings,
+        project_id_to_identifier: Mapping[int, str],
+        resolve_work_package_id: WorkPackageIdResolver,
+    ) -> None:
+        self._api = api
+        self._work_package_lookup_api = work_package_lookup_api
+        self._settings = settings
+        self._project_id_to_identifier = project_id_to_identifier
+        self._resolve_work_package_id = resolve_work_package_id
+
+    def _stamp(self, summary: FileLinkSummary) -> FileLinkSummary:
+        return hidden_fields.apply_hidden_fields("file_link", summary, settings=self._settings)
+
+    async def list_for_work_package(
+        self, work_package_id: int | str, *, offset: int = 1, limit: int | None = None
+    ) -> FileLinkListResult:
+        access.ensure_read_enabled("work_package", settings=self._settings)
+        effective_limit = clamp_limit(
+            limit,
+            default_page_size=self._settings.default_page_size,
+            max_page_size=self._settings.max_page_size,
+            max_results=self._settings.max_results,
+        )
+        # Resolving the id already confirms the anchor work package itself is
+        # allowed against OPENPROJECT_READ_PROJECTS before its file links are
+        # fetched.
+        resolved_id = await self._resolve_work_package_id(work_package_id, write=False)
+        # File Links is offset-paginated server-side (verified against
+        # OpenProject's own API implementation: FileLinkCollectionRepresenter
+        # subclasses OffsetPaginatedCollection) -- a single unparameterized
+        # GET returns only the server's default page, and a single fetch
+        # capped at settings.max_results would silently hide any file link
+        # beyond that cap. Scan server pages instead, same early-stopping
+        # pattern already applied to Documents/Views/News.
+        raw_items, truncated = await scan_records_and_paginate(
+            lambda o, ps: self._api.list_for_work_package(resolved_id, offset=o, page_size=ps),
+            item_allowed=lambda _record: True,
+            server_page_size=self._settings.max_page_size,
+            offset=offset,
+            limit=effective_limit,
+            key=lambda r: r.summary.id,
+        )
+        results = [self._stamp(record.summary) for record in raw_items]
+        total = len(results)
+        return FileLinkListResult(
+            offset=offset,
+            limit=effective_limit,
+            total=total,
+            count=total,
+            next_offset=offset + 1 if truncated else None,
+            truncated=truncated,
+            results=results,
+        )
+
+    async def delete(self, file_link_id: int, *, confirm: bool = False) -> FileLinkWriteResult:
+        access.ensure_read_enabled("work_package", settings=self._settings)
+        record = await self._api.get(file_link_id)
+        file_link = self._stamp(record.summary)
+
+        container_href = record.container_link.get("href") if isinstance(record.container_link, dict) else None
+        work_package_id = id_from_href(container_href)
+
+        # Fail closed when the container cannot be resolved: an unverifiable
+        # project association must never be treated as authorized for a
+        # destructive operation, even under write_projects=("*",).
+        if work_package_id:
+            work_package_payload = await self._work_package_lookup_api.get(str(work_package_id))
+            project_link = work_package_payload.get("_links", {}).get("project")
+        else:
+            project_link = None
+        scope_policy.ensure_project_write_link_allowed(
+            project_link, settings=self._settings, project_id_to_identifier=self._project_id_to_identifier
+        )
+
+        if not confirm:
+            return FileLinkWriteResult(
+                action="delete",
+                state="preview",
+                ready=True,
+                message="OpenProject found the file link. Ask for confirmation, then call again with confirm=true to delete it.",
+                file_link_id=file_link.id,
+                work_package_id=work_package_id,
+                validation_errors={},
+                result=file_link,
+            )
+
+        access.ensure_write_enabled("work_package", settings=self._settings)
+        await self._api.delete(file_link_id)
+        return FileLinkWriteResult(
+            action="delete",
+            state="confirmed",
+            ready=True,
+            message="File link deleted successfully.",
+            file_link_id=file_link.id,
+            work_package_id=work_package_id,
+            validation_errors={},
+            result=None,
+        )

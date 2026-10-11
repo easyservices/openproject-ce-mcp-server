@@ -1,0 +1,51 @@
+# Python / build
+__pycache__/
+*.egg-info/
+dist/
+build/
+requirements.txt
+sbom.json
+
+# Test / coverage
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Virtual environments
+.venv/
+
+# Type checking
+.mypy_cache/
+
+# Local credentials and config
+.env
+.env.*
+!.env.example
+
+# Runtime audit logs
+/logs/
+*.log
+
+# Tool-local state
+.claude/
+.vscode/
+.codex/
+.continue/
+.mcp.json
+.DS_Store
+Thumbs.db
+Desktop.ini
+/CONTINUE.md
+
+# Local backups
+*.bak.*
+
+# Internal review notes
+SELF_REVIEW.md
+
+# AGENTS.md/CLAUDE.md live one level up at the umbrella-directory level, not
+# inside this repo. ADRs and other internal engineering docs live in a
+# private companion repository, not tracked here.

@@ -1,0 +1,96 @@
+"""HTTP-backed RelationApi adapter.
+
+No `httpx` import (depends on the `Transport` Protocol only, matching every
+other adapter). `trim_text`/`link_title`/`id_from_href`/`delimit_user_content`/
+`SUBJECT_LIMIT` come from `app/adapters/_text.py`, used by `normalize_relation`
+for `trim_text` (description truncation), `delimit_user_content` (description
+wrapped as untrusted user content), `link_title` (from/to subject titles), and
+`id_from_href` (from/to numeric ids from their hrefs).
+
+Unlike most other adapters, this one takes no `api_prefix` -- `RelationSummary`
+has no `url` field of its own (nothing here builds an `_api_href(...)` link),
+and the outgoing paths (`relations`, `relations/{id}`, `work_packages/{ref}/
+relations`) are always passed relative to the transport, never prefix-joined
+locally.
+
+`normalize_relation` here always computes `from_subject`/`to_subject`
+unconditionally -- the work_package-subject-hide check (from_subject/
+to_subject nulled when work_package.subject is hidden) is a Service-layer
+concern applied via `dataclasses.replace` after normalization (see
+RelationService._stamp), keeping this adapter's normalize function structurally
+identical to every other domain's Settings-free normalize_*.
+
+`create()` validates the source work-package reference itself via the shared
+`work_package_ref()` helper before building the POST path, since nothing else
+in the call chain validates the reference used in that path.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ...models import RelationSummary
+from ..ports.relation_api import RelationRecord
+from ..ports.work_package_ref import work_package_ref as _valid_work_package_ref
+from ..transport.protocol import Transport
+from ._text import SUBJECT_LIMIT
+from ._text import delimit_user_content as _delimit_user_content
+from ._text import id_from_href as _id_from_href
+from ._text import link_title as _link_title
+from ._text import trim_text_with_meta as _trim_text_with_meta
+
+
+def normalize_relation(payload: dict[str, Any]) -> RelationSummary:
+    links = payload.get("_links", {})
+    description, truncated, length = _trim_text_with_meta(payload.get("description"), limit=SUBJECT_LIMIT)
+    return RelationSummary(
+        id=int(payload["id"]),
+        type=payload.get("type"),
+        description=_delimit_user_content(description),
+        from_id=_id_from_href(links.get("from", {}).get("href")),
+        from_subject=_link_title(links.get("from")),
+        to_id=_id_from_href(links.get("to", {}).get("href")),
+        to_subject=_link_title(links.get("to")),
+        description_truncated=truncated,
+        description_length=length,
+    )
+
+
+class HttpxRelationApi:
+    def __init__(self, transport: Transport) -> None:
+        self._transport = transport
+
+    def to_record(self, payload: dict[str, Any]) -> RelationRecord:
+        links = payload.get("_links", {})
+        # `summary` is lazy (see RelationRecord's docstring): the Service
+        # filters records by from_link/to_link BEFORE ever reading .summary
+        # ("filter raw, normalize survivors" order) -- an eager field here
+        # would normalize (and potentially KeyError on) records the Service
+        # is about to discard.
+        return RelationRecord(
+            summary=lambda: normalize_relation(payload),
+            from_link=links.get("from"),
+            to_link=links.get("to"),
+        )
+
+    async def fetch_page(self, *, offset: int, page_size: int, filters: str | None) -> dict[str, Any]:
+        params = {"offset": str(offset), "pageSize": str(page_size)}
+        if filters is not None:
+            params["filters"] = filters
+        return await self._transport.get_json("relations", params=params)
+
+    async def get(self, relation_id: int) -> RelationRecord:
+        payload = await self._transport.get_json(f"relations/{relation_id}")
+        return self.to_record(payload)
+
+    async def create(self, work_package_ref: str, payload: dict[str, Any]) -> RelationRecord:
+        source = _valid_work_package_ref(work_package_ref)
+        response = await self._transport.post_json(f"work_packages/{source}/relations", json_body=payload)
+        return self.to_record(response)
+
+    async def update(self, relation_id: int, payload: dict[str, Any]) -> RelationRecord:
+        response = await self._transport.patch_json(f"relations/{relation_id}", json_body=payload)
+        return self.to_record(response)
+
+    async def delete(self, relation_id: int) -> None:
+        await self._transport.delete(f"relations/{relation_id}")

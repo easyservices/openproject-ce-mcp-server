@@ -1,0 +1,276 @@
+"""Application Service for the Reminders domain.
+
+Depends on the `ReminderApi` Protocol (never `HttpxReminderApi` concretely --
+enforced by the architecture-boundary test), on `WorkPackageLookupApi`
+directly, on `WorkPackageIdResolver`, and on `WorkPackageProjectAllowedCheck`
+-- the widest seam surface of any domain, because each of its four methods
+scopes differently:
+
+- `list()` fans out across N *different* work packages (one per reminder,
+  not a single anchor) -- uses `WorkPackageProjectAllowedCheck` +
+  `WorkPackageAllowedContext` (a request-scoped cache avoiding a redundant
+  fetch if two reminders happen to share a work package). This does NOT
+  belong in a Policy module (`app/policies/` is documented as pure, no I/O)
+  since the check itself does I/O (a conditional work-package fetch).
+- `create()` takes a genuine caller-supplied work-package reference -- uses
+  `WorkPackageIdResolver(ref, write=True)`.
+- `update()`/`delete()` both need the reminder's OWN `remindable` link first
+  (an id already concrete once the reminder is fetched, not a caller-supplied
+  reference) -- uses `WorkPackageLookupApi.get_by_href()` + a direct
+  `scope_policy.ensure_project_write_link_allowed` call, the same shape as
+  Emoji Reactions' `toggle()` (fail-closed raise on a missing/malformed link,
+  not a bool-returning check to re-wrap).
+
+`create()`/`update()`/`delete()` share the same `ReminderWriteResult` shape
+and are wired onto the shared `_write_outcome._finalize_write` with
+`validation_errors={}` throughout (OPM-2705) -- like News/Group/Storage, this
+domain has no `<domain>/form` endpoint the way Grid/Board do, but
+`_finalize_write` already supports the no-form case.
+
+Read/write scope reuses `"work_package"` (not a dedicated `"reminder"`
+scope).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+from ... import policy_observation
+from ...config import Settings
+from ...models import ReminderListResult, ReminderSummary, ReminderWriteResult
+from ..errors import InvalidInputError, ProjectScopeDeniedError
+from ..pagination import clamp_limit, fetch_bounded_and_paginate
+from ..policies import access, hidden_fields
+from ..policies import scope as scope_policy
+from ..ports.reminder_api import ReminderApi
+from ..ports.work_package_lookup_api import WorkPackageLookupApi
+from ..ports.work_package_ref import (
+    WorkPackageIdResolver,
+    WorkPackageProjectAllowedBulkCheck,
+    WorkPackageProjectAllowedCheck,
+)
+from ..ports.work_package_resolution import WorkPackageAllowedContext
+from ._write_outcome import _finalize_write, _WriteOutcome
+
+
+class ReminderService:
+    def __init__(
+        self,
+        *,
+        api: ReminderApi,
+        work_package_lookup_api: WorkPackageLookupApi,
+        settings: Settings,
+        project_id_to_identifier: Mapping[int, str],
+        resolve_work_package_id: WorkPackageIdResolver,
+        work_package_project_allowed: WorkPackageProjectAllowedCheck,
+        work_package_project_allowed_bulk: WorkPackageProjectAllowedBulkCheck,
+    ) -> None:
+        self._api = api
+        self._work_package_lookup_api = work_package_lookup_api
+        self._settings = settings
+        self._project_id_to_identifier = project_id_to_identifier
+        self._resolve_work_package_id = resolve_work_package_id
+        self._work_package_project_allowed = work_package_project_allowed
+        self._work_package_project_allowed_bulk = work_package_project_allowed_bulk
+
+    def _stamp(self, summary: ReminderSummary) -> ReminderSummary:
+        return hidden_fields.apply_hidden_fields("reminder", summary, settings=self._settings)
+
+    async def list_all(self, *, offset: int = 1, limit: int | None = None) -> ReminderListResult:
+        access.ensure_read_enabled("work_package", settings=self._settings)
+        effective_limit = clamp_limit(
+            limit,
+            default_page_size=self._settings.default_page_size,
+            max_page_size=self._settings.max_page_size,
+            max_results=self._settings.max_results,
+        )
+        if not self._settings.read_projects:
+            # deny-all: skip the network call entirely
+            return ReminderListResult(
+                offset=offset, limit=effective_limit, total=0, count=0, next_offset=None, truncated=False, results=[]
+            )
+        allowlisted = not scope_policy.scope_allows_all(self._settings.read_projects)
+        cache = WorkPackageAllowedContext()
+
+        async def item_allowed_bulk(raw_elements: list[dict[str, Any]]) -> list[bool | Exception]:
+            """Page-batching hook: collect every raw reminder's `remindable`
+            href up front and resolve them all concurrently in one bulk
+            call, then map back per item -- a missing href needs no I/O and
+            fails closed synchronously."""
+            hrefs = []
+            for raw in raw_elements:
+                record = self._api.to_record(raw)
+                href = record.remindable_link.get("href") if isinstance(record.remindable_link, dict) else None
+                if href:
+                    hrefs.append(href)
+            outcomes = await self._work_package_project_allowed_bulk(hrefs, context=cache) if hrefs else {}
+
+            results: list[bool | Exception] = []
+            for raw in raw_elements:
+                record = self._api.to_record(raw)
+                href = record.remindable_link.get("href") if isinstance(record.remindable_link, dict) else None
+                if not href:
+                    results.append(False)  # can't verify -> fail closed
+                    continue
+                results.append(outcomes[href])
+            return results
+
+        # Reminders is offset-paginated server-side (verified against
+        # OpenProject's own API implementation: ReminderCollectionRepresenter
+        # subclasses OffsetPaginatedCollection) -- a single unparameterized
+        # GET returns only the server's default page. Scan just enough pages
+        # to fill the requested window instead of walking the complete
+        # collection, same early-stopping pattern as Relations. .summary()
+        # (LAZY, see ReminderRecord's own docstring) is called only AFTER
+        # filtering, inside `normalize` -- "filter raw, normalize survivors".
+        raw_items, total, next_offset, truncated = await fetch_bounded_and_paginate(
+            fetch_page=lambda o, ps: self._api.fetch_page(offset=o, page_size=ps),
+            normalize=lambda raw: self._stamp(self._api.to_record(raw).summary()),
+            item_allowed=None,
+            item_allowed_bulk=item_allowed_bulk if allowlisted else None,
+            server_page_size=self._settings.max_page_size,
+            offset=offset,
+            limit=effective_limit,
+        )
+        return ReminderListResult(
+            offset=offset,
+            limit=effective_limit,
+            total=total,
+            count=total,
+            next_offset=next_offset,
+            truncated=truncated,
+            results=raw_items,
+        )
+
+    async def create(
+        self,
+        *,
+        work_package_id: int | str,
+        remind_at: str,
+        note: str | None = None,
+        confirm: bool = False,
+    ) -> ReminderWriteResult:
+        resolved_id = await self._resolve_work_package_id(work_package_id, write=True)
+        hidden_fields.ensure_field_writable("reminder", "remind_at", settings=self._settings)
+        payload: dict = {"remindAt": remind_at}
+        if note is not None:
+            hidden_fields.ensure_field_writable("reminder", "note", settings=self._settings)
+            payload["note"] = note
+
+        async def _commit(p: dict[str, Any]) -> ReminderSummary:
+            # One active reminder per work package/user: a second create
+            # returns 409, surfaced as InvalidInputError with the API's
+            # "update or delete" message.
+            record = await self._api.create(resolved_id, p)
+            return self._stamp(record.summary())
+
+        outcome = await _finalize_write(
+            confirm=confirm,
+            payload=payload,
+            validation_errors={},
+            identity={"reminder_id": None},
+            ensure_write_enabled=lambda: access.ensure_write_enabled("work_package", settings=self._settings),
+            commit=_commit,
+            committed_identity=lambda d: {"reminder_id": d.id},
+            rejected_message="",
+            preview_message="OpenProject is ready to create this reminder. Ask for confirmation, then call again with confirm=true.",
+            success_message="Reminder created successfully.",
+        )
+        return self._to_write_result("create", outcome)
+
+    async def _ensure_reminder_project_write_allowed(self, reminder_id: int) -> None:
+        """Fetch only the reminder's `remindable` link (not the full record --
+        see `ReminderApi.get_remindable_link`'s docstring for why), derive its
+        work package, and check the write allowlist against that work
+        package's own project link.
+
+        Fail closed: an unresolvable remindable link must not be bypassed,
+        even under a fully open READ_PROJECTS=*/WRITE_PROJECTS=* scope.
+        """
+        remindable = await self._api.get_remindable_link(reminder_id)
+        href = remindable.get("href") if isinstance(remindable, dict) else None
+        if not isinstance(href, str) or not href:
+            policy_observation.record_project_scope(None)
+            policy_observation.record_policy_decision("project_scope_write_denied")
+            raise ProjectScopeDeniedError(
+                "OpenProject writes to this reminder are disabled by OPENPROJECT_WRITE_PROJECTS."
+            )
+        work_package = await self._work_package_lookup_api.get_by_href(href)
+        # Delegates to the already-instrumented ensure_project_write_link_allowed
+        # (its own @_observe_project_scope_check decorator records
+        # project_scope/policy_decision) -- no separate recording needed here.
+        scope_policy.ensure_project_write_link_allowed(
+            work_package.get("_links", {}).get("project"),
+            settings=self._settings,
+            project_id_to_identifier=self._project_id_to_identifier,
+        )
+
+    async def update(
+        self,
+        *,
+        reminder_id: int,
+        remind_at: str | None = None,
+        note: str | None = None,
+        confirm: bool = False,
+    ) -> ReminderWriteResult:
+        await self._ensure_reminder_project_write_allowed(reminder_id)
+        payload: dict = {}
+        if remind_at is not None:
+            hidden_fields.ensure_field_writable("reminder", "remind_at", settings=self._settings)
+            payload["remindAt"] = remind_at
+        if note is not None:
+            hidden_fields.ensure_field_writable("reminder", "note", settings=self._settings)
+            payload["note"] = note
+        if not payload:
+            raise InvalidInputError("At least one field (remind_at or note) is required.")
+
+        async def _commit(p: dict[str, Any]) -> ReminderSummary:
+            record = await self._api.update(reminder_id, p)
+            return self._stamp(record.summary())
+
+        outcome = await _finalize_write(
+            confirm=confirm,
+            payload=payload,
+            validation_errors={},
+            identity={"reminder_id": reminder_id},
+            ensure_write_enabled=lambda: access.ensure_write_enabled("work_package", settings=self._settings),
+            commit=_commit,
+            committed_identity=lambda d: {"reminder_id": d.id},
+            rejected_message="",
+            preview_message="OpenProject is ready to update this reminder. Ask for confirmation, then call again with confirm=true.",
+            success_message="Reminder updated successfully.",
+        )
+        return self._to_write_result("update", outcome)
+
+    async def delete(self, *, reminder_id: int, confirm: bool = False) -> ReminderWriteResult:
+        await self._ensure_reminder_project_write_allowed(reminder_id)
+
+        async def _commit(p: dict[str, Any]) -> None:
+            await self._api.delete(reminder_id)
+
+        outcome = await _finalize_write(
+            confirm=confirm,
+            payload={},
+            validation_errors={},
+            identity={"reminder_id": reminder_id},
+            ensure_write_enabled=lambda: access.ensure_write_enabled("work_package", settings=self._settings),
+            commit=_commit,
+            committed_identity=lambda d: {"reminder_id": reminder_id},
+            rejected_message="",
+            preview_message="OpenProject is ready to delete this reminder. Ask for confirmation, then call again with confirm=true.",
+            success_message="Reminder deleted successfully.",
+        )
+        return self._to_write_result("delete", outcome)
+
+    def _to_write_result(self, action: str, outcome: _WriteOutcome[ReminderSummary | None]) -> ReminderWriteResult:
+        return ReminderWriteResult(
+            action=action,
+            state=outcome.state,
+            ready=outcome.ready,
+            message=outcome.message,
+            payload=outcome.payload,
+            validation_errors=outcome.validation_errors,
+            result=outcome.detail,
+            **outcome.identity,
+        )

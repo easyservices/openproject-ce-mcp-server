@@ -1,0 +1,258 @@
+"""HTTP-backed TimeEntryApi adapter.
+
+No `httpx` import (depends on the `Transport` Protocol only, matching every
+other adapter). `trim_text`/`id_from_href`/`link_title`/`delimit_user_content`/
+`web_url`/`SUBJECT_LIMIT`/`normalize_form_validation_errors`/`_normalize_text`/
+`_trim_text_with_meta`/`_extract_formattable_text_with_meta` come from
+`app/adapters/_text.py`. `normalize_form_validation_errors` is the exact
+three-branch shape `create_time_entry`/`update_time_entry` use, shared with
+Grids' identical situation. This adapter's `comment` field never needs
+`preserve_newlines=True`, so it relies on the shared helper's `False` default.
+
+Unlike `normalize_relation`, `normalize_time_entry_raw`/
+`normalize_time_entry_activity_raw` here do NOT call a hide-aware,
+settings-dependent extraction or apply hidden-field masking inline -- these
+functions do ONLY the pure HAL extraction. `comment` is still
+trimmed/delimited (matching the untrusted-user-content handling every other
+domain applies, via the same `raw`-or-`html` fallback, whitespace-collapse,
+and ellipsis-truncation shape as `httpx_project_api.py`'s
+`_extract_formattable_text_with_meta`), but with NO hidden-field awareness at
+all. `TimeEntryService._stamp`/`_stamp_activity` apply the
+`"time_entry"`/`"time_entry_activity"` hidden-field masking afterwards (see
+that module's docstring for the comment-specific metadata-clearing rationale).
+
+`fetch_activities_for_entity` lets the transport call raise normally on
+error -- it must NOT convert failures to `None`/empty here, since one of its
+two callers (`TimeEntryService._resolve_activity_id`) needs a real error to
+propagate, not be silently swallowed (see time_entry_api.py's module
+docstring for the full rationale, and GitHub issue #10's log_own_time
+entity-vs-project-link distinction, described below).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse
+
+from ...models import TimeEntryActivitySummary, TimeEntrySummary
+from ..api_href import api_href as _api_href
+from ..errors import InvalidInputError, NotFoundError, OpenProjectServerError, PermissionDeniedError
+from ..ports.time_entry_api import TimeEntryActivityRecord, TimeEntryFormResult, TimeEntryRecord
+from ..transport.protocol import Transport
+from ._text import SUBJECT_LIMIT
+from ._text import delimit_user_content as _delimit_user_content
+from ._text import extract_formattable_text_with_meta as _extract_formattable_text_with_meta
+from ._text import id_from_href as _id_from_href
+from ._text import link_title as _link_title
+from ._text import normalize_form_validation_errors as normalize_validation_errors
+from ._text import origin_from_url as _origin_from_url
+from ._text import trim_text as _trim_text
+
+_ENTITY_TYPE_BY_HREF_SEGMENT = {"work_packages": "WorkPackage", "meetings": "Meeting"}
+
+
+def _entity_type_from_href(href: str | None) -> str | None:
+    """OpenProject's TimeEntry representer never emits an `entityType` field --
+    the entity's type is only ever distinguishable by which resource collection
+    its `entity` link's href points into (`/api/v3/work_packages/<id>` vs.
+    `/api/v3/meetings/<id>`), matching `EntityRepresenterFactory.representer_type`
+    server-side."""
+    if not href:
+        return None
+    segments = [s for s in href.split("/") if s]
+    for segment, entity_type in _ENTITY_TYPE_BY_HREF_SEGMENT.items():
+        if segment in segments:
+            return entity_type
+    return None
+
+
+def normalize_time_entry_raw(payload: dict[str, Any], *, text_limit: int | None) -> TimeEntrySummary:
+    """Pure HAL extraction, no hidden-field awareness (see module docstring).
+
+    ``text_limit=None`` returns the full comment uncapped (get_time_entry);
+    the caller passes settings.text_limit for list rows.
+    """
+    links = payload.get("_links", {})
+    project_link = links.get("project")
+    # `entity` covers both WorkPackage and Meeting time entries but doesn't
+    # exist before 16.6 (server representer only has `workPackage` there --
+    # meeting time entries aren't a thing on those versions either, so this
+    # fallback loses no coverage on older servers).
+    entity_link = links.get("entity") or links.get("workPackage")
+    entity_href = entity_link.get("href") if isinstance(entity_link, dict) else None
+    trimmed, truncated, full_length = _extract_formattable_text_with_meta(payload.get("comment"), limit=text_limit)
+    return TimeEntrySummary(
+        id=int(payload["id"]),
+        project=_link_title(project_link),
+        entity_type=_entity_type_from_href(entity_href),
+        entity_id=_id_from_href(entity_href),
+        entity_name=_link_title(entity_link),
+        user=_link_title(links.get("user")),
+        activity=_link_title(links.get("activity")),
+        hours=_trim_text(payload.get("hours"), limit=SUBJECT_LIMIT),
+        spent_on=_trim_text(payload.get("spentOn"), limit=SUBJECT_LIMIT),
+        start_time=_trim_text(payload.get("startTime"), limit=SUBJECT_LIMIT),
+        end_time=_trim_text(payload.get("endTime"), limit=SUBJECT_LIMIT),
+        ongoing=bool(payload.get("ongoing")),
+        comment=_delimit_user_content(trimmed),
+        comment_truncated=truncated,
+        comment_length=full_length,
+        created_at=payload.get("createdAt"),
+        updated_at=payload.get("updatedAt"),
+    )
+
+
+def normalize_time_entry_activity_raw(payload: dict[str, Any]) -> TimeEntryActivitySummary:
+    activity_id = int(payload["id"])
+    projects = [_link_title(item) for item in payload.get("_links", {}).get("projects", []) if isinstance(item, dict)]
+    return TimeEntryActivitySummary(
+        id=activity_id,
+        name=_trim_text(payload.get("name"), limit=SUBJECT_LIMIT) or f"Activity {activity_id}",
+        position=payload.get("position"),
+        is_default=bool(payload.get("default")),
+        projects=[item for item in projects if item],
+    )
+
+
+class HttpxTimeEntryApi:
+    def __init__(self, transport: Transport, *, base_url: str, api_prefix: str = "/api/v3/") -> None:
+        self._transport = transport
+        self._origin = _origin_from_url(base_url)
+        self._api_prefix = api_prefix
+
+    def _link_to_api_path(self, href: str) -> str:
+        """Same-origin-checked href -> API-relative path. Mirrored by
+        `HttpxWorkPackageApi._link_to_api_path`/`HttpxProjectApi._link_to_api_path`
+        -- deliberately duplicated per adapter rather than shared, so a future
+        change to one cannot silently change another's contract."""
+        parsed = urlparse(href)
+        if not parsed.scheme:
+            path = parsed.path or href
+        else:
+            if _origin_from_url(href) != self._origin:
+                raise OpenProjectServerError("OpenProject returned an unexpected link host.")
+            path = parsed.path
+        if path.startswith(self._api_prefix):
+            relative_path = path[len(self._api_prefix) :]
+        else:
+            relative_path = path.lstrip("/")
+        if parsed.query:
+            return f"{relative_path}?{parsed.query}"
+        return relative_path
+
+    def to_record(self, payload: dict[str, Any], *, text_limit: int | None) -> TimeEntryRecord:
+        return TimeEntryRecord(summary=lambda: normalize_time_entry_raw(payload, text_limit=text_limit))
+
+    def to_activity_record(self, payload: dict[str, Any]) -> TimeEntryActivityRecord:
+        return TimeEntryActivityRecord(summary=normalize_time_entry_activity_raw(payload))
+
+    def parse_form_result(self, form: dict[str, Any]) -> TimeEntryFormResult:
+        embedded = form.get("_embedded", {})
+        return TimeEntryFormResult(
+            payload=embedded.get("payload", {}),
+            validation_errors=normalize_validation_errors(embedded.get("validationErrors")),
+        )
+
+    def project_link_title_and_id(self, link: Any) -> tuple[str | None, int | None]:
+        title = _link_title(link)
+        href = link.get("href") if isinstance(link, dict) else None
+        return title, _id_from_href(href)
+
+    async def fetch_page(self, *, offset: int, page_size: int) -> dict[str, Any]:
+        params = {"offset": str(offset), "pageSize": str(page_size)}
+        return await self._transport.get_json("time_entries", params=params)
+
+    async def fetch_page_by_href(self, href: str, *, offset: int, page_size: int) -> dict[str, Any]:
+        # httpx's params= REPLACES an existing query string on the request URL
+        # rather than merging with it (verified) -- since the link already
+        # carries OpenProject's own filters=[...] query, offset/pageSize must
+        # be merged into the link's query string by hand before dispatch, or
+        # the link's filter would silently be dropped.
+        base_path, _, query = self._link_to_api_path(href).partition("?")
+        merged = urlencode([*parse_qsl(query), ("offset", str(offset)), ("pageSize", str(page_size))])
+        return await self._transport.get_json(f"{base_path}?{merged}")
+
+    async def get_raw(self, time_entry_id: int) -> dict[str, Any]:
+        return await self._transport.get_json(f"time_entries/{time_entry_id}")
+
+    async def validate_create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._transport.post_json("time_entries/form", json_body=payload)
+
+    async def validate_update(self, time_entry_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._transport.post_json(f"time_entries/{time_entry_id}/form", json_body=payload)
+
+    async def create(self, payload: dict[str, Any]) -> TimeEntryRecord:
+        response = await self._transport.post_json("time_entries", json_body=payload)
+        return self.to_record(response, text_limit=None)
+
+    async def update(self, time_entry_id: int, payload: dict[str, Any]) -> TimeEntryRecord:
+        response = await self._transport.patch_json(f"time_entries/{time_entry_id}", json_body=payload)
+        return self.to_record(response, text_limit=None)
+
+    async def delete(self, time_entry_id: int) -> None:
+        await self._transport.delete(f"time_entries/{time_entry_id}")
+
+    async def fetch_activities(self) -> dict[str, Any] | None:
+        # Only ONE call context uses this (list_activities()'s best-effort
+        # first attempt, which treats a failure identically to an empty
+        # result) -- unlike fetch_activities_for_entity, catching here is
+        # safe and keeps that call site simple. See module docstring.
+        # Some installations route the path to time_entries/:id and answer
+        # 400 ("id is invalid") instead of 404; both mean the collection
+        # route does not exist.
+        try:
+            return await self._transport.get_json("time_entries/activities")
+        except (NotFoundError, PermissionDeniedError, OpenProjectServerError, InvalidInputError):
+            return None
+
+    async def fetch_activities_for_entity(self, *, project_id: int, work_package_id: int | None) -> dict[str, Any]:
+        # OpenProject's CreateContract#allowed_to_log_own? can only validate the
+        # log_own_time permission against a concrete WorkPackage/Meeting entity
+        # (case model.entity ... else false) -- a project-only link makes it fall
+        # through to requiring log_time instead, denying a caller who only has
+        # log_own_time even though they're entitled to log their own time on this
+        # work package. Send a work-package link whenever the work package is
+        # already known, matching what the real create/update payload sends
+        # (GitHub #10). Uses the `workPackage` key, not `entity`: on 16.6+
+        # both set the same underlying `entity` model attribute (its setter is
+        # literally the entity setter -- verified in source), but `entity` as
+        # a link key doesn't exist at all before 16.6 and is silently dropped
+        # there, making assignable_activities see no project/work_package and
+        # return none (verified live against 16.0: `entity` link -> empty
+        # allowedValues, `workPackage` link -> correct 6 activities).
+        # `workPackage` works identically on every version in the support
+        # range, so there is no need to branch on server version here.
+        links: dict[str, dict[str, str]] = (
+            {"workPackage": {"href": _api_href(f"work_packages/{work_package_id}", api_prefix=self._api_prefix)}}
+            if work_package_id is not None
+            else {"project": {"href": _api_href(f"projects/{project_id}", api_prefix=self._api_prefix)}}
+        )
+        form = await self._transport.post_json("time_entries/form", json_body={"_links": links})
+        # A project that restricts its available activities can make OpenProject
+        # link a filtered collection instead of embedding it -- mirrors
+        # HttpxWorkPackageApi._resolve_linked_allowed_values's identical
+        # dereference-if-not-embedded shape for allowedValues.
+        # _activities_from_form (the Service's pure consumer of this dict) stays
+        # unchanged: it only ever reads _embedded.allowedValues, which is now
+        # always populated by the time it sees this response. Never mutates the
+        # input `form` in place -- returns a new dict, mirroring parse_form.
+        schema = (form.get("_embedded") or {}).get("schema") or {}
+        activity_field = schema.get("activity")
+        if (
+            not isinstance(activity_field, dict)
+            or (activity_field.get("_embedded") or {}).get("allowedValues") is not None
+        ):
+            return form
+        link = (activity_field.get("_links") or {}).get("allowedValues")
+        href = link.get("href") if isinstance(link, dict) else None
+        if not isinstance(href, str) or not href:
+            return form
+        collection = await self._transport.get_json(self._link_to_api_path(href))
+        elements = (collection.get("_embedded") or {}).get("elements", [])
+        resolved_activity = {
+            **activity_field,
+            "_embedded": {**(activity_field.get("_embedded") or {}), "allowedValues": elements},
+        }
+        resolved_schema = {**schema, "activity": resolved_activity}
+        resolved_embedded = {**(form.get("_embedded") or {}), "schema": resolved_schema}
+        return {**form, "_embedded": resolved_embedded}

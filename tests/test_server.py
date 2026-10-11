@@ -1,0 +1,734 @@
+"""Tests for dynamic tool registration in create_app()."""
+
+import json
+
+import pytest
+
+import openproject_ce_mcp_server.server as server
+from openproject_ce_mcp_server import __version__, models
+from openproject_ce_mcp_server.config import Settings
+from openproject_ce_mcp_server.server import create_app
+from openproject_ce_mcp_server.tools_validation import (
+    BATCH_READ_ITEM_WRAPPER_FIELDS,
+    BULK_ITEM_WRAPPER_FIELDS,
+    _validate_select,
+)
+
+
+def make_settings(**overrides) -> Settings:
+    defaults = {
+        "base_url": "https://op.example.com",
+        "api_token": "token",
+        "timeout": 12,
+        "verify_ssl": True,
+        "default_page_size": 20,
+        "max_page_size": 50,
+        "max_results": 100,
+        "log_level": "WARNING",
+    }
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
+def _tool_names(mcp) -> set[str]:
+    return {t.name for t in mcp._tool_manager.list_tools()}
+
+
+# The 5 project-scoped write flags now default True on the Settings dataclass
+# itself (direct Settings(**kwargs) construction never validates that
+# combination) — tests isolating a single write category must explicitly turn
+# the other 4 off, or they'd all be visible regardless of the flag under test.
+ALL_WRITE_OFF = {
+    "enable_project_write": False,
+    "enable_work_package_write": False,
+    "enable_membership_write": False,
+    "enable_version_write": False,
+    "enable_board_write": False,
+}
+
+
+def test_ce_instructions_are_not_duplicated_into_any_tool_description() -> None:
+    """Live Codex tool discovery reportedly saw the server-level CE
+    instructions repeated in every tool's own metadata/description. Guards
+    against this server (or a future change to it) ever introducing that --
+    server.instructions must stay the single carrier of this text, sent once
+    in the `initialize` response, never copied into a tool's own description.
+    """
+    mcp = create_app(make_settings(**ALL_WRITE_OFF, enable_metadata_tools=True))
+    assert mcp.instructions == server.CE_INSTRUCTIONS
+    needle = "Community Edition (CE)"  # distinctive substring, implausible false positive
+    assert needle in server.CE_INSTRUCTIONS
+    offenders = [t.name for t in mcp._tool_manager.list_tools() if needle in (t.description or "")]
+    assert offenders == []
+
+
+def test_budget_comparison_tool_is_opt_in() -> None:
+    assert "compare_project_budgets" not in _tool_names(create_app(make_settings()))
+    assert "compare_project_budgets" in _tool_names(
+        create_app(make_settings(budget_comparison_enabled=True, read_projects=("*",)))
+    )
+
+
+def test_defaults_contain_read_tools() -> None:
+    # read_projects=("*",): these are all project-scoped read tools, only
+    # registered when the read allowlist is non-empty (see
+    # tools._PROJECT_SCOPED_READ_TOOLS) — this test is about the read-enable
+    # flags being on by default, not about the allowlist gate.
+    mcp = create_app(make_settings(read_projects=("*",)))
+    names = _tool_names(mcp)
+    assert "list_projects" in names
+    assert "list_work_packages" in names
+    assert "list_boards" in names
+    assert "list_versions" in names
+    assert "list_sprints" in names
+    assert "get_sprint" in names
+    assert "list_project_memberships" in names
+
+
+def test_defaults_no_write_tools() -> None:
+    mcp = create_app(make_settings())
+    names = _tool_names(mcp)
+    assert "create_project" not in names
+    assert "update_work_package" not in names
+    assert "delete_board" not in names
+    assert "create_user" not in names
+    assert "mark_notifications_read" not in names
+
+
+def test_update_my_preferences_absent_by_default() -> None:
+    """ "personal" is opt-in only — update_my_preferences is not
+    unconditionally registered."""
+    mcp = create_app(make_settings())
+    names = _tool_names(mcp)
+    assert "update_my_preferences" not in names
+
+
+def test_update_my_preferences_needs_both_personal_read_and_write() -> None:
+    """ "personal" is an AND-gate, not the independent read/write pattern every
+    other scope uses: both enable_personal_read AND enable_personal_write are
+    required together before the mutation tools appear."""
+    mcp = create_app(make_settings(enable_personal_read=True, enable_personal_write=True))
+    names = _tool_names(mcp)
+    assert "update_my_preferences" in names
+    assert "mark_notifications_read" in names
+
+
+def test_personal_tools_absent_by_default() -> None:
+    mcp = create_app(make_settings())
+    names = _tool_names(mcp)
+    assert "get_my_preferences" not in names
+    assert "list_notifications" not in names
+    assert "update_my_preferences" not in names
+    assert "mark_notifications_read" not in names
+
+
+def test_personal_read_alone_exposes_only_reads() -> None:
+    mcp = create_app(make_settings(enable_personal_read=True))
+    names = _tool_names(mcp)
+    assert "get_my_preferences" in names
+    assert "list_notifications" in names
+    assert "update_my_preferences" not in names
+    assert "mark_notifications_read" not in names
+
+
+def test_personal_write_alone_exposes_nothing() -> None:
+    mcp = create_app(make_settings(enable_personal_write=True))
+    names = _tool_names(mcp)
+    assert "get_my_preferences" not in names
+    assert "list_notifications" not in names
+    assert "update_my_preferences" not in names
+    assert "mark_notifications_read" not in names
+
+
+def test_enable_project_read_false_removes_project_tools() -> None:
+    # read_projects=("*",) so the "other scopes remain active" assertions
+    # below are actually exercising the project-read flag, not incidentally
+    # passing because of the empty-allowlist gate too.
+    mcp = create_app(make_settings(enable_project_read=False, read_projects=("*",)))
+    names = _tool_names(mcp)
+    assert "list_projects" not in names
+    assert "get_project" not in names
+    assert "list_sprints" not in names
+    assert "get_sprint" not in names
+    # Other scopes remain active
+    assert "list_work_packages" in names
+    assert "list_boards" in names
+
+
+def test_enable_work_package_read_false_removes_wp_tools() -> None:
+    # read_projects=("*",): see test_enable_project_read_false_removes_project_tools.
+    mcp = create_app(make_settings(enable_work_package_read=False, read_projects=("*",)))
+    names = _tool_names(mcp)
+    assert "list_work_packages" not in names
+    assert "get_work_package" not in names
+    assert "search_work_packages" not in names
+    # Other scopes remain active
+    assert "list_projects" in names
+
+
+def test_enable_board_read_false_removes_board_read_tools() -> None:
+    mcp = create_app(make_settings(enable_board_read=False))
+    names = _tool_names(mcp)
+    assert "list_boards" not in names
+    assert "get_board" not in names
+
+
+def test_enable_version_read_false_removes_version_read_tools() -> None:
+    mcp = create_app(make_settings(enable_version_read=False))
+    names = _tool_names(mcp)
+    assert "list_versions" not in names
+    assert "get_version" not in names
+
+
+def test_enable_membership_read_false_removes_membership_tools() -> None:
+    mcp = create_app(make_settings(enable_membership_read=False))
+    names = _tool_names(mcp)
+    assert "list_project_memberships" not in names
+    assert "list_roles" not in names
+    assert "list_users" not in names
+
+
+def test_enable_membership_read_false_removes_previously_ungated_tools() -> None:
+    """get_current_user/list_actions/list_capabilities each enforce
+    _ensure_read_enabled("principal"/"membership") at call time, so they must
+    be gated out of registration together with the rest of the membership
+    group when that flag is disabled -- otherwise the tool would be visible
+    but fail on every call. get_my_project_access (home: project) also
+    disappears, because its client method additionally requires membership
+    read."""
+    # read_projects=("*",) so "list_projects" being present actually verifies
+    # the project-read flag/scope, not the (separately tested) allowlist gate.
+    mcp = create_app(make_settings(enable_membership_read=False, read_projects=("*",)))
+    names = _tool_names(mcp)
+    assert "get_current_user" not in names
+    assert "list_actions" not in names
+    assert "list_capabilities" not in names
+    assert "get_my_project_access" not in names
+    # project itself stays active — only the membership-dependent tool is gone
+    assert "list_projects" in names
+
+
+def test_enable_work_package_read_false_removes_previously_ungated_tools() -> None:
+    """list_notifications' client method enforces
+    _ensure_read_enabled("work_package") at call time, so it must be gated
+    out of registration when that flag is disabled."""
+    mcp = create_app(make_settings(enable_work_package_read=False))
+    names = _tool_names(mcp)
+    assert "list_notifications" not in names
+
+
+def test_enable_project_read_false_removes_previously_ungated_tools() -> None:
+    """get_instance_configuration/get_job_status each enforce
+    _ensure_read_enabled("project") at call time, so they must be gated out
+    of registration when that flag is disabled."""
+    mcp = create_app(make_settings(enable_project_read=False))
+    names = _tool_names(mcp)
+    assert "get_instance_configuration" not in names
+    assert "get_job_status" not in names
+
+
+def test_enable_work_package_write_adds_wp_write_tools() -> None:
+    mcp = create_app(
+        make_settings(
+            **{**ALL_WRITE_OFF, "enable_work_package_write": True},
+            read_projects=("*",),
+            write_projects=("*",),
+        )
+    )
+    names = _tool_names(mcp)
+    assert "create_work_package" in names
+    assert "update_work_package" in names
+    assert "delete_work_package" in names
+    assert "create_time_entry" in names
+    assert "update_relation" in names
+    assert "delete_file_link" in names
+    # work_package write alone is no longer sufficient for attachment uploads
+    assert "create_work_package_attachment" not in names
+    # Other write scopes remain locked
+    assert "create_project" not in names
+    assert "create_board" not in names
+    assert "create_news" not in names
+
+
+def test_attachment_root_plus_work_package_write_adds_upload_tool() -> None:
+    mcp = create_app(
+        make_settings(
+            enable_work_package_write=True,
+            attachment_root="/tmp/uploads",
+            read_projects=("*",),
+            write_projects=("*",),
+        )
+    )
+    names = _tool_names(mcp)
+    assert "create_work_package_attachment" in names
+
+
+def test_enable_board_write_adds_board_write_tools() -> None:
+    mcp = create_app(
+        make_settings(**{**ALL_WRITE_OFF, "enable_board_write": True}, read_projects=("*",), write_projects=("*",))
+    )
+    names = _tool_names(mcp)
+    assert "create_board" in names
+    assert "update_board" in names
+    assert "delete_board" in names
+    assert "create_work_package" not in names
+
+
+def test_enable_project_write_adds_project_write_tools() -> None:
+    mcp = create_app(
+        make_settings(**{**ALL_WRITE_OFF, "enable_project_write": True}, read_projects=("*",), write_projects=("*",))
+    )
+    names = _tool_names(mcp)
+    assert "create_project" in names
+    assert "create_news" in names
+    assert "update_document" in names
+    assert "create_grid" in names
+    assert "create_time_entry" not in names
+    assert "create_user" not in names
+
+
+def test_work_package_write_without_work_package_read_hides_compound_scope_tools() -> None:
+    """Asymmetric case: delete_file_link additionally requires work_package READ
+    (not just its home WRITE scope) — it must disappear when read is off, even
+    though other work_package writes (which have no such extra dependency) stay.
+
+    This is a low-level registration test of enabled_tool_names()'s additional-
+    scope dependency tracking, deliberately using direct Settings(...)
+    construction to reach a read=False/write=True combo that Settings.from_env
+    would reject at startup (see test_config.py's tool_exposure_violations
+    coverage) — enabled_tool_names() itself must still behave predictably for
+    that input, since nothing else re-validates it downstream."""
+    mcp = create_app(
+        make_settings(
+            enable_work_package_read=False,
+            enable_work_package_write=True,
+            read_projects=("*",),
+            write_projects=("*",),
+        )
+    )
+    names = _tool_names(mcp)
+    assert "create_work_package" in names
+    assert "delete_file_link" not in names
+    assert "list_notifications" not in names
+
+
+def test_membership_write_without_membership_read_hides_compound_scope_tools() -> None:
+    """Asymmetric case: create_membership/update_membership additionally require
+    membership READ (role lookup) and must disappear when read is off, while
+    delete_membership (no additional scope) stays visible.
+
+    Same deliberate-direct-Settings-construction rationale as
+    test_work_package_write_without_work_package_read_hides_compound_scope_tools
+    above — this is a registration-logic test, not a config-validation test."""
+    mcp = create_app(
+        make_settings(
+            enable_membership_read=False, enable_membership_write=True, read_projects=("*",), write_projects=("*",)
+        )
+    )
+    names = _tool_names(mcp)
+    assert "create_membership" not in names
+    assert "update_membership" not in names
+    assert "delete_membership" in names
+
+
+def test_metadata_tools_partially_hidden_without_additional_read_scopes() -> None:
+    """7 of the 12 metadata tools additionally require board or work_package read;
+    the other 5 have no such dependency and appear regardless."""
+    mcp = create_app(make_settings(enable_metadata_tools=True, enable_board_read=False, enable_work_package_read=False))
+    names = _tool_names(mcp)
+    assert "get_query_filter" not in names  # needs board
+    assert "render_text" not in names  # needs work_package
+    assert "list_help_texts" in names  # no additional scope
+    assert "list_working_days" in names
+    assert "get_custom_option" in names
+
+
+def test_enable_admin_write_adds_user_group_tools() -> None:
+    mcp = create_app(make_settings(enable_admin_write=True, enable_admin_read=True))
+    names = _tool_names(mcp)
+    assert "create_user" in names
+    assert "update_user" in names
+    assert "delete_user" in names
+    assert "set_user_locked" in names
+    assert "create_group" in names
+    assert "update_group" in names
+    assert "delete_group" in names
+
+
+def test_admin_tools_absent_without_enable_admin_write() -> None:
+    """All project-scoped write flags enabled — admin tools must still be absent."""
+    mcp = create_app(
+        make_settings(
+            enable_project_write=True,
+            enable_work_package_write=True,
+            enable_membership_write=True,
+            enable_version_write=True,
+            enable_board_write=True,
+        )
+    )
+    names = _tool_names(mcp)
+    assert "create_user" not in names
+    assert "delete_user" not in names
+    assert "create_group" not in names
+    assert "delete_group" not in names
+
+
+_METADATA_TOOLS = {
+    "get_query_filter",
+    "get_query_column",
+    "get_query_operator",
+    "get_query_sort_by",
+    "list_query_filter_instance_schemas",
+    "get_query_filter_instance_schema",
+    "render_text",
+    "list_help_texts",
+    "get_help_text",
+    "list_working_days",
+    "list_non_working_days",
+    "get_custom_option",
+}
+
+
+def test_metadata_tools_absent_by_default() -> None:
+    """Rarely-used metadata tools stay out of the default set to save context."""
+    mcp = create_app(make_settings())
+    names = _tool_names(mcp)
+    assert _METADATA_TOOLS.isdisjoint(names), _METADATA_TOOLS & names
+
+
+def test_enable_metadata_tools_adds_them() -> None:
+    mcp = create_app(make_settings(enable_metadata_tools=True))
+    names = _tool_names(mcp)
+    assert _METADATA_TOOLS <= names, _METADATA_TOOLS - names
+
+
+def test_all_scoped_writes_independent() -> None:
+    """Each scoped write flag activates exactly its own tools."""
+    for flag, expected_tool, extra in [
+        ("enable_project_write", "create_project", {}),
+        ("enable_work_package_write", "create_work_package", {}),
+        ("enable_membership_write", "create_membership", {}),
+        ("enable_version_write", "create_version", {}),
+        ("enable_board_write", "create_board", {}),
+        # admin_write requires its own admin_read (like every other write flag
+        # requires its matching read) — pass it explicitly so this doesn't
+        # codify a combination Settings.from_env would reject at startup.
+        ("enable_admin_write", "create_user", {"enable_admin_read": True}),
+    ]:
+        mcp = create_app(make_settings(**{flag: True}, **extra, read_projects=("*",), write_projects=("*",)))
+        names = _tool_names(mcp)
+        assert expected_tool in names, f"{expected_tool} missing when {flag}=True"
+
+
+# ── server instructions & handshake metadata ──────────────────────────────────
+
+
+def test_instructions_state_ce_reality() -> None:
+    """The initialize handshake carries the CE guidance the agent needs up front."""
+    mcp = create_app(make_settings())
+    instructions = mcp.instructions or ""
+    assert "Community Edition" in instructions
+    # The two hard limits we most want the agent to know:
+    assert "do not attempt" in instructions.lower() or "not creatable" in instructions.lower()
+    assert "list_capabilities" in instructions
+
+
+def test_serverinfo_version_is_our_version() -> None:
+    """serverInfo.version (MCP MUST) reports our package version, not the SDK default."""
+    mcp = create_app(make_settings())
+    assert mcp.version == __version__
+
+
+def test_create_app_applies_log_level(monkeypatch) -> None:
+    """OPENPROJECT_LOG_LEVEL takes effect: create_app forces the root level so
+    MCPServer's default INFO does not leak SDK request logs."""
+    import logging
+
+    root = logging.getLogger()
+    original_level = root.level
+    # Simulate a handler already installed at INFO (as MCPServer does on construction),
+    # which makes basicConfig a no-op — the exact condition of the bug.
+    root.setLevel(logging.INFO)
+    try:
+        create_app(make_settings(log_level="WARNING"))
+        assert root.getEffectiveLevel() == logging.WARNING
+        assert not logging.getLogger("mcp.server.lowlevel.server").isEnabledFor(logging.INFO)
+    finally:
+        root.setLevel(original_level)
+
+
+def test_instructions_are_static() -> None:
+    """create_app() builds instructions from the static text only, unconditionally."""
+    mcp = create_app(make_settings())
+    assert mcp.instructions == server.CE_INSTRUCTIONS
+
+
+def test_create_app_makes_no_network_call(monkeypatch) -> None:
+    """create_app() must never touch the network. Patch the transport to raise on
+    any call, so a reintroduced fetch would fail this test loudly instead of
+    passing by accident."""
+    import httpx
+
+    async def _boom(self, *args, **kwargs):
+        raise AssertionError("unexpected network call from create_app()")
+
+    monkeypatch.setattr(httpx.AsyncClient, "request", _boom)
+    mcp = create_app(make_settings())
+    assert mcp.instructions == server.CE_INSTRUCTIONS
+
+
+# ── console entry-point dispatch ───────────────────────────────────────────────
+
+
+def test_main_no_args_runs_server(monkeypatch) -> None:
+    import openproject_ce_mcp_server.server as srv
+
+    ran = []
+    monkeypatch.setattr(srv, "_run_server", lambda: ran.append(True))
+    monkeypatch.setattr(srv.sys, "argv", ["openproject-ce-mcp-server"])
+    srv.main()
+    assert ran == [True]
+
+
+def test_main_configure_dispatches_to_setup(monkeypatch) -> None:
+    import openproject_ce_mcp_server.server as srv
+    import openproject_ce_mcp_server.setup_cli as setup_cli
+
+    forwarded = []
+    monkeypatch.setattr(setup_cli, "main", lambda argv: forwarded.append(argv))
+    monkeypatch.setattr(srv, "_run_server", lambda: forwarded.append("SERVER"))
+    monkeypatch.setattr(srv.sys, "argv", ["openproject-ce-mcp-server", "configure", "--uninstall"])
+    srv.main()
+    assert forwarded == [["--uninstall"]]
+
+
+def test_main_unexpected_flag_still_runs_server(monkeypatch) -> None:
+    # A client passing an unknown flag must start the server, not error out.
+    import openproject_ce_mcp_server.server as srv
+
+    ran = []
+    monkeypatch.setattr(srv, "_run_server", lambda: ran.append(True))
+    monkeypatch.setattr(srv.sys, "argv", ["openproject-ce-mcp-server", "--some-client-flag"])
+    srv.main()
+    assert ran == [True]
+
+
+def test_main_unrecognized_flag_hints_at_help_when_config_is_missing(monkeypatch, capsys) -> None:
+    # "--configure" is a common typo for the "configure" subcommand (no
+    # leading "--"). It isn't a recognized token, so by design it falls
+    # through to a normal server launch -- which then fails on missing
+    # OPENPROJECT_BASE_URL. That failure should point at --help/configure,
+    # not raise a bare ConfigError traceback, since the presence of an
+    # unrecognized flag is itself evidence of a likely CLI typo.
+    import os
+
+    import openproject_ce_mcp_server.server as srv
+
+    for name in list(os.environ):
+        if name.startswith("OPENPROJECT_"):
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(srv.sys, "argv", ["openproject-ce-mcp-server", "--configure"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        srv.main()
+
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "OPENPROJECT_BASE_URL is required" in err
+    assert "--configure" in err
+    assert "--help" in err
+    assert "configure" in err
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        ({}, "OPENPROJECT_BASE_URL is required"),
+        ({"OPENPROJECT_BASE_URL": "ftp://op.example.com", "OPENPROJECT_API_TOKEN": "token"}, "http or https"),
+    ],
+)
+def test_main_no_args_reports_a_config_error_without_a_traceback(monkeypatch, capsys, env, message) -> None:
+    # How every MCP client launches the server: no argv. The person reading
+    # stderr is setting up a client, so a configuration error must be a short,
+    # actionable message and a non-zero exit, not a traceback.
+    import os
+
+    import openproject_ce_mcp_server.server as srv
+
+    for name in list(os.environ):
+        if name.startswith("OPENPROJECT_"):
+            monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(srv.sys, "argv", ["openproject-ce-mcp-server"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        srv.main()
+
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ")
+    assert message in err
+    assert "openproject-ce-mcp-server configure" in err
+
+
+def test_main_no_args_config_error_through_the_installed_console_script() -> None:
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = Path(sys.executable).with_name("openproject-ce-mcp-server")
+    assert script.exists(), f"console script not installed next to {sys.executable}"
+    env = {name: value for name, value in os.environ.items() if not name.startswith("OPENPROJECT_")}
+    result = subprocess.run(
+        [str(script)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+    assert "error: OPENPROJECT_BASE_URL is required." in result.stderr
+
+
+def test_main_unrecognized_subcommand_errors_instead_of_running_server(monkeypatch, capsys) -> None:
+    # A typo'd subcommand (e.g. "confiugure") is not something any MCP client
+    # would ever pass -- it must fail with a clear "invalid choice" usage
+    # error instead of silently starting the server and failing confusingly
+    # later with an unrelated missing-configuration error.
+    import openproject_ce_mcp_server.server as srv
+
+    monkeypatch.setattr(srv, "_run_server", lambda: (_ for _ in ()).throw(AssertionError("server ran")))
+    monkeypatch.setattr(srv.sys, "argv", ["openproject-ce-mcp-server", "confiugure"])
+    try:
+        srv.main()
+    except SystemExit as exc:
+        assert exc.code == 2
+    err = capsys.readouterr().err
+    assert "invalid choice" in err
+    assert "confiugure" in err
+
+
+def test_main_help_exits_without_server(monkeypatch, capsys) -> None:
+    import openproject_ce_mcp_server.server as srv
+
+    monkeypatch.setattr(srv, "_run_server", lambda: (_ for _ in ()).throw(AssertionError("server ran")))
+    monkeypatch.setattr(srv.sys, "argv", ["openproject-ce-mcp-server", "--help"])
+    try:
+        srv.main()
+    except SystemExit as exc:
+        assert exc.code == 0
+    out = capsys.readouterr().out
+    assert "configure" in out and "usage:" in out
+
+
+def test_main_version_prints_version(monkeypatch, capsys) -> None:
+    import openproject_ce_mcp_server.server as srv
+    from openproject_ce_mcp_server import __version__
+
+    monkeypatch.setattr(srv.sys, "argv", ["openproject-ce-mcp-server", "--version"])
+    try:
+        srv.main()
+    except SystemExit as exc:
+        assert exc.code == 0
+    assert __version__ in capsys.readouterr().out
+
+
+def test_main_doctor_help_prints_help_not_runs_checks(monkeypatch, capsys) -> None:
+    """Regression test: doctor --help should show help, not run diagnostics."""
+    import openproject_ce_mcp_server.server as srv
+
+    monkeypatch.setattr(srv.sys, "argv", ["openproject-ce-mcp-server", "doctor", "--help"])
+    try:
+        srv.main()
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    out = capsys.readouterr().out
+    # Should show argparse help for doctor subcommand
+    assert "usage:" in out
+    assert "doctor" in out
+    # Should NOT run actual diagnostics
+    assert "Running OpenProject MCP diagnostics" not in out
+    assert "[OK]" not in out
+    assert "[FAIL]" not in out
+
+
+# ── legacy env-var warnings at real server startup ───────────────────────────────
+
+
+class _StubApp:
+    def run(self, *, transport: str) -> None:  # pragma: no cover - never actually invoked
+        pass
+
+
+async def _noop_verify_strict_dispatch(mcp) -> None:
+    pass
+
+
+def test_run_server_ignores_legacy_env_var_with_no_warning(monkeypatch, capsys) -> None:
+    # Removed names are unrecognized env vars like any other, so no diagnostic
+    # is emitted.
+    monkeypatch.setenv("OPENPROJECT_BASE_URL", "https://op.example.com")
+    monkeypatch.setenv("OPENPROJECT_API_TOKEN", "tok")
+    monkeypatch.setenv("OPENPROJECT_ALLOWED_PROJECTS_READ", "DEMO")
+    monkeypatch.setattr(server, "create_app", lambda settings: _StubApp())
+    monkeypatch.setattr(server, "verify_strict_dispatch", _noop_verify_strict_dispatch)
+
+    server._run_server()
+
+    err = capsys.readouterr().err
+    assert "[WARN]" not in err
+
+
+def test_run_server_silent_when_no_legacy_env_vars(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("OPENPROJECT_BASE_URL", "https://op.example.com")
+    monkeypatch.setenv("OPENPROJECT_API_TOKEN", "tok")
+    monkeypatch.delenv("OPENPROJECT_ALLOWED_PROJECTS_READ", raising=False)
+    monkeypatch.setattr(server, "create_app", lambda settings: _StubApp())
+    monkeypatch.setattr(server, "verify_strict_dispatch", _noop_verify_strict_dispatch)
+
+    server._run_server()
+
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    ("example", "row_type", "wrapper_fields", "nested"),
+    [
+        (
+            '["work_package_id", "result.status"]',
+            models.WorkPackageWriteResult,
+            BULK_ITEM_WRAPPER_FIELDS,
+            {"result": models.WorkPackageDetail},
+        ),
+        ('["id", "status"]', models.WorkPackageDetail, BATCH_READ_ITEM_WRAPPER_FIELDS, None),
+    ],
+)
+def test_select_examples_in_the_instructions_are_accepted_by_their_tools(
+    example, row_type, wrapper_fields, nested
+) -> None:
+    assert f"`{example}`" in server.CE_INSTRUCTIONS
+    select = json.loads(example)
+
+    assert _validate_select(select, row_type=row_type, wrapper_fields=wrapper_fields, nested=nested) == select
+
+
+def test_a_config_error_from_a_defect_after_settings_loaded_keeps_its_traceback(monkeypatch) -> None:
+    import openproject_ce_mcp_server.server as srv
+    from openproject_ce_mcp_server.config import ConfigError
+
+    monkeypatch.setenv("OPENPROJECT_BASE_URL", "https://op.example.com")
+    monkeypatch.setenv("OPENPROJECT_API_TOKEN", "token")
+
+    def defect(settings):
+        raise ConfigError("Unknown read scope: nonsense")
+
+    monkeypatch.setattr(srv, "create_app", defect)
+    monkeypatch.setattr(srv.sys, "argv", ["openproject-ce-mcp-server"])
+
+    with pytest.raises(ConfigError, match="Unknown read scope"):
+        srv.main()

@@ -1,0 +1,357 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, release/0.4.3, release/0.5.0]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+  # GitHub only fires `schedule` from a workflow file that exists on the
+  # repo's default branch (main) — this file is on main, so this trigger
+  # is live. A manual `workflow_dispatch` run against any branch also
+  # works, since that lets you pick the ref to run against.
+  schedule:
+    - cron: "17 5 * * 1" # weekly, Monday ~05:17 UTC (off the hour, less likely to be delayed/dropped)
+
+permissions:
+  contents: read
+
+concurrency:
+  # Prefixed, not the `${{ github.workflow }}-${{ github.ref }}` default --
+  # inside a reusable-workflow call, `github.workflow` resolves to the
+  # *caller's* name, so the default group would collide with a caller like
+  # publish.yml's own group and self-cancel this run before any job starts.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run Ruff
+        run: uv run ruff check .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Run mypy
+        run: uv run mypy
+
+      - name: Run bandit (SAST)
+        run: uvx bandit -r src/openproject_ce_mcp_server -ll
+
+      - name: Run semgrep (SAST)
+        run: uvx semgrep --config auto --error src/openproject_ce_mcp_server
+
+      - name: Check dependency licenses
+        run: uvx pip-licenses --python .venv/bin/python3 --fail-on="GPL;LGPL;AGPL"
+
+  # macos-latest/windows-latest cost roughly 10x/2x a Linux runner-minute — scoped to
+  # release-time confirmation only (the workflow_call from publish.yml's tag push, or a
+  # manual workflow_dispatch), never the per-push/per-PR gate. Split into two jobs rather
+  # than one matrix job with a job-level `if`, because GitHub Actions job-level `if` can't
+  # reference `matrix` at all, and a step-level `if` still provisions (and bills) the
+  # runner before skipping — so test-macos-windows below uses a job-level `if` on
+  # a job with a fixed (non-matrix) runs-on per OS instead.
+  test-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run tests
+        if: matrix.python-version != '3.12'
+        run: uv run pytest
+
+      - name: Run tests with coverage gate
+        if: matrix.python-version == '3.12'
+        run: ./dev test
+
+  test-macos-windows:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run tests
+        run: uv run pytest
+
+  # A real end-user install (pipx/uv tool install/pip/uvx) resolves the
+  # newest version satisfying pyproject.toml's declared ranges at install
+  # time -- uv.lock only pins one specific version, so the normal test-linux
+  # job above never exercises anything newer than that pin. This job runs
+  # `uv sync --upgrade`, which re-resolves every dependency to its newest
+  # allowed version and updates the lockfile's pins accordingly (in-memory
+  # for this job only, not committed back to the repo), so drift inside the
+  # declared ranges (mcp>=2,<3 above all) gets caught here instead of by a
+  # real user.
+  test-newest-deps:
+    # Also on push: a new SDK release can change behaviour between the weekly
+    # runs, and only release-branch pushes exercise the code about to ship.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies at their newest allowed versions
+        run: uv sync --dev --upgrade
+
+      - name: Run tests
+        run: uv run pytest
+
+  # The other end of the declared ranges: uv.lock follows the newest releases,
+  # so without this job nothing would show that a range's lower bound
+  # (mcp>=2 above all) still works.
+  test-lowest-deps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Job-wide, not a sync flag: a plain `uv run` would otherwise re-lock at
+    # the newest versions and test those instead.
+    env:
+      UV_RESOLUTION: lowest-direct
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Install direct dependencies at their lowest allowed versions
+        run: uv sync --dev
+
+      - name: Check every direct dependency sits on its declared lower bound
+        run: |
+          uv run python - <<'EOF'
+          import importlib.metadata as metadata
+
+          from packaging.requirements import Requirement
+          from packaging.version import Version
+
+          off_floor = []
+          for raw in metadata.requires("openproject-ce-mcp-server") or []:
+              requirement = Requirement(raw)
+              if requirement.marker and not requirement.marker.evaluate({"extra": "dev"}):
+                  continue
+              floor = next((spec.version for spec in requirement.specifier if spec.operator == ">="), None)
+              installed = metadata.version(requirement.name)
+              print(f"{requirement.name} {installed} (floor {floor})")
+              if floor is not None and Version(installed) != Version(floor):
+                  off_floor.append(f"{requirement.name} {installed} (floor {floor})")
+          assert not off_floor, f"not at the declared lower bound: {off_floor}"
+          EOF
+
+      - name: Run tests
+        run: uv run pytest
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Build again into a separate directory for reproducibility comparison
+        run: uv build --out-dir dist2
+
+      - name: Verify the two builds are byte-identical
+        run: |
+          for f in dist/*; do
+            name="$(basename "$f")"
+            cmp "$f" "dist2/$name"
+          done
+
+      - name: Check package metadata
+        run: uvx twine check dist/*
+
+      - name: Generate SBOM
+        run: |
+          uv export --no-dev --format requirements-txt --no-hashes -o requirements.txt
+          uvx --from cyclonedx-bom cyclonedx-py requirements requirements.txt --of JSON -o sbom.json
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: sbom.json
+          # An artifact name is immutable within one workflow run -- a
+          # re-run of this job (e.g. "Re-run failed jobs" after the LATER
+          # dist upload below failed transiently) would otherwise fail this
+          # already-succeeded upload outright with "already exists",
+          # permanently stranding the job before it ever reaches the step
+          # that actually needs retrying.
+          overwrite: true
+
+      - name: Upload built dist for install-smoke/upgrade jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/*
+          retention-days: 1
+          overwrite: true # see the sbom upload's own comment above
+
+  install-smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: /tmp/dist
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Create scratch working directory
+        run: |
+          scratch="$(mktemp -d)"
+          echo "SCRATCH=$scratch" >> "$GITHUB_ENV"
+
+      - name: Install via pipx
+        working-directory: ${{ env.SCRATCH }}
+        run: |
+          python3 -m pip install --user pipx
+          python3 -m pipx ensurepath
+          pipx install /tmp/dist/openproject_ce_mcp_server-*.whl
+
+      - name: "pipx: --version"
+        run: openproject-ce-mcp-server --version
+
+      - name: "pipx: configure --help"
+        run: openproject-ce-mcp-server configure --help
+
+      - name: "pipx: doctor --help"
+        run: openproject-ce-mcp-server doctor --help
+
+      - name: "pipx: bounded MCP STDIO startup"
+        run: |
+          set +e
+          OPENPROJECT_BASE_URL="https://op.invalid.example" \
+          OPENPROJECT_API_TOKEN="synthetic-ci-token" \
+            timeout --signal=TERM 20 openproject-ce-mcp-server </dev/null >stdout.log 2>stderr.log
+          exit_code=$?
+          set -e
+          cat stdout.log
+          cat stderr.log >&2
+          # Closed stdin reaches EOF immediately, so the stdio transport exits
+          # cleanly on its own (exit 0) well inside the timeout; the wrapper
+          # only guards against a future hang. A real startup failure
+          # (Settings/ConfigError, an uncaught exception) exits non-zero.
+          [ "$exit_code" -eq 0 ] || { echo "::error::server did not exit cleanly (exit $exit_code)" >&2; exit 1; }
+
+      - name: uv tool install
+        # uv's default tool bin dir (~/.local/bin) is the SAME directory pipx
+        # just installed into above -- `uv tool install` would otherwise fail
+        # with "Executable already exists ... (use --force to overwrite)"
+        # before ever exercising the uv-installed binary. A separate
+        # UV_TOOL_BIN_DIR keeps both installs intact and independently
+        # testable, matching this job's actual intent (verify BOTH install
+        # paths work, not one overwriting the other).
+        working-directory: ${{ env.SCRATCH }}
+        run: |
+          mkdir -p "${{ env.SCRATCH }}/uv-tool-bin"
+          echo "UV_TOOL_BIN_DIR=${{ env.SCRATCH }}/uv-tool-bin" >> "$GITHUB_ENV"
+          echo "${{ env.SCRATCH }}/uv-tool-bin" >> "$GITHUB_PATH"
+          UV_TOOL_BIN_DIR="${{ env.SCRATCH }}/uv-tool-bin" uv tool install /tmp/dist/openproject_ce_mcp_server-*.whl
+
+      - name: "uv-tool: --version"
+        run: "${{ env.SCRATCH }}/uv-tool-bin/openproject-ce-mcp-server --version"
+
+      - name: "uv-tool: configure --help"
+        run: "${{ env.SCRATCH }}/uv-tool-bin/openproject-ce-mcp-server configure --help"
+
+      - name: "uv-tool: doctor --help"
+        run: "${{ env.SCRATCH }}/uv-tool-bin/openproject-ce-mcp-server doctor --help"
+
+      - name: "uv-tool: bounded MCP STDIO startup"
+        run: |
+          set +e
+          OPENPROJECT_BASE_URL="https://op.invalid.example" \
+          OPENPROJECT_API_TOKEN="synthetic-ci-token" \
+            timeout --signal=TERM 20 "${{ env.SCRATCH }}/uv-tool-bin/openproject-ce-mcp-server" </dev/null >stdout.log 2>stderr.log
+          exit_code=$?
+          set -e
+          cat stdout.log
+          cat stderr.log >&2
+          # Closed stdin reaches EOF immediately, so the stdio transport exits
+          # cleanly on its own (exit 0) well inside the timeout; the wrapper
+          # only guards against a future hang. A real startup failure
+          # (Settings/ConfigError, an uncaught exception) exits non-zero.
+          [ "$exit_code" -eq 0 ] || { echo "::error::server did not exit cleanly (exit $exit_code)" >&2; exit 1; }
+
+  shell-scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Check shell scripts syntax (bash -n)
+        run: |
+          for f in dev docker/test/up.sh docker/test/down.sh tools/api-check/fetch-sources.sh; do
+            bash -n "$f"
+          done
+
+      - name: shellcheck
+        run: shellcheck dev docker/test/up.sh docker/test/down.sh tools/api-check/fetch-sources.sh
+
+      - name: Install shfmt
+        run: |
+          go install mvdan.cc/sh/v3/cmd/shfmt@v3.14.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: shfmt
+        run: shfmt -l dev docker/test/up.sh docker/test/down.sh tools/api-check/fetch-sources.sh

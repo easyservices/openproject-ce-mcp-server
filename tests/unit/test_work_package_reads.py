@@ -1,0 +1,1448 @@
+from __future__ import annotations
+
+import json
+
+import httpx
+import pytest
+from _client_test_helpers import (
+    _base_settings,
+    _empty_scope_settings,
+    _no_request_handler,
+    _wp_detail_payload,
+    _wp_detail_payload_with_description,
+    make_settings,
+    serving_projects,
+    started_client,
+)
+
+from openproject_ce_mcp_server.client import (
+    InvalidInputError,
+    NotFoundError,
+    OpenProjectClient,
+    PermissionDeniedError,
+)
+from openproject_ce_mcp_server.config import Settings
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_uses_supported_subject_or_id_operator() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages/Feature":
+            return httpx.Response(404, json={"message": "not found"}, request=request)
+        assert request.url.path == "/api/v3/work_packages"
+        assert json.loads(request.url.params["filters"]) == [
+            {"subject_or_id": {"operator": "**", "values": ["Feature"]}}
+        ]
+        return httpx.Response(200, json={"total": 0, "_embedded": {"elements": []}}, request=request)
+
+    transport = httpx.MockTransport(handler)
+    client = OpenProjectClient(make_settings(), transport=transport)
+
+    result = await client.work_package.search(search="Feature")
+
+    assert result.count == 0
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_resolves_exact_match_by_display_id() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages/DEMO-394":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 394,
+                    "subject": "Some ticket",
+                    "_links": {"project": {"href": "/api/v3/projects/1", "title": "Demo"}},
+                },
+                request=request,
+            )
+        if request.url.path == "/api/v3/work_packages":
+            filters = json.loads(request.url.params["filters"])
+            if any("id" in f for f in filters):
+                return httpx.Response(
+                    200,
+                    json={
+                        "total": 1,
+                        "_embedded": {
+                            "elements": [
+                                {
+                                    "id": 394,
+                                    "subject": "Some ticket",
+                                    "_links": {"project": {"href": "/api/v3/projects/1", "title": "Demo"}},
+                                }
+                            ]
+                        },
+                    },
+                    request=request,
+                )
+            return httpx.Response(200, json={"total": 0, "_embedded": {"elements": []}}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    result = await client.work_package.search(search="DEMO-394")
+
+    assert result.count == 0
+    assert result.exact_match is not None
+    assert result.exact_match.id == 394
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_exact_match_respects_other_filters() -> None:
+    # The resolved work package belongs to a different project than the
+    # caller scoped the search to -- must not surface as an exact match.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages/DEMO-394":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 394,
+                    "subject": "Some ticket",
+                    "_links": {"project": {"href": "/api/v3/projects/2", "title": "Other"}},
+                },
+                request=request,
+            )
+        if request.url.path == "/api/v3/projects/demo":
+            return httpx.Response(
+                200,
+                json={"_type": "Project", "id": 1, "identifier": "demo", "name": "Demo"},
+                request=request,
+            )
+        if request.url.path == "/api/v3/work_packages":
+            return httpx.Response(200, json={"total": 0, "_embedded": {"elements": []}}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    result = await client.work_package.search(search="DEMO-394", project="demo")
+
+    assert result.exact_match is None
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_exact_match_deduplicated_against_results() -> None:
+    # The text search already found the same work package by subject match --
+    # exact_match must not duplicate it.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages/DEMO-394":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 394,
+                    "subject": "DEMO-394 fix the thing",
+                    "_links": {"project": {"href": "/api/v3/projects/1", "title": "Demo"}},
+                },
+                request=request,
+            )
+        if request.url.path == "/api/v3/work_packages":
+            return httpx.Response(
+                200,
+                json={
+                    "total": 1,
+                    "_embedded": {
+                        "elements": [
+                            {
+                                "id": 394,
+                                "subject": "DEMO-394 fix the thing",
+                                "_links": {"project": {"href": "/api/v3/projects/1", "title": "Demo"}},
+                            }
+                        ]
+                    },
+                },
+                request=request,
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    result = await client.work_package.search(search="DEMO-394")
+
+    assert result.count == 1
+    assert result.results[0].id == 394
+    assert result.exact_match is None
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_exact_match_none_for_unresolvable_query() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages":
+            return httpx.Response(200, json={"total": 0, "_embedded": {"elements": []}}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    result = await client.work_package.search(search="garbage text")
+
+    assert result.exact_match is None
+
+    await client.aclose()
+
+
+@pytest.mark.parametrize("search", ["context token catalog", "a/b?c#d", "100%"])
+@pytest.mark.asyncio
+async def test_search_work_packages_looks_up_only_identifier_shaped_terms(search: str) -> None:
+    requested: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        if request.url.path == "/api/v3/work_packages":
+            return httpx.Response(200, json={"total": 0, "_embedded": {"elements": []}}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    result = await client.work_package.search(search=search)
+
+    assert result.exact_match is None
+    assert requested == ["/api/v3/work_packages"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_does_not_look_up_a_date_shaped_term() -> None:
+    # 2026-10-15 is a valid display id of a project whose classic identifier is
+    # "2026-10", so only search's own date rule keeps it from being looked up.
+    requested: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        if request.url.path == "/api/v3/work_packages":
+            return httpx.Response(200, json={"total": 0, "_embedded": {"elements": []}}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    result = await client.work_package.search(search="2026-10-15")
+
+    assert result.exact_match is None
+    assert requested == ["/api/v3/work_packages"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_exact_match_none_under_restricted_read_scope() -> None:
+    # The resolved work package belongs to a project outside the configured
+    # OPENPROJECT_READ_PROJECTS allowlist -- exact_match must not leak its
+    # existence via PermissionDeniedError, nor via the id/subject either.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages/394":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 394,
+                    "subject": "Some ticket",
+                    "_links": {"project": {"href": "/api/v3/projects/2", "title": "other-project"}},
+                },
+                request=request,
+            )
+        if request.url.path == "/api/v3/work_packages":
+            # Main text search: no server-side project filter is sent for an
+            # unscoped search under a restricted allowlist, so this returns
+            # empty rather than leaking anything from outside the scope.
+            return httpx.Response(200, json={"total": 0, "_embedded": {"elements": []}}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = await started_client(
+        _base_settings(read_projects=("demo",)), handler, [(1, "demo", "Demo"), (2, "other-project", "other-project")]
+    )
+
+    result = await client.work_package.search(search="394")
+
+    assert result.exact_match is None
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_accepts_status_filter() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v3/statuses"
+        if "filters" in request.url.params:
+            raise AssertionError("Did not expect filters on statuses lookup")
+        if request.method != "GET":
+            raise AssertionError(f"Unexpected request method for statuses: {request.method}")
+        return httpx.Response(
+            200,
+            json={
+                "_embedded": {
+                    "elements": [
+                        {"id": 1, "name": "New"},
+                        {"id": 7, "name": "In progress"},
+                    ]
+                }
+            },
+            request=request,
+        )
+
+    status_calls = {"count": 0}
+
+    async def routed_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/statuses":
+            status_calls["count"] += 1
+            return await handler(request)
+        if request.url.path == "/api/v3/work_packages/Feature":
+            return httpx.Response(404, json={"message": "not found"}, request=request)
+        if request.url.path == "/api/v3/work_packages":
+            assert json.loads(request.url.params["filters"]) == [
+                {"subject_or_id": {"operator": "**", "values": ["Feature"]}},
+                {"status_id": {"operator": "=", "values": ["7"]}},
+            ]
+            return httpx.Response(200, json={"total": 0, "_embedded": {"elements": []}}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(routed_handler))
+
+    result = await client.work_package.search(search="Feature", status="In progress")
+
+    assert result.count == 0
+    assert status_calls["count"] == 1
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_resolves_type_and_version_filters() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/projects/demo":
+            return httpx.Response(
+                200,
+                json={
+                    "_type": "Project",
+                    "id": 1,
+                    "name": "Demo",
+                    "identifier": "demo",
+                    "_links": {"versions": {"href": "/api/v3/projects/demo/versions"}},
+                },
+                request=request,
+            )
+        if request.url.path == "/api/v3/projects/1/types":
+            return httpx.Response(
+                200,
+                json={
+                    "_embedded": {
+                        "elements": [
+                            {"id": 7, "name": "Feature"},
+                            {"id": 8, "name": "Task"},
+                        ]
+                    }
+                },
+                request=request,
+            )
+        if request.url.path == "/api/v3/projects/1/versions":
+            return httpx.Response(
+                200,
+                json={
+                    "total": 1,
+                    "_embedded": {"elements": [{"id": 11, "name": "v1", "_links": {}}]},
+                },
+                request=request,
+            )
+        if request.url.path == "/api/v3/work_packages":
+            filters = json.loads(request.url.params.get("filters", "[]"))
+            filter_keys = [list(f.keys())[0] for f in filters]
+            assert "project_id" in filter_keys
+            # Filter keys use type_id/version_id per OpenProject's source-defined filter keys
+            assert "type_id" in filter_keys
+            assert "version_id" in filter_keys
+            return httpx.Response(
+                200,
+                json={
+                    "total": 1,
+                    "_embedded": {
+                        "elements": [
+                            {
+                                "id": 42,
+                                "subject": "Apple HealthKit Anbindung",
+                                "description": {"raw": "Sync steps and calories"},
+                                "_links": {
+                                    "type": {"title": "Feature"},
+                                    "status": {"title": "New"},
+                                    "project": {"href": "/api/v3/projects/1", "title": "Demo"},
+                                    "version": {"title": "v1"},
+                                },
+                            }
+                        ]
+                    },
+                },
+                request=request,
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    client = OpenProjectClient(make_settings(), transport=transport)
+
+    result = await client.work_package.list(
+        project="demo",
+        type="Feature",
+        version="v1",
+    )
+
+    assert result.count == 1
+    assert result.results[0].type == "Feature"
+    assert result.results[0].version == "v1"
+    assert result.results[0].description == "<user-content>Sync steps and calories</user-content>"
+    assert result.results[0].has_description is True
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_returns_parent_display_id_when_present() -> None:
+    # parent_display_id mirrors parent_id: both are derived from the same
+    # _links.parent object already present in the list/search payload, not an
+    # extra lookup. displayId is only present in semantic mode (17.5+, 17.4 behind its feature flag).
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages":
+            return httpx.Response(
+                200,
+                json={
+                    "total": 2,
+                    "_embedded": {
+                        "elements": [
+                            {
+                                "id": 42,
+                                "subject": "Child with semantic parent",
+                                "_links": {
+                                    "parent": {
+                                        "href": "/api/v3/work_packages/7",
+                                        "title": "Parent",
+                                        "displayId": "EMTB-7",
+                                    },
+                                    "project": {"href": "/api/v3/projects/1", "title": "Demo"},
+                                },
+                            },
+                            {
+                                "id": 43,
+                                "subject": "Child on classic instance",
+                                "_links": {
+                                    "parent": {"href": "/api/v3/work_packages/8", "title": "Parent"},
+                                    "project": {"href": "/api/v3/projects/1", "title": "Demo"},
+                                },
+                            },
+                        ]
+                    },
+                },
+                request=request,
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(_base_settings(read_projects=("*",)), transport=httpx.MockTransport(handler))
+
+    result = await client.work_package.list()
+
+    assert result.results[0].parent_id == 7
+    assert result.results[0].parent_display_id == "EMTB-7"
+    assert result.results[1].parent_id == 8
+    assert result.results[1].parent_display_id is None
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_returns_parent_display_id_when_present() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages/Block D":
+            return httpx.Response(404, json={"message": "not found"}, request=request)
+        assert request.url.path == "/api/v3/work_packages"
+        return httpx.Response(
+            200,
+            json={
+                "total": 1,
+                "_embedded": {
+                    "elements": [
+                        {
+                            "id": 42,
+                            "subject": "Block D task",
+                            "_links": {
+                                "parent": {
+                                    "href": "/api/v3/work_packages/7",
+                                    "title": "Parent",
+                                    "displayId": "EMTB-7",
+                                },
+                                "project": {"href": "/api/v3/projects/1", "title": "Demo"},
+                            },
+                        }
+                    ]
+                },
+            },
+            request=request,
+        )
+
+    client = OpenProjectClient(_base_settings(read_projects=("*",)), transport=httpx.MockTransport(handler))
+
+    result = await client.work_package.search(search="Block D")
+
+    assert result.results[0].parent_id == 7
+    assert result.results[0].parent_display_id == "EMTB-7"
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_exposes_real_total_when_scope_unrestricted() -> None:
+    # read_projects="*" -- the query is provably unrestricted, so the server's
+    # real total is safe to expose regardless of what any single page contains.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v3/work_packages"
+        return httpx.Response(
+            200,
+            json={
+                "total": 5,
+                "_embedded": {
+                    "elements": [
+                        {
+                            "id": 1,
+                            "subject": "A",
+                            "_links": {"project": {"href": "/api/v3/projects/1", "title": "demo"}},
+                        },
+                        {
+                            "id": 2,
+                            "subject": "B",
+                            "_links": {"project": {"href": "/api/v3/projects/1", "title": "demo"}},
+                        },
+                    ]
+                },
+            },
+            request=request,
+        )
+
+    client = OpenProjectClient(_base_settings(read_projects=("*",)), transport=httpx.MockTransport(handler))
+    result = await client.work_package.list(limit=2)
+
+    assert result.total == 5
+    assert result.count == 2
+    assert result.next_offset == 2
+    assert result.truncated is True
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_denies_when_no_readable_project_exists_under_restricted_scope() -> None:
+    # Without a readable project there is no server-side project filter that
+    # provably restricts the query, and an unfiltered total would leak matches
+    # from disallowed projects; failing closed is the only safe answer.
+    client = OpenProjectClient(
+        _base_settings(read_projects=("demo",)),
+        transport=httpx.MockTransport(serving_projects(_no_request_handler, [(2, "other", "Other")])),
+    )
+
+    with pytest.raises(PermissionDeniedError, match="OPENPROJECT_READ_PROJECTS"):
+        await client.work_package.list(limit=2)
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_exposes_real_total_when_restricted_scope_filter_sent() -> None:
+    # Restricted scope, no explicit project, but the allowed-project-id cache IS
+    # populated (as initialize() would do on success) -- a server-side project_id
+    # filter covering exactly the allowed projects is sent, so the query is
+    # provably restricted and the server's real total is safe to expose.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v3/work_packages"
+        params = dict(request.url.params)
+        assert '"project_id"' in params["filters"]
+        return httpx.Response(
+            200,
+            json={
+                "total": 5,
+                "_embedded": {
+                    "elements": [
+                        {
+                            "id": 1,
+                            "subject": "A",
+                            "_links": {"project": {"href": "/api/v3/projects/1", "title": "demo"}},
+                        },
+                        {
+                            "id": 2,
+                            "subject": "B",
+                            "_links": {"project": {"href": "/api/v3/projects/1", "title": "demo"}},
+                        },
+                    ]
+                },
+            },
+            request=request,
+        )
+
+    client = await started_client(_base_settings(read_projects=("demo",)), handler, [(1, "demo", "Demo")])
+    result = await client.work_package.list(limit=2)
+
+    assert result.total == 5
+    assert result.count == 2
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_pagination_hints_do_not_leak_untrusted_total() -> None:
+    # search_work_packages has no restricted-scope project_id filter branch at
+    # all (unlike list_work_packages, which now fails closed instead of ever
+    # reaching an untrusted-total state -- see
+    # test_list_work_packages_denies_when_no_readable_project_exists_under_restricted_scope),
+    # so it's the one remaining path that can still legitimately produce an
+    # untrusted total without an explicit project. next_offset/truncated must
+    # NOT be derived from the server's secret total (50) -- that would reveal
+    # the existence of further matches just as much as exposing the total
+    # itself. Since this raw page came back short of the requested limit,
+    # there is nothing more to page through.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "total": 50,
+                "_embedded": {
+                    "elements": [
+                        {
+                            "id": 1,
+                            "subject": "A",
+                            "_links": {"project": {"href": "/api/v3/projects/1", "title": "demo"}},
+                        },
+                    ]
+                },
+            },
+            request=request,
+        )
+
+    client = await started_client(_base_settings(read_projects=("demo",)), handler, [(1, "demo", "Demo")])
+    result = await client.work_package.search(search="A", limit=5)
+
+    assert result.total == 1
+    assert result.next_offset is None
+    assert result.truncated is False
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_pagination_continues_with_untrusted_total_when_page_full() -> None:
+    # Same untrusted-total scope, but a genuine (limit + 1)-th allowed match
+    # exists beyond the requested page -- pagination must still continue even
+    # though the total itself stays hidden. search() has no server-side
+    # project_id filter branch (see work_package_service.py's module
+    # docstring), so this goes through the scanned multi-page path, which
+    # requests full server pages (settings.max_page_size), not a single
+    # limit+1-sized request.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages/A":
+            return httpx.Response(404, json={"message": "not found"}, request=request)
+        assert request.url.params["pageSize"] == "50"
+        return httpx.Response(
+            200,
+            json={
+                "total": 50,
+                "_embedded": {
+                    "elements": [
+                        {
+                            "id": 1,
+                            "subject": "A",
+                            "_links": {"project": {"href": "/api/v3/projects/1", "title": "demo"}},
+                        },
+                        {
+                            "id": 2,
+                            "subject": "B",
+                            "_links": {"project": {"href": "/api/v3/projects/1", "title": "demo"}},
+                        },
+                        {
+                            "id": 3,
+                            "subject": "C",
+                            "_links": {"project": {"href": "/api/v3/projects/1", "title": "demo"}},
+                        },
+                    ]
+                },
+            },
+            request=request,
+        )
+
+    client = await started_client(_base_settings(read_projects=("demo",)), handler, [(1, "demo", "Demo")])
+    result = await client.work_package.search(search="A", offset=1, limit=2)
+
+    assert result.total == 2
+    assert [wp.id for wp in result.results] == [1, 2]
+    assert result.next_offset == 2
+    assert result.truncated is True
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_does_not_report_truncated_when_page_full_but_nothing_further_exists() -> None:
+    # The bug this guards against: reporting truncated=True purely from "the
+    # server's raw page was full" without a (limit + 1)-th allowed match
+    # actually proving more exists would make a follow-up call on the
+    # fabricated next_offset silently return an empty page. Here the server
+    # only ever has 2 matches total, so the scan sees a short final page
+    # (fewer raw elements than the requested server page size) and correctly
+    # recognizes exhaustion.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages/A":
+            return httpx.Response(404, json={"message": "not found"}, request=request)
+        assert request.url.params["pageSize"] == "50"
+        return httpx.Response(
+            200,
+            json={
+                "total": 50,
+                "_embedded": {
+                    "elements": [
+                        {
+                            "id": 1,
+                            "subject": "A",
+                            "_links": {"project": {"href": "/api/v3/projects/1", "title": "demo"}},
+                        },
+                        {
+                            "id": 2,
+                            "subject": "B",
+                            "_links": {"project": {"href": "/api/v3/projects/1", "title": "demo"}},
+                        },
+                    ]
+                },
+            },
+            request=request,
+        )
+
+    client = await started_client(_base_settings(read_projects=("demo",)), handler, [(1, "demo", "Demo")])
+    result = await client.work_package.search(search="A", offset=1, limit=2)
+
+    assert result.total == 2
+    assert [wp.id for wp in result.results] == [1, 2]
+    assert result.next_offset is None
+    assert result.truncated is False
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_falls_back_to_page_count_without_explicit_project() -> None:
+    # search_work_packages has no restricted-scope project_id filter branch at
+    # all (unlike list_work_packages), so without an explicit project it must
+    # never trust the server total under a restricted scope, regardless of
+    # whether this particular page happened to be filtered.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "total": 50,
+                "_embedded": {
+                    "elements": [
+                        {
+                            "id": 1,
+                            "subject": "A",
+                            "_links": {"project": {"href": "/api/v3/projects/1", "title": "demo"}},
+                        },
+                    ]
+                },
+            },
+            request=request,
+        )
+
+    client = await started_client(_base_settings(read_projects=("demo",)), handler, [(1, "demo", "Demo")])
+    result = await client.work_package.search(search="A", limit=5)
+
+    assert result.total == 1
+    assert result.count == 1
+    assert result.next_offset is None
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_exposes_real_total_with_explicit_project() -> None:
+    # An explicit project is validated against the allowlist by
+    # _get_project_payload before the filter is built, so the query is
+    # provably restricted to that one allowed project and the server total is
+    # safe to expose.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/projects/demo":
+            return httpx.Response(200, json={"_type": "Project", "id": 1, "identifier": "demo", "name": "Demo"})
+        return httpx.Response(
+            200,
+            json={
+                "total": 5,
+                "_embedded": {
+                    "elements": [
+                        {
+                            "id": 1,
+                            "subject": "A",
+                            "_links": {"project": {"href": "/api/v3/projects/1", "title": "demo"}},
+                        },
+                    ]
+                },
+            },
+            request=request,
+        )
+
+    client = await started_client(_base_settings(read_projects=("demo",)), handler, [(1, "demo", "Demo")])
+    result = await client.work_package.search(search="A", project="demo", limit=5)
+
+    assert result.total == 5
+    assert result.count == 1
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_my_open_work_packages_falls_back_to_page_count_under_restricted_scope() -> None:
+    # list_my_open_work_packages never sends a project-scoping filter at all,
+    # so under a restricted scope the total must always fall back to the
+    # page's item count -- never the server's secret total.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/users/me":
+            return httpx.Response(200, json={"id": 9, "name": "Me", "login": "me"}, request=request)
+        return httpx.Response(
+            200,
+            json={
+                "total": 50,
+                "_embedded": {
+                    "elements": [
+                        {
+                            "id": 1,
+                            "subject": "A",
+                            "_links": {"project": {"href": "/api/v3/projects/1", "title": "demo"}},
+                        },
+                    ]
+                },
+            },
+            request=request,
+        )
+
+    client = await started_client(_base_settings(read_projects=("demo",)), handler, [(1, "demo", "Demo")])
+    result = await client.work_package.list_my_open(limit=5)
+
+    assert result.total == 1
+    assert result.count == 1
+    assert result.next_offset is None
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_returns_empty_without_request_under_empty_read_projects() -> None:
+    client = OpenProjectClient(_empty_scope_settings(), transport=httpx.MockTransport(_no_request_handler))
+
+    result = await client.work_package.list()
+
+    assert result.count == 0
+    assert result.results == []
+    assert result.next_offset is None
+    assert result.truncated is False
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_returns_empty_without_request_even_with_project_and_type() -> None:
+    # Proves the early return fires unconditionally — even with project=/type=
+    # explicitly given, no lookup call (project resolution, type resolution) happens.
+    client = OpenProjectClient(_empty_scope_settings(), transport=httpx.MockTransport(_no_request_handler))
+
+    result = await client.work_package.list(project="demo", type="Bug")
+
+    assert result.results == []
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_returns_empty_without_request_under_empty_read_projects() -> None:
+    client = OpenProjectClient(_empty_scope_settings(), transport=httpx.MockTransport(_no_request_handler))
+
+    result = await client.work_package.search(search="demo")
+
+    assert result.count == 0
+    assert result.results == []
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_my_open_work_packages_returns_empty_without_request_even_with_assignee_me() -> None:
+    # Proves the guard fires before get_current_user() is ever called.
+    client = OpenProjectClient(_empty_scope_settings(), transport=httpx.MockTransport(_no_request_handler))
+
+    result = await client.work_package.list_my_open()
+
+    assert result.count == 0
+    assert result.results == []
+    assert result.next_offset is None
+    assert result.truncated is False
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_global_list_work_packages_and_versions_respect_allowlist_ids() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages":
+            return httpx.Response(
+                200,
+                json={
+                    "total": 2,
+                    "_embedded": {
+                        "elements": [
+                            {
+                                "id": 42,
+                                "subject": "Visible task",
+                                "_links": {
+                                    "type": {"title": "Task"},
+                                    "status": {"title": "Open"},
+                                    "project": {"href": "/api/v3/projects/6", "title": "Demo"},
+                                },
+                            },
+                            {
+                                "id": 99,
+                                "subject": "Hidden task",
+                                "_links": {
+                                    "type": {"title": "Task"},
+                                    "status": {"title": "Open"},
+                                    "project": {"href": "/api/v3/projects/7", "title": "Other"},
+                                },
+                            },
+                        ]
+                    },
+                },
+                request=request,
+            )
+        if request.url.path == "/api/v3/versions":
+            return httpx.Response(
+                200,
+                json={
+                    "total": 2,
+                    "_embedded": {
+                        "elements": [
+                            {
+                                "id": 1,
+                                "name": "Visible version",
+                                "_links": {"definingProject": {"href": "/api/v3/projects/6", "title": "Demo"}},
+                            },
+                            {
+                                "id": 2,
+                                "name": "Hidden version",
+                                "_links": {"definingProject": {"href": "/api/v3/projects/7", "title": "Other"}},
+                            },
+                        ]
+                    },
+                },
+                request=request,
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    settings = Settings(
+        base_url="https://op.example.com",
+        api_token="token",
+        timeout=12,
+        verify_ssl=True,
+        default_page_size=20,
+        max_page_size=50,
+        max_results=100,
+        log_level="WARNING",
+        read_projects=("6",),
+    )
+    client = await started_client(settings, handler, [(6, "demo", "Demo"), (7, "other", "Other")])
+    # The per-row allowlist filter must still drop project 7's item, which the
+    # mocked server returns despite the project filter.
+
+    work_packages = await client.work_package.list()
+    versions = await client.version.list()
+
+    assert work_packages.count == 1
+    assert work_packages.total == 1
+    assert work_packages.results[0].id == 42
+    assert versions.count == 1
+    assert versions.total == 1
+    assert versions.results[0].id == 1
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_my_open_work_packages_filters_total_when_all_items_blocked_by_allowlist() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/users/me":
+            return httpx.Response(
+                200,
+                json={"id": 5, "name": "Demo User", "login": "demo"},
+                request=request,
+            )
+        if request.url.path == "/api/v3/work_packages":
+            return httpx.Response(
+                200,
+                json={
+                    "total": 3,
+                    "_embedded": {
+                        "elements": [
+                            {
+                                "id": 101,
+                                "subject": "Hidden A",
+                                "_links": {
+                                    "type": {"title": "Task"},
+                                    "status": {"title": "Open"},
+                                    "project": {"href": "/api/v3/projects/7", "title": "Other"},
+                                },
+                            },
+                            {
+                                "id": 102,
+                                "subject": "Hidden B",
+                                "_links": {
+                                    "type": {"title": "Task"},
+                                    "status": {"title": "Open"},
+                                    "project": {"href": "/api/v3/projects/7", "title": "Other"},
+                                },
+                            },
+                            {
+                                "id": 103,
+                                "subject": "Hidden C",
+                                "_links": {
+                                    "type": {"title": "Task"},
+                                    "status": {"title": "Open"},
+                                    "project": {"href": "/api/v3/projects/8", "title": "Another"},
+                                },
+                            },
+                        ]
+                    },
+                },
+                request=request,
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    settings = Settings(
+        base_url="https://op.example.com",
+        api_token="token",
+        timeout=12,
+        verify_ssl=True,
+        default_page_size=20,
+        max_page_size=50,
+        max_results=100,
+        log_level="WARNING",
+        read_projects=("6",),
+    )
+    client = await started_client(
+        settings, handler, [(6, "demo", "Demo"), (7, "other", "Other"), (8, "another", "Another")]
+    )
+
+    result = await client.work_package.list_my_open(limit=20, offset=1)
+
+    assert result.results == []
+    assert result.count == 0
+    assert result.total == 0
+    assert result.next_offset is None
+    assert result.truncated is False
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_work_package_returns_full_description_by_default() -> None:
+    long_desc = "word " * 400 + "END"  # well over 1200 chars
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_wp_detail_payload_with_description(42, "42", long_desc),
+            request=request,
+        )
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    detail = await client.work_package.get("42")
+
+    assert detail.description is not None
+    assert detail.description.endswith("END</user-content>")  # not cut, includes delimiter
+    assert detail.description.startswith("<user-content>")
+    assert "…" not in detail.description
+    assert detail.description_truncated is False
+    # description_length is the original length without delimiters
+    assert detail.description_length + 29 == len(detail.description)  # +29 for <user-content> tags
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_work_package_text_limit_caps_and_flags() -> None:
+    long_desc = "a" * 2000
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_wp_detail_payload_with_description(42, "42", long_desc),
+            request=request,
+        )
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    detail = await client.work_package.get("42", text_limit=200)
+
+    assert detail.description is not None
+    # Description includes <user-content> tags (29 chars), so limit is 200 + 29 = 229
+    assert len(detail.description) <= 229
+    assert detail.description.startswith("<user-content>")
+    assert detail.description.endswith("…</user-content>")
+    assert detail.description_truncated is True
+    assert detail.description_length == 2000
+    # Invariant.
+    assert detail.description_truncated == (detail.description_length > 200)
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_work_package_preserves_paragraphs() -> None:
+    structured = "First paragraph.\n\nSecond paragraph.\n\n- item one\n- item two"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_wp_detail_payload_with_description(42, "42", structured),
+            request=request,
+        )
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    detail = await client.work_package.get("42")
+
+    # newlines/list preserved, but wrapped in delimiters
+    assert detail.description == f"<user-content>{structured}</user-content>"
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_work_package_numeric_reference_hits_canonical_path() -> None:
+    paths: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/v3/work_packages/42":
+            paths.append(request.url.path)
+            return httpx.Response(200, json=_wp_detail_payload(42, "42"), request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    detail = await client.work_package.get("42")
+
+    assert detail.id == 42
+    # Exactly one request, straight to the canonical numeric path. No lookup roundtrip.
+    assert paths == ["/api/v3/work_packages/42"]
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_work_package_semantic_reference_passes_through_to_path() -> None:
+    # OpenProject 17.5+ (17.4 behind its feature flag) resolves a project-prefixed identifier on the
+    # work_packages/{id} endpoint, so the reference is sent through the path verbatim.
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/v3/work_packages/PROJ-123":
+            return httpx.Response(200, json=_wp_detail_payload(412, "PROJ-123"), request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    detail = await client.work_package.get("PROJ-123")
+
+    assert detail.id == 412
+    assert detail.display_id == "PROJ-123"
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_work_package_unknown_reference_maps_404_to_not_found() -> None:
+    # On instances without semantic identifiers a project-prefixed reference simply
+    # yields a 404, which must surface as NotFoundError (backwards compatible).
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages/PROJ-999":
+            return httpx.Response(404, json={"message": "Not found"}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(NotFoundError):
+        await client.work_package.get("PROJ-999")
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resolve_work_package_id_fetches_and_validates_both_reference_shapes() -> None:
+    # Both a numeric id and a semantic ref fetch the WP to validate its
+    # project against the allowlist — neither shape short-circuits.
+    requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path == "/api/v3/work_packages/99":
+            return httpx.Response(200, json=_wp_detail_payload(99, "99"), request=request)
+        if request.url.path == "/api/v3/work_packages/PROJ-7":
+            return httpx.Response(200, json=_wp_detail_payload(55, "PROJ-7"), request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+
+    assert await client._work_package_resolver.resolve_id(99) == 99
+    assert requests == ["/api/v3/work_packages/99"]
+
+    assert await client._work_package_resolver.resolve_id("PROJ-7") == 55
+    assert requests == ["/api/v3/work_packages/99", "/api/v3/work_packages/PROJ-7"]
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_created_on_validates_format() -> None:
+    """Test that created_on rejects invalid date formats."""
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(lambda r: None))
+
+    with pytest.raises(InvalidInputError, match="YYYY-MM-DD format"):
+        await client.work_package.list(created_on="2024/01/15")
+
+    with pytest.raises(InvalidInputError, match="YYYY-MM-DD format"):
+        await client.work_package.list(created_on="15-01-2024")
+
+    with pytest.raises(InvalidInputError, match="YYYY-MM-DD format"):
+        await client.work_package.list(created_on="2024-13-01")
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_created_between_validates_range() -> None:
+    """Test that created_between validates start <= end."""
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(lambda r: None))
+
+    with pytest.raises(InvalidInputError, match="start date must be <= end date"):
+        await client.work_package.list(created_between=["2024-12-31", "2024-01-01"])
+
+    with pytest.raises(InvalidInputError, match="exactly 2 dates"):
+        await client.work_package.list(created_between=["2024-01-01"])
+
+    with pytest.raises(InvalidInputError, match="exactly 2 dates"):
+        await client.work_package.list(created_between=["2024-01-01", "2024-01-31", "2024-02-01"])
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_rejects_both_on_and_between() -> None:
+    """Test mutual exclusivity of _on and _between filters."""
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(lambda r: None))
+
+    with pytest.raises(InvalidInputError, match="Cannot specify both created_on and created_between"):
+        await client.work_package.list(created_on="2024-01-15", created_between=["2024-01-01", "2024-01-31"])
+
+    with pytest.raises(InvalidInputError, match="Cannot specify both updated_on and updated_between"):
+        await client.work_package.list(updated_on="2024-01-15", updated_between=["2024-01-01", "2024-01-31"])
+
+    with pytest.raises(InvalidInputError, match="Cannot specify both due_on and due_between"):
+        await client.work_package.list(due_on="2024-01-15", due_between=["2024-01-01", "2024-01-31"])
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_created_on_builds_filter() -> None:
+    """Test that created_on generates correct API filter."""
+    captured: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages" and request.method == "GET":
+            captured["filters"] = request.url.params.get("filters", "")
+            return httpx.Response(200, json={"_embedded": {"elements": []}, "total": 0}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+    await client.work_package.list(created_on="2024-01-15")
+
+    filters = json.loads(captured["filters"])
+    created_filter = next(f for f in filters if "created_at" in f)
+    assert created_filter["created_at"]["operator"] == "=d"
+    assert created_filter["created_at"]["values"] == ["2024-01-15"]
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_created_between_builds_filter() -> None:
+    """Test that created_between generates correct API filter."""
+    captured: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages" and request.method == "GET":
+            captured["filters"] = request.url.params.get("filters", "")
+            return httpx.Response(200, json={"_embedded": {"elements": []}, "total": 0}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+    await client.work_package.list(created_between=["2024-01-01", "2024-01-31"])
+
+    filters = json.loads(captured["filters"])
+    created_filter = next(f for f in filters if "created_at" in f)
+    assert created_filter["created_at"]["operator"] == "<>d"
+    assert created_filter["created_at"]["values"] == ["2024-01-01", "2024-01-31"]
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_multiple_date_filters() -> None:
+    """Test combining multiple date filters."""
+    captured: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages" and request.method == "GET":
+            captured["filters"] = request.url.params.get("filters", "")
+            return httpx.Response(200, json={"_embedded": {"elements": []}, "total": 0}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+    await client.work_package.list(
+        created_between=["2024-01-01", "2024-01-31"], updated_on="2024-01-15", due_on="2024-02-01"
+    )
+
+    filters = json.loads(captured["filters"])
+    assert len([f for f in filters if "created_at" in f]) == 1
+    assert len([f for f in filters if "updated_at" in f]) == 1
+    assert len([f for f in filters if "due_date" in f]) == 1
+
+    created_filter = next(f for f in filters if "created_at" in f)
+    assert created_filter["created_at"]["operator"] == "<>d"
+
+    updated_filter = next(f for f in filters if "updated_at" in f)
+    assert updated_filter["updated_at"]["operator"] == "=d"
+
+    due_filter = next(f for f in filters if "due_date" in f)
+    assert due_filter["due_date"]["operator"] == "=d"
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_date_filters() -> None:
+    """Test that search_work_packages also supports date filters."""
+    captured: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages/test":
+            return httpx.Response(404, json={"message": "not found"}, request=request)
+        if request.url.path == "/api/v3/work_packages" and request.method == "GET":
+            captured["filters"] = request.url.params.get("filters", "")
+            return httpx.Response(200, json={"_embedded": {"elements": []}, "total": 0}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+    await client.work_package.search(search="test", updated_on="2024-07-09")
+
+    filters = json.loads(captured["filters"])
+    # Should have both subject_or_id filter and updated_at filter
+    assert any("subject_or_id" in f for f in filters)
+    assert any("updated_at" in f for f in filters)
+
+    updated_filter = next(f for f in filters if "updated_at" in f)
+    assert updated_filter["updated_at"]["operator"] == "=d"
+    assert updated_filter["updated_at"]["values"] == ["2024-07-09"]
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_custom_field_filters_builds_cf_filter_end_to_end() -> None:
+    """End-to-end through the real OpenProjectClient/Service/httpx
+    adapter (not just a fake) -- confirms the actual wire payload sent to
+    GET /api/v3/work_packages contains a cf_<N>-keyed filter fragment."""
+    captured: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages" and request.method == "GET":
+            captured["filters"] = request.url.params.get("filters", "")
+            return httpx.Response(200, json={"_embedded": {"elements": []}, "total": 0}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+    await client.work_package.list(custom_field_filters={"cf_12": {"operator": "=", "values": ["42"]}})
+
+    filters = json.loads(captured["filters"])
+    cf_filter = next(f for f in filters if "cf_12" in f)
+    assert cf_filter["cf_12"]["operator"] == "="
+    assert cf_filter["cf_12"]["values"] == ["42"]
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_search_work_packages_custom_field_filters_builds_cf_filter_end_to_end() -> None:
+    captured: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/work_packages/foo":
+            return httpx.Response(404, json={"message": "not found"}, request=request)
+        if request.url.path == "/api/v3/work_packages" and request.method == "GET":
+            captured["filters"] = request.url.params.get("filters", "")
+            return httpx.Response(200, json={"_embedded": {"elements": []}, "total": 0}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+    await client.work_package.search(search="foo", custom_field_filters={"cf_7": {"operator": "!~", "values": ["x"]}})
+
+    filters = json.loads(captured["filters"])
+    cf_filter = next(f for f in filters if "cf_7" in f)
+    assert cf_filter["cf_7"]["operator"] == "!~"
+    assert cf_filter["cf_7"]["values"] == ["x"]
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_work_packages_type_filter_uses_correct_key() -> None:
+    """Verify type filter uses type_id key per source definition.
+
+    OpenProject CE 17.5 app/models/queries/work_packages/filter/type_filter.rb
+    defines: def self.key → :type_id
+
+    This test ensures we use the official filter key as defined in the source.
+    """
+    captured: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v3/projects/demo":
+            return httpx.Response(
+                200,
+                json={
+                    "_type": "Project",
+                    "id": 1,
+                    "name": "Demo",
+                    "identifier": "demo",
+                    "_links": {"types": {"href": "/api/v3/projects/1/types"}},
+                },
+                request=request,
+            )
+        if request.url.path == "/api/v3/projects/1/types":
+            return httpx.Response(
+                200,
+                json={"_embedded": {"elements": [{"id": 1, "name": "Task"}]}},
+                request=request,
+            )
+        if request.url.path == "/api/v3/work_packages":
+            captured["filters"] = request.url.params.get("filters", "")
+            return httpx.Response(200, json={"_embedded": {"elements": []}, "total": 0}, request=request)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = OpenProjectClient(make_settings(), transport=httpx.MockTransport(handler))
+    await client.work_package.list(type="Task", project="demo")
+
+    filters = json.loads(captured["filters"])
+    # Must use "type_id" not "type"
+    assert any("type_id" in f for f in filters), "type_id filter key not found"
+    assert not any("type" in f and "type_id" not in f for f in filters), "Found deprecated 'type' key"
+
+    type_filter = next(f for f in filters if "type_id" in f)
+    assert type_filter["type_id"]["operator"] == "="
+    assert len(type_filter["type_id"]["values"]) == 1
+
+    await client.aclose()

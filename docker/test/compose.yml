@@ -1,0 +1,448 @@
+# Local OpenProject instances for runtime verification of the MCP client
+# across the full supported minor-version range (16.0-17.9). We run the
+# LATEST patch of every minor (what users actually run), using the all-in-one
+# images (NOT -slim, which have no bundled database and crash on boot).
+#
+#   16.0.1  first version in our support range
+#   16.1.1  Project::Phase(Definition) introduced
+#   16.2.2
+#   16.3.2
+#   16.4.1
+#   16.5.1
+#   16.6.10 classic numeric identifiers (no displayId, no semantic) -- our
+#           long-standing "classic baseline" pin
+#   17.0.7  workspaces introduced
+#   17.1.4  storages' forbiddenFileNameCharacters field introduced
+#   17.2.4
+#   17.3.4  sprints, meeting_agenda_items/sections, recurring_meetings,
+#           user non-working-times/working-hours introduced
+#   17.4.1  displayId field introduced
+#   17.5.1  project-based semantic identifiers active + workspaces favorites
+#   17.6.0  same semantic-identifier generation as 17.5; backlog_buckets,
+#           meeting_outcomes introduced
+#   17.7.2  same semantic-identifier generation as 17.5/17.6; user
+#           working-times generally available (no longer feature-flag-gated).
+#           targetVersions (multi-value successor to version) and
+#           Setting::WorkPackageMultipleVersions already exist here, but on
+#           17.7 the setting's own .active? additionally requires an
+#           experimental OpenProject::FeatureDecisions flag this project does
+#           not enable -- see 17.8's entry below and seed.rb's own comment.
+#   17.8.1  Drops 17.7's extra
+#           FeatureDecisions gate on Setting::WorkPackageMultipleVersions --
+#           setting the plain Setting alone is now sufficient to enable
+#           multi-value target_versions writes. Reading targetVersions has no
+#           gate on any pinned version -- always present, independent of the
+#           setting. Writing more than one target version IS rejected
+#           server-side unless the setting is active (on this version).
+#           The setting ships with default: true (OpenProject's
+#           config/constants/settings/definition.rb). seed.rb explicitly
+#           forces it to false before
+#           seeding op-17-8's single-target-version fixture (so this
+#           container still exercises the setting-disabled path as a real
+#           reference state, e.g. an upgraded-from-17.7 instance where an
+#           admin turned it off), then flips it to true when
+#           SEED_MULTI_VERSIONS=1 is passed, to also exercise the
+#           setting-enabled multi-value write path on the SAME container/
+#           volume -- no separate dedicated container needed, since a fresh
+#           17.8 instance already defaults to the enabled state.
+#   17.9.1  latest release as of this pin. New work package attribute
+#           observedInVersions (multi-value, closed versions allowed, on by
+#           default for type Bug); GET /api/v3/meetings gains a title filter
+#           (case-insensitive partial, matches a recurring series' title);
+#           date alerts are now Community Edition (notification details).
+#
+# Driven by up.sh / down.sh. SECRET_KEY_BASE comes from a generated .env
+# (gitignored); never hardcode it here.
+
+services:
+  op-16-0:
+    image: openproject/openproject:16.0.1
+    ports:
+      - "8160:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8160
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op160_pgdata:/var/openproject/pgdata
+      - op160_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-16-1:
+    image: openproject/openproject:16.1.1
+    ports:
+      - "8161:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8161
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op161_pgdata:/var/openproject/pgdata
+      - op161_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-16-2:
+    image: openproject/openproject:16.2.2
+    ports:
+      - "8162:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8162
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op162_pgdata:/var/openproject/pgdata
+      - op162_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-16-3:
+    image: openproject/openproject:16.3.2
+    ports:
+      - "8163:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8163
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op163_pgdata:/var/openproject/pgdata
+      - op163_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-16-4:
+    image: openproject/openproject:16.4.1
+    ports:
+      - "8164:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8164
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op164_pgdata:/var/openproject/pgdata
+      - op164_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-16-5:
+    image: openproject/openproject:16.5.1
+    ports:
+      - "8165:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8165
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op165_pgdata:/var/openproject/pgdata
+      - op165_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-16-6:
+    image: openproject/openproject:16.6.10
+    ports:
+      - "8166:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8166
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op166_pgdata:/var/openproject/pgdata
+      - op166_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-17-0:
+    image: openproject/openproject:17.0.7
+    ports:
+      - "8170:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8170
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op170_pgdata:/var/openproject/pgdata
+      - op170_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-17-1:
+    image: openproject/openproject:17.1.4
+    ports:
+      - "8171:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8171
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op171_pgdata:/var/openproject/pgdata
+      - op171_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-17-2:
+    image: openproject/openproject:17.2.4
+    ports:
+      - "8172:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8172
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op172_pgdata:/var/openproject/pgdata
+      - op172_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-17-3:
+    image: openproject/openproject:17.3.4
+    ports:
+      - "8173:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8173
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op173_pgdata:/var/openproject/pgdata
+      - op173_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-17-4:
+    image: openproject/openproject:17.4.1
+    ports:
+      - "8174:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8174
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op174_pgdata:/var/openproject/pgdata
+      - op174_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-17-5:
+    image: openproject/openproject:17.5.1
+    ports:
+      - "8175:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8175
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op175_pgdata:/var/openproject/pgdata
+      - op175_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-17-6:
+    image: openproject/openproject:17.6.0
+    ports:
+      - "8176:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8176
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op176_pgdata:/var/openproject/pgdata
+      - op176_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-17-7:
+    image: openproject/openproject:17.7.2
+    ports:
+      - "8177:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8177
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op177_pgdata:/var/openproject/pgdata
+      - op177_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-17-8:
+    image: openproject/openproject:17.8.1
+    ports:
+      - "8178:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8178
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op178_pgdata:/var/openproject/pgdata
+      - op178_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  op-17-9:
+    image: openproject/openproject:17.9.1
+    ports:
+      - "8179:80"
+    environment:
+      OPENPROJECT_HOST__NAME: localhost:8179
+      OPENPROJECT_HTTPS: "false"
+      OPENPROJECT_DEFAULT__LANGUAGE: en
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set via up.sh / .env}
+    volumes:
+      - op179_pgdata:/var/openproject/pgdata
+      - op179_assets:/var/openproject/assets
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health_checks/default"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  # Nextcloud fixture for the storages/project_storages read-tool
+  # tests. SQLite-backed, one-container, non-interactive install via env vars
+  # (confirmed against the image's own /entrypoint.sh). Only ever brought up
+  # alongside a single OpenProject instance (op-17-7), never with all five —
+  # see README.md's resource-constraint note.
+  #
+  # This container gives OpenProject something real to reach at the network
+  # level (service-name DNS: http://nextcloud/). It intentionally does NOT
+  # get a live, browser-driven OAuth handshake with OpenProject — seed.rb
+  # creates the OpenProject-side Storage/ProjectStorage rows directly via
+  # `save(validate: false)`, bypassing the live host-reachability/app-
+  # installed probe. This is sufficient for storages/project_storages
+  # read-tool tests; it is NOT a "connected, browsable" storage (no
+  # storage_files browsing — out of scope, see docker/test/README.md).
+  nextcloud:
+    image: nextcloud:30-apache
+    ports:
+      - "8080:80"
+    environment:
+      NEXTCLOUD_ADMIN_USER: admin
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:?set via up.sh / .env}
+      SQLITE_DATABASE: nextcloud
+      NEXTCLOUD_TRUSTED_DOMAINS: "nextcloud localhost"
+    volumes:
+      - nextcloud_data:/var/www/html
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/status.php"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 90s
+
+volumes:
+  op160_pgdata:
+  op160_assets:
+  op161_pgdata:
+  op161_assets:
+  op162_pgdata:
+  op162_assets:
+  op163_pgdata:
+  op163_assets:
+  op164_pgdata:
+  op164_assets:
+  op165_pgdata:
+  op165_assets:
+  op166_pgdata:
+  op166_assets:
+  op170_pgdata:
+  op170_assets:
+  op171_pgdata:
+  op171_assets:
+  op172_pgdata:
+  op172_assets:
+  op173_pgdata:
+  op173_assets:
+  op174_pgdata:
+  op174_assets:
+  op175_pgdata:
+  op175_assets:
+  op176_pgdata:
+  op176_assets:
+  op177_pgdata:
+  op177_assets:
+  op178_pgdata:
+  op178_assets:
+  op179_pgdata:
+  op179_assets:
+  nextcloud_data:

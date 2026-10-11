@@ -1,0 +1,124 @@
+"""HTTP-backed ReminderApi adapter.
+
+No `httpx` import (depends on the `Transport` Protocol only, matching every
+other adapter). `trim_text`/`id_from_href`/`SUBJECT_LIMIT` come from
+`app/adapters/_text.py`.
+
+No web `url` field: `GET /api/v3/reminders/{id}` does not exist -- `_find_raw`
+below documents that OpenProject's `route_param :id` block under
+`resource :reminders` mounts only `patch`/`delete`, never `get`. A `self`
+link built from that path would never be dereferenceable, by API or by
+browser.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ...models import ReminderSummary
+from ..errors import NotFoundError
+from ..ports.reminder_api import ReminderRecord
+from ..transport.protocol import Transport
+from ._text import SUBJECT_LIMIT
+from ._text import delimit_user_content as _delimit_user_content
+from ._text import id_from_href as _id_from_href
+from ._text import trim_text as _trim_text
+
+
+def normalize_reminder(payload: dict[str, Any]) -> ReminderSummary:
+    """Pure HAL->model translation (ADR: 'lives in the Domain API adapter').
+
+    Excludes hidden-field masking -- that is a Service-layer concern applied
+    after this returns (same pattern as every other normalize_*).
+    """
+    links = payload.get("_links", {})
+    creator = payload.get("_embedded", {}).get("creator", {})
+    return ReminderSummary(
+        id=int(payload["id"]),
+        remind_at=payload.get("remindAt"),
+        note=_delimit_user_content(_trim_text(payload.get("note"), limit=SUBJECT_LIMIT)),
+        work_package_id=_id_from_href(links.get("remindable", {}).get("href")),
+        creator=_trim_text(creator.get("name"), limit=SUBJECT_LIMIT) if isinstance(creator, dict) else None,
+    )
+
+
+class HttpxReminderApi:
+    def __init__(self, transport: Transport) -> None:
+        self._transport = transport
+
+    def _record(self, payload: dict[str, Any]) -> ReminderRecord:
+        # `summary` is lazy (see ReminderRecord's docstring): list_all()'s
+        # caller filters records by remindable_link BEFORE ever reading
+        # .summary ("filter raw, normalize survivors" order) -- an eager
+        # field here would normalize (and potentially KeyError on) records
+        # the Service is about to discard.
+        return ReminderRecord(
+            summary=lambda: normalize_reminder(payload),
+            remindable_link=payload.get("_links", {}).get("remindable"),
+        )
+
+    async def fetch_page(self, *, offset: int, page_size: int) -> dict[str, Any]:
+        return await self._transport.get_json("reminders", params={"offset": str(offset), "pageSize": str(page_size)})
+
+    def to_record(self, payload: dict[str, Any]) -> ReminderRecord:
+        return self._record(payload)
+
+    async def _find_raw(self, reminder_id: int) -> dict[str, Any] | None:
+        """Find a reminder's raw payload via the collection endpoint.
+
+        OpenProject has no `GET reminders/{id}` single-item endpoint -- the
+        `route_param :id` block under `resource :reminders` mounts only
+        `patch`/`delete`, never `get` (verified against
+        lib/api/v3/reminders/reminders_api.rb in every vendored OpenProject
+        version). The only way to read a reminder's own payload/`remindable`
+        link is by paging through the collection and matching on id.
+
+        Stops on a `seen_ids` repeat, not just server-reported `total`/offset
+        arithmetic (same safety net as `fetch_bounded_and_paginate` in
+        app/pagination.py) -- a sub-collection endpoint that silently ignores
+        offset/pageSize would otherwise loop forever re-fetching page 1.
+        """
+        offset = 1
+        page_size = 100
+        seen_ids: set[Any] = set()
+        is_first_page = True
+        while True:
+            payload = await self._transport.get_json(
+                "reminders", params={"offset": str(offset), "pageSize": str(page_size)}
+            )
+            elements = [item for item in payload.get("_embedded", {}).get("elements", []) if isinstance(item, dict)]
+            page_ids = {item.get("id") for item in elements}
+            if not is_first_page and page_ids and page_ids <= seen_ids:
+                return None
+            is_first_page = False
+            seen_ids.update(page_ids)
+            match = next((item for item in elements if item.get("id") == reminder_id), None)
+            if match is not None:
+                return match
+            total = int(payload.get("total", len(elements)))
+            if offset * page_size >= total or not elements:
+                return None
+            offset += 1
+
+    async def get(self, reminder_id: int) -> ReminderRecord:
+        payload = await self._find_raw(reminder_id)
+        if payload is None:
+            raise NotFoundError(f"OpenProject reminder {reminder_id} not found.")
+        return self._record(payload)
+
+    async def get_remindable_link(self, reminder_id: int) -> dict[str, Any] | None:
+        payload = await self._find_raw(reminder_id)
+        if payload is None:
+            return None
+        return payload.get("_links", {}).get("remindable")
+
+    async def create(self, work_package_id: int, payload: dict[str, Any]) -> ReminderRecord:
+        response = await self._transport.post_json(f"work_packages/{work_package_id}/reminders", json_body=payload)
+        return self._record(response)
+
+    async def update(self, reminder_id: int, payload: dict[str, Any]) -> ReminderRecord:
+        response = await self._transport.patch_json(f"reminders/{reminder_id}", json_body=payload)
+        return self._record(response)
+
+    async def delete(self, reminder_id: int) -> None:
+        await self._transport.delete(f"reminders/{reminder_id}")
