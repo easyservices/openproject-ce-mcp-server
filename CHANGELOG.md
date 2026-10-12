@@ -5,6 +5,13 @@ here. The project uses its own package identity and version sequence; history
 from the MIT-licensed source project is not represented as releases of this
 project. See [LICENSE.md](LICENSE.md) for provenance and attribution.
 
+## [0.1.2] - Unreleased
+
+### Fixed
+
+- Include project identifiers throughout the budget comparison query so the
+  final result selection works.
+
 ## [0.1.1] - Unreleased
 
 ### Fixed

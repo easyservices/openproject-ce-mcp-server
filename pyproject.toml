@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "openproject-ce-mcp-server"
-version = "0.1.1"
+version = "0.1.2"
 description = "Independent MCP server for OpenProject Community Edition, with remote HTTP and local stdio transports."
 readme = "README.md"
 license = { file = "LICENSE.md" }

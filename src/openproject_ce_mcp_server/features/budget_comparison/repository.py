@@ -17,10 +17,10 @@ class BudgetComparisonRepository:
     async def compare(self, project_ids: list[int], user_id: int, include_subprojects: bool) -> list[dict[str, Any]]:
         query = """
         WITH RECURSIVE tree AS (
-          SELECT p.id, p.name, p.parent_id, 0 AS depth
+          SELECT p.id, p.name, p.identifier, p.parent_id, 0 AS depth
           FROM projects p WHERE p.id = ANY(%s::int[])
           UNION ALL
-          SELECT child.id, child.name, child.parent_id, tree.depth + 1
+          SELECT child.id, child.name, child.identifier, child.parent_id, tree.depth + 1
           FROM projects child JOIN tree ON child.parent_id = tree.id
           WHERE %s AND tree.depth < 32
         ), principals AS (
@@ -48,7 +48,7 @@ class BudgetComparisonRepository:
             pp.can_view_project AND pp.can_view_budgets AND pp.can_view_costs AND pp.can_view_hourly_rates
           )
         ), per_project AS (
-          SELECT vt.id, vt.name, vt.parent_id, vt.depth,
+          SELECT vt.id, vt.name, vt.identifier, vt.parent_id, vt.depth,
                  COALESCE((
                    SELECT sum(
                      COALESCE(b.base_amount, 0)
