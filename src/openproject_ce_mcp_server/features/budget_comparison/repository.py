@@ -53,20 +53,23 @@ class BudgetComparisonRepository:
                    SELECT sum(
                      COALESCE(b.base_amount, 0)
                      + COALESCE((SELECT sum(COALESCE(mbi.amount,
-                         mbi.units * COALESCE((SELECT cr.rate FROM cost_rates cr
-                           WHERE cr.cost_type_id = mbi.cost_type_id AND cr.valid_from <= b.fixed_date
+                         mbi.units * COALESCE((SELECT cr.rate FROM rates cr
+                           WHERE cr.type = 'CostRate' AND cr.cost_type_id = mbi.cost_type_id
+                             AND cr.valid_from <= b.fixed_date
                            ORDER BY cr.valid_from DESC LIMIT 1), 0)))
                        FROM material_budget_items mbi WHERE mbi.budget_id = b.id), 0)
                      + COALESCE((SELECT sum(COALESCE(lbi.amount,
                          lbi.hours * COALESCE(
-                           (SELECT hr.rate FROM hourly_rates hr
+                           (SELECT hr.rate FROM rates hr
                              JOIN projects rate_project ON rate_project.id = hr.project_id
                              JOIN projects budget_project ON budget_project.id = b.project_id
-                             WHERE hr.user_id = lbi.user_id AND hr.valid_from <= b.fixed_date
+                             WHERE hr.type = 'HourlyRate' AND hr.user_id = lbi.user_id
+                               AND hr.valid_from <= b.fixed_date
                                AND rate_project.lft <= budget_project.lft AND rate_project.rgt >= budget_project.rgt
                              ORDER BY rate_project.lft DESC, hr.valid_from DESC LIMIT 1),
-                           (SELECT dhr.rate FROM default_hourly_rates dhr
-                             WHERE dhr.user_id = lbi.user_id AND dhr.valid_from <= b.fixed_date
+                           (SELECT dhr.rate FROM rates dhr
+                             WHERE dhr.type = 'DefaultHourlyRate' AND dhr.user_id = lbi.user_id
+                               AND dhr.valid_from <= b.fixed_date
                              ORDER BY dhr.valid_from DESC LIMIT 1), 0)))
                        FROM labor_budget_items lbi WHERE lbi.budget_id = b.id), 0)
                    ) FROM budgets b WHERE b.project_id = vt.id

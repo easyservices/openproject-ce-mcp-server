@@ -154,7 +154,13 @@ Amounts are lifetime totals; no date filter or currency conversion is applied.
 The underlying budget/cost plugin schema is version-specific. On OpenProject
 17.9.x, the query uses the base amount, material/labor items valued at rates
 effective on each budget's fixed date, and cost/time entries attached to
-budgeted work packages. This follows OpenProject's [Budget model](https://raw.githubusercontent.com/opf/openproject/v17.9.1/modules/budgets/app/models/budget.rb),
+budgeted work packages. Cost, hourly, and default hourly rates are stored in
+the shared `rates` table and distinguished by its `type` column. This follows
+OpenProject's [rate table migration](https://github.com/opf/openproject/blob/v17.9.1/modules/costs/db/migrate/tables/rates.rb),
+[CostRate model](https://github.com/opf/openproject/blob/v17.9.1/modules/costs/app/models/cost_rate.rb),
+[HourlyRate model](https://github.com/opf/openproject/blob/v17.9.1/modules/costs/app/models/hourly_rate.rb),
+[DefaultHourlyRate model](https://github.com/opf/openproject/blob/v17.9.1/modules/costs/app/models/default_hourly_rate.rb),
+and [Budget model](https://raw.githubusercontent.com/opf/openproject/v17.9.1/modules/budgets/app/models/budget.rb),
 [material budget item](https://raw.githubusercontent.com/opf/openproject/v17.9.1/modules/budgets/app/models/material_budget_item.rb),
 [labor budget item](https://raw.githubusercontent.com/opf/openproject/v17.9.1/modules/budgets/app/models/labor_budget_item.rb),
 and [time-entry cost model](https://raw.githubusercontent.com/opf/openproject/v17.9.1/modules/costs/app/models/time_entry.rb). Project
@@ -170,7 +176,7 @@ Use a dedicated account and grant only `CONNECT`, schema `USAGE`, and
 `SELECT` on these tables (do not grant writes, sequences, schema ownership, or
 `SELECT ON ALL TABLES`): `projects`, `budgets`, `work_packages`,
 `cost_entries`, `time_entries`, `material_budget_items`, `labor_budget_items`,
-`cost_rates`, `hourly_rates`, `default_hourly_rates`, `members`, `member_roles`,
+`rates`, `members`, `member_roles`,
 `role_permissions`, `group_users`, `users`.
 The database role should also have PostgreSQL `default_transaction_read_only`
 enabled. The server starts each query in a read-only transaction and uses

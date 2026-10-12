@@ -30,6 +30,90 @@ docker compose \
   up -d
 ```
 
+### Adding it to a stack that already has OpenProject and PostgreSQL MCP
+
+The OpenProject connector is a separate service. Add the `openproject-mcp`
+service from the production Compose file to your existing `services:` section;
+keep the other MCP service there as well. In particular, the API connection
+uses the OpenProject service name (`openproject` below), not the PostgreSQL MCP
+service name. The PostgreSQL connector does not need to be changed.
+
+For a minimal in-file example, the relevant part of the existing Compose file
+looks like this (retain your current image, volumes, environment, and other
+settings for `openproject` and `postgres-mcp`):
+
+```yaml
+services:
+  openproject:
+    # Your existing OpenProject service
+    networks:
+      - openproject_backend
+
+  postgres-mcp:
+    # Your existing PostgreSQL MCP service
+    networks:
+      - mcp_web
+
+  openproject-mcp:
+    image: ghcr.io/easyservices/openproject-ce-mcp-server:${MCP_IMAGE_TAG:-latest}
+    depends_on:
+      - openproject
+    ports:
+      - "8766:8000"
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_ENVIRONMENT: "${MCP_ENVIRONMENT:-development}"
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+      MCP_PUBLIC_URL: "${MCP_PUBLIC_URL:-http://localhost:8766}"
+      MCP_SERVER_NAME: openproject
+      MCP_PATH: /mcp
+      MCP_ALLOWED_HOSTS: "${MCP_ALLOWED_HOSTS:-localhost:8766,127.0.0.1:8766}"
+      OPENPROJECT_BASE_URL: http://openproject
+      MCP_AUDIT_LOG_FILE: /app/logs/audit.jsonl
+    volumes:
+      - ./data/mcp-audit:/app/logs
+    networks:
+      - mcp_web
+      - openproject_backend
+    restart: unless-stopped
+
+networks:
+  mcp_web:
+  openproject_backend:
+```
+
+Use the actual Compose network keys from your stack in place of
+`mcp_web`/`openproject_backend`, and attach `openproject-mcp` to the network
+that can reach OpenProject. Compose service DNS (`http://openproject`) works
+only when both services share a network and `openproject` is the OpenProject
+service name. If you use the provided overlay instead, its network names must
+match the top-level network keys in the base file. For networks managed outside
+this Compose project, declare them as `external: true` and set their actual
+Docker network names with `name:`.
+
+The audit directory is relative to the Compose project directory. Create it
+and grant write access to the container user (UID/GID `10001`) before starting
+the service; the commands are in the next paragraph. Add the
+`OPENPROJECT_DB_*` settings from the full production Compose example only if
+you enable the optional budget comparison feature; it connects directly to
+PostgreSQL, so its DB host must also be reachable from the `openproject-mcp`
+container. This is independent of the PostgreSQL MCP service.
+
+After creating the audit directory using the commands in the next paragraph,
+start or update the stack. If you use the overlay, include both `-f` options
+from the first example in this section:
+
+```bash
+docker compose up -d openproject-mcp
+```
+
+Set the MCP endpoint in your client to `http://<docker-host>:8766/mcp` (or to
+the HTTPS URL configured on your reverse proxy). Each user supplies their own
+OpenProject API token in their MCP client; do not add a shared token to
+Compose. For production, configure TLS and the production environment values
+described above.
+
 Create the audit-log directory next to the base Compose file and give the
 container's unprivileged user access to it:
 
