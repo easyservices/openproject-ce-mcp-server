@@ -5,6 +5,13 @@ here. The project uses its own package identity and version sequence; history
 from the MIT-licensed source project is not represented as releases of this
 project. See [LICENSE.md](LICENSE.md) for provenance and attribution.
 
+## [0.1.1] - Unreleased
+
+### Fixed
+
+- Read cost, hourly, and default hourly rates from OpenProject's shared `rates`
+  table when comparing project budgets.
+
 ## [0.1.0] - Unreleased
 
 ### Added
